@@ -1,6 +1,6 @@
 # Drenyra GPUI — Phase 3: Resilience Hardening & Accounting Generative UI (`drenyra-ui`)
 
-Feature: `drenyra-gpui-phase3` | Repo: `arkelythex/drenyra-gpui` | Stacked on: `feat/drenyra-gpui-phase2` (PR #395) | Status: in_progress
+Feature: `drenyra-gpui-phase3` | Repo: `arkelythex/drenyra-gpui` | Stacked on: `feat/drenyra-gpui-phase2` (PR #395) | Status: done
 
 ## Specs
 
@@ -24,12 +24,17 @@ Feature: `drenyra-gpui-phase3` | Repo: `arkelythex/drenyra-gpui` | Stacked on: `
 
 | ID | Task | Specs | Route | Status | Commit |
 | --- | --- | --- | --- | --- | --- |
-| T1 | Harden `drenyra-protocol`, `drenyra-workspace`, `drenyra-rpc`, and `drenyra-app` | S1 | worker | in_progress | - |
-| T2 | Build `crates/drenyra-ui` (`EntryDiffReview` + `ReconciliationTable`) | S2 | worker | in_progress | - |
-| T3 | Wire `crates/drenyra-ui` into root `Cargo.toml`, run full checks, and commit | S1, S2 | inline | pending | - |
-| T4 | Independent verification (`gentle-ai-verify`), native review, and stacked PR | S3 | verify | pending | - |
+| T1 | Harden `drenyra-protocol`, `drenyra-workspace`, `drenyra-rpc`, and `drenyra-app` | S1 | worker | done | `869402b9` |
+| T2 | Build `crates/drenyra-ui` (`EntryDiffReview` + `ReconciliationTable`) | S2 | worker | done | `4ad7ab4a` |
+| T3 | Wire `crates/drenyra-ui` into root `Cargo.toml`, run full checks, and commit | S1, S2 | inline | done | `4ad7ab4a` |
+| T4 | Independent verification (`gentle-ai-verify`), native review, and stacked PR | S3 | verify | done | `review-3a8f9af5b06ae5f0` / PR #396 |
 
 ## Log
 
 - **L1 — User authorization (verbatim):**
   "avanza"
+- **L2 — Phase 3 verified, reviewed, and delivered:**
+  - Commits `869402b9` (S1 hardening) and `4ad7ab4a` (S2 `crates/drenyra-ui`) on `feat/drenyra-gpui-phase3`.
+  - Independent `gentle-ai-verify` (`mwsr9ley-6-wk7n`): S1–S2 MET (`cargo test --workspace` 33/33, `--features gpui` 10/10, `cargo clippy -- -D warnings` 0 warnings).
+  - Native review `review-3a8f9af5b06ae5f0` (`review-risk`, `review-resilience`, `review-reliability`): `acknowledge-approved` (`authority: burned`, `burn_evidence: gentle-ai.review-acknowledged/v1`); 0 risk findings, 5 non-blocking advisories logged for Phase 4.
+  - Stacked PR opened: `https://github.com/arkelythex/drenyra-gpui/pull/396`.
