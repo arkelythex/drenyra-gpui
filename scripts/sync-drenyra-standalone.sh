@@ -7,7 +7,6 @@
 
 set -euo pipefail
 
-DRENYRA_ROOT="${DRENYRA_ROOT:-$HOME/Documents/PROYECTOS/drenyra}"
 DRENYRA_ROOT="${DRENYRA_STANDALONE_ROOT:-$HOME/Documents/PROYECTOS/drenyra-gpui}"
 
 MODE="dry-run"
