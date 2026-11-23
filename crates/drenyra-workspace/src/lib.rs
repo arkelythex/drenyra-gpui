@@ -47,6 +47,15 @@ impl PaneNode {
         }
     }
 
+    fn contains(&self, target_id: u64) -> bool {
+        match self {
+            Self::Leaf(leaf) => leaf.id == target_id,
+            Self::Split { first, second, .. } => {
+                first.contains(target_id) || second.contains(target_id)
+            }
+        }
+    }
+
     fn first_leaf_id(&self) -> u64 {
         match self {
             Self::Leaf(leaf) => leaf.id,
@@ -160,8 +169,8 @@ pub struct FiscalWorkspace {
     pub sidebar_open: bool,
     pub sidebar_tab: SidebarTab,
     pub guardrails: SessionGuardrails,
-    pub layout: PaneNode,
-    pub focused_pane_id: u64,
+    layout: PaneNode,
+    focused_pane_id: u64,
     next_pane_id: u64,
     closed_history: Vec<PaneLeaf>,
 }
@@ -190,28 +199,40 @@ impl FiscalWorkspace {
         }
     }
 
+    pub fn layout(&self) -> &PaneNode {
+        &self.layout
+    }
+
+    pub const fn focused_pane_id(&self) -> u64 {
+        self.focused_pane_id
+    }
+
+    /// Moves focus to `pane_id` iff that pane exists in the layout tree.
+    pub fn focus_pane(&mut self, pane_id: u64) -> bool {
+        if self.layout.contains(pane_id) {
+            self.focused_pane_id = pane_id;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Splits the focused pane along its longer side (Hyprland dwindle).
-    pub fn split_focused(
-        &mut self,
-        kind: PaneKind,
-        viewport_width: u32,
-        viewport_height: u32,
-    ) -> u64 {
-        let axis = if viewport_width >= viewport_height {
+    pub fn split_focused(&mut self, kind: PaneKind, pane_width: u32, pane_height: u32) -> u64 {
+        let axis = if pane_width >= pane_height {
             SplitAxis::Horizontal
         } else {
             SplitAxis::Vertical
         };
         let id = self.next_pane_id;
-        self.next_pane_id += 1;
-
         let new_leaf = PaneLeaf { id, kind };
-        let inserted = self
-            .layout
-            .split_leaf(self.focused_pane_id, axis, new_leaf);
-        debug_assert!(inserted, "focused pane must exist in layout");
-        self.focused_pane_id = id;
-        id
+        if self.layout.split_leaf(self.focused_pane_id, axis, new_leaf) {
+            self.next_pane_id += 1;
+            self.focused_pane_id = id;
+            id
+        } else {
+            self.focused_pane_id
+        }
     }
 
     /// Closes the focused pane if more than one pane exists, recording it for undo_close.
@@ -236,13 +257,86 @@ impl FiscalWorkspace {
     }
 
     /// Reopens the most recently closed pane by splitting the currently focused pane.
-    pub fn undo_close(&mut self, viewport_width: u32, viewport_height: u32) -> Option<u64> {
+    pub fn undo_close(&mut self, pane_width: u32, pane_height: u32) -> Option<u64> {
         let leaf = self.closed_history.pop()?;
-        Some(self.split_focused(leaf.kind, viewport_width, viewport_height))
+        Some(self.split_focused(leaf.kind, pane_width, pane_height))
     }
 
     pub fn pane_count(&self) -> usize {
         self.layout.count()
+    }
+}
+
+/// Multi-entity workspace manager (analogous to gentle-shell-gpui's project switcher `⌃⌘K`).
+#[derive(Debug, Clone, Default)]
+pub struct WorkspaceManager {
+    workspaces: Vec<FiscalWorkspace>,
+    active_index: usize,
+}
+
+impl WorkspaceManager {
+    pub fn new(initial: FiscalWorkspace) -> Self {
+        Self {
+            workspaces: vec![initial],
+            active_index: 0,
+        }
+    }
+
+    pub fn add_workspace(&mut self, workspace: FiscalWorkspace) -> usize {
+        self.workspaces.push(workspace);
+        self.workspaces.len() - 1
+    }
+
+    pub fn switch_to(&mut self, index: usize) -> bool {
+        if index < self.workspaces.len() {
+            self.active_index = index;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn active(&self) -> &FiscalWorkspace {
+        &self.workspaces[self.active_index]
+    }
+
+    pub fn active_mut(&mut self) -> &mut FiscalWorkspace {
+        &mut self.workspaces[self.active_index]
+    }
+
+    /// Returns the highest-priority background activity across non-active workspaces
+    /// (AwaitingApproval > Reconciling > Idle) for the workspace chip indicator dot.
+    pub fn background_alert(&self) -> WorkspaceActivity {
+        let mut alert = WorkspaceActivity::Idle;
+        for (idx, ws) in self.workspaces.iter().enumerate() {
+            if idx == self.active_index {
+                continue;
+            }
+            match ws.activity {
+                WorkspaceActivity::AwaitingApproval => return WorkspaceActivity::AwaitingApproval,
+                WorkspaceActivity::Reconciling => alert = WorkspaceActivity::Reconciling,
+                WorkspaceActivity::Idle => {}
+            }
+        }
+        alert
+    }
+
+    /// Case-insensitive filter over RUC, legal name, or fiscal period for the `⌘K` switcher.
+    pub fn search(&self, query: &str) -> Vec<usize> {
+        let needle = query.trim().to_ascii_lowercase();
+        if needle.is_empty() {
+            return (0..self.workspaces.len()).collect();
+        }
+        self.workspaces
+            .iter()
+            .enumerate()
+            .filter(|(_, ws)| {
+                ws.entity_ruc.to_ascii_lowercase().contains(&needle)
+                    || ws.legal_name.to_ascii_lowercase().contains(&needle)
+                    || ws.fiscal_period.to_ascii_lowercase().contains(&needle)
+            })
+            .map(|(idx, _)| idx)
+            .collect()
     }
 }
 
@@ -258,27 +352,32 @@ mod tests {
 
         let ledger_id = ws.split_focused(PaneKind::LedgerViewer, 1440, 900);
         assert_eq!(ws.pane_count(), 2);
-        assert_eq!(ws.focused_pane_id, ledger_id);
-        match &ws.layout {
+        assert_eq!(ws.focused_pane_id(), ledger_id);
+        match ws.layout() {
             PaneNode::Split { axis, .. } => assert_eq!(*axis, SplitAxis::Horizontal),
-            _ => panic!("expected horizontal split when width >= height"),
+            _ => panic!("expected horizontal split when pane_width >= pane_height"),
         }
 
         let evidence_id = ws.split_focused(PaneKind::EvidenceVault, 700, 900);
         assert_eq!(ws.pane_count(), 3);
-        assert_eq!(ws.focused_pane_id, evidence_id);
+        assert_eq!(ws.focused_pane_id(), evidence_id);
+
+        assert!(ws.focus_pane(1));
+        assert_eq!(ws.focused_pane_id(), 1);
+        assert!(!ws.focus_pane(999));
+        assert_eq!(ws.focused_pane_id(), 1);
     }
 
     #[test]
     fn closing_pane_collapses_tree_and_undo_restores_it() {
         let mut ws = FiscalWorkspace::new("20123456789", "Andino SAC", "2026-10");
         let ledger_id = ws.split_focused(PaneKind::LedgerViewer, 1440, 900);
-        assert_eq!(ws.focused_pane_id, ledger_id);
+        assert_eq!(ws.focused_pane_id(), ledger_id);
 
         let closed = ws.close_focused().expect("should close second pane");
         assert_eq!(closed.kind, PaneKind::LedgerViewer);
         assert_eq!(ws.pane_count(), 1);
-        assert_eq!(ws.focused_pane_id, 1);
+        assert_eq!(ws.focused_pane_id(), 1);
 
         // Cannot close the last remaining pane.
         assert!(ws.close_focused().is_none());
@@ -287,6 +386,32 @@ mod tests {
             .undo_close(1440, 900)
             .expect("should restore closed pane");
         assert_eq!(ws.pane_count(), 2);
-        assert_eq!(ws.focused_pane_id, restored_id);
+        assert_eq!(ws.focused_pane_id(), restored_id);
+    }
+
+    #[test]
+    fn workspace_manager_tracks_background_alerts_and_search() {
+        let ws1 = FiscalWorkspace::new("20123456789", "Andino SAC", "2026-10");
+        let mut ws2 = FiscalWorkspace::new("20987654321", "Sierra SRL", "2026-10");
+        ws2.activity = WorkspaceActivity::Reconciling;
+        let mut ws3 = FiscalWorkspace::new("20555555555", "Costa EIRL", "2026-11");
+        ws3.activity = WorkspaceActivity::AwaitingApproval;
+
+        let mut mgr = WorkspaceManager::new(ws1);
+        let idx2 = mgr.add_workspace(ws2);
+        let idx3 = mgr.add_workspace(ws3);
+
+        // Active is ws1; ws3 awaits approval so background alert is AwaitingApproval.
+        assert_eq!(mgr.background_alert(), WorkspaceActivity::AwaitingApproval);
+
+        // Switch to ws3; remaining background alert drops to ws2's Reconciling.
+        assert!(mgr.switch_to(idx3));
+        assert_eq!(mgr.active().entity_ruc, "20555555555");
+        assert_eq!(mgr.background_alert(), WorkspaceActivity::Reconciling);
+        assert!(!mgr.switch_to(99));
+
+        assert_eq!(mgr.search("sierra"), vec![idx2]);
+        assert_eq!(mgr.search("2026-10"), vec![0, idx2]);
+        assert_eq!(mgr.search(""), vec![0, idx2, idx3]);
     }
 }

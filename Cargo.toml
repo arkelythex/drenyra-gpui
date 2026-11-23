@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/drenyra-protocol",
     "crates/drenyra-workspace",
+    "crates/drenyra-rpc",
     "crates/drenyra-app",
 ]
 exclude = [

@@ -10,6 +10,11 @@ description = "Drenyra GPUI native desktop host entrypoint and environment diagn
 name = "drenyra-gpui"
 path = "src/main.rs"
 
+[features]
+default = []
+gpui = []
+
 [dependencies]
 drenyra-protocol = { path = "../drenyra-protocol" }
+drenyra-rpc = { path = "../drenyra-rpc" }
 drenyra-workspace = { path = "../drenyra-workspace" }
