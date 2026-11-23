@@ -14,7 +14,7 @@ Esta política es una decisión de negocio del propietario (2026-08-03): *"Dreny
 
 | Repo                          | Visibilidad | Rol                                        |
 | ----------------------------- | ----------- | ------------------------------------------ |
-| `arkelythex/drenyra-console`          | **private** | Producto (Drenyra Console)       |
+| `arkelythex/drenyra-gpui`             | **private** | Producto (Drenyra GPUI — host nativo Rust/GPUI + API) |
 | `arkelythex/drenyra-engram`   | **private** | Motor Go (ledger, fiscal, memoria)         |
 | `arkelythex/drenyra-ai`       | **private** | Extracción AI de la casa                   |
 | `arkelythex/drenyra-shell`     | **private** | Harness Pi de la casa                      |
