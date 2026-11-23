@@ -1,6 +1,6 @@
 # Drenyra GPUI — Phase 2: Protocol Hardening, Live RPC Supervisor & Host Diagnostics
 
-Feature: `drenyra-gpui-phase2` | Repo: `arkelythex/drenyra-gpui` | Stacked on: `feat/drenyra-gpui-pivot` (PR #394) | Status: in_progress
+Feature: `drenyra-gpui-phase2` | Repo: `arkelythex/drenyra-gpui` | Stacked on: `feat/drenyra-gpui-pivot` (PR #394) | Status: done
 
 ## Specs
 
@@ -25,10 +25,10 @@ Feature: `drenyra-gpui-phase2` | Repo: `arkelythex/drenyra-gpui` | Stacked on: `
 | ID | Task | Specs | Route | Status | Commit |
 | --- | --- | --- | --- | --- | --- |
 | T1 | Deliver Phase 1 (`Arkelythex` PR #404 + `drenyra-gpui` PR #394) | - | inline | done | `b978058a` |
-| T2 | Harden `drenyra-protocol`, `drenyra-workspace`, and `sync-drenyra-standalone.sh` | S1 | inline | in_progress | - |
-| T3 | Build `crates/drenyra-rpc` live NDJSON stdio subprocess supervisor + tests | S2 | inline | pending | - |
-| T4 | Upgrade `drenyra-app` (`--check-env`, `--probe-rpc`, `src/ui.rs` GPUI feature module) | S3 | inline | pending | - |
-| T5 | Independent verification (`gentle-ai-verify`), native review, and stacked PR | S4 | verify | pending | - |
+| T2 | Harden `drenyra-protocol`, `drenyra-workspace`, and `sync-drenyra-standalone.sh` | S1 | inline | done | `cceb9853` |
+| T3 | Build `crates/drenyra-rpc` live NDJSON stdio subprocess supervisor + tests | S2 | worker | done | `f8f4ce1f` |
+| T4 | Upgrade `drenyra-app` (`--check-env`, `--probe-rpc`, `src/ui.rs` GPUI feature module) | S3 | worker | done | `f8f4ce1f` |
+| T5 | Independent verification (`gentle-ai-verify`), native review, and stacked PR | S4 | verify | done | `review-fa59f2da0a53f77b` / PR #395 |
 
 ## Log
 
@@ -37,3 +37,8 @@ Feature: `drenyra-gpui-phase2` | Repo: `arkelythex/drenyra-gpui` | Stacked on: `
 - **L2 — Phase 1 PRs opened:**
   - `https://github.com/arkelythex/drenyra-gpui/pull/394` (`feat/drenyra-gpui-pivot`)
   - `https://github.com/arkelythex/Arkelythex/pull/404` (`docs/rename-drenyra-gpui`)
+- **L3 — Phase 2 verified, reviewed, and delivered:**
+  - Commits `cceb9853` (T2) and `f8f4ce1f` (T3+T4) on `feat/drenyra-gpui-phase2`.
+  - Independent `gentle-ai-verify` (`mwsqv1bz-3-kf9x`): S1–S3 MET (`cargo test --workspace` 18/18, `cargo clippy -- -D warnings` 0 warnings, `--features gpui` 8/8).
+  - Native review `review-fa59f2da0a53f77b` (`review-risk`, `review-resilience`, `review-reliability`): `acknowledge-approved` (`authority: burned`, `burn_evidence: gentle-ai.review-acknowledged/v1`), 9 non-blocking advisories logged for Phase 3 hardening.
+  - Stacked PR opened: `https://github.com/arkelythex/drenyra-gpui/pull/395`.

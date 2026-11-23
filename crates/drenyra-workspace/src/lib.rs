@@ -268,7 +268,7 @@ impl FiscalWorkspace {
 }
 
 /// Multi-entity workspace manager (analogous to gentle-shell-gpui's project switcher `⌃⌘K`).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct WorkspaceManager {
     workspaces: Vec<FiscalWorkspace>,
     active_index: usize,
@@ -413,5 +413,22 @@ mod tests {
         assert_eq!(mgr.search("sierra"), vec![idx2]);
         assert_eq!(mgr.search("2026-10"), vec![0, idx2]);
         assert_eq!(mgr.search(""), vec![0, idx2, idx3]);
+    }
+
+    #[test]
+    fn background_alert_ignores_active_workspace_activity() {
+        let mut active_ws = FiscalWorkspace::new("20123456789", "Andino SAC", "2026-10");
+        active_ws.activity = WorkspaceActivity::AwaitingApproval;
+        let idle_ws = FiscalWorkspace::new("20987654321", "Sierra SRL", "2026-10");
+
+        let mut mgr = WorkspaceManager::new(active_ws);
+        let idx2 = mgr.add_workspace(idle_ws);
+
+        // Active workspace is AwaitingApproval, other is Idle -> background_alert must be Idle.
+        assert_eq!(mgr.background_alert(), WorkspaceActivity::Idle);
+
+        // Switching to idx2 makes the AwaitingApproval workspace a background workspace.
+        assert!(mgr.switch_to(idx2));
+        assert_eq!(mgr.background_alert(), WorkspaceActivity::AwaitingApproval);
     }
 }

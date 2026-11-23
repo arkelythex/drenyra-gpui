@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use drenyra_protocol::{escape_json_str, JsonRpcRequest, MoneyCents};
-use drenyra_rpc::{RpcError, RpcSession, RpcTransportConfig};
+use drenyra_rpc::{RpcSession, RpcTransportConfig};
 use drenyra_workspace::SessionGuardrails;
 
 fn main() -> ExitCode {
@@ -30,18 +30,23 @@ pub fn format_check_env_json(
     )
 }
 
-pub fn probe_rpc(command: &str, args: &[String]) -> Result<String, RpcError> {
-    let config = RpcTransportConfig {
-        program: command.to_string(),
-        args: args.to_vec(),
-    };
-    let mut session = RpcSession::spawn(&config)?;
+pub fn probe_rpc(command: &str, args: &[String]) -> Result<String, String> {
+    let config = RpcTransportConfig::new(command, args.to_vec());
+    let mut session = RpcSession::spawn(&config).map_err(|err| err.to_string())?;
     let req = JsonRpcRequest {
         id: 1,
         method: "initialize".into(),
         params_json: r#"{"client":"drenyra-gpui"}"#.into(),
     };
-    session.request(&req)
+    session.request(&req).map_err(|err| {
+        let stderr = session.stderr_snapshot();
+        let stderr = stderr.trim();
+        if stderr.is_empty() {
+            err.to_string()
+        } else {
+            format!("{err} (stderr: {stderr})")
+        }
+    })
 }
 
 pub fn run_cli(args: &[String]) -> ExitCode {
@@ -156,6 +161,34 @@ mod tests {
     #[test]
     fn probe_rpc_without_command_fails() {
         assert_eq!(run_cli(&["--probe-rpc".into()]), ExitCode::FAILURE);
+    }
+
+    #[test]
+    fn probe_rpc_nonexistent_binary_and_eof_fail() {
+        assert_eq!(
+            run_cli(&[
+                "--probe-rpc".into(),
+                "definitely-not-a-real-drenyra-binary-12345".into(),
+            ]),
+            ExitCode::FAILURE
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            run_cli(&["--probe-rpc".into(), "sh".into(), "-c".into(), "exit 0".into()]),
+            ExitCode::FAILURE
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_rpc_failure_includes_non_empty_stderr_snapshot() {
+        let err = probe_rpc("sh", &["-c".into(), "echo 'boom on stderr' >&2; exit 1".into()])
+            .expect_err("expected probe_rpc failure");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("boom on stderr"),
+            "expected stderr in error message, got: {msg}"
+        );
     }
 
     #[cfg(unix)]
