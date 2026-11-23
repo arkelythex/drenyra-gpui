@@ -1,0 +1,15 @@
+[package]
+name = "drenyra-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Drenyra GPUI native desktop host entrypoint and environment diagnostics"
+
+[[bin]]
+name = "drenyra-gpui"
+path = "src/main.rs"
+
+[dependencies]
+drenyra-protocol = { path = "../drenyra-protocol" }
+drenyra-workspace = { path = "../drenyra-workspace" }

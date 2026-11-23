@@ -78,7 +78,8 @@ testsprite_tests/
 # Versioned canonical contracts are tracked deliberately (mirrors contracts/data-engine/v1 precedent)
 !/contracts/receipt-schema/
 
-# Tauri build artifacts
+# Rust workspace & Tauri build artifacts
+/target/
 apps/web/src-tauri/target/
 apps/web/src-tauri/gen/
 

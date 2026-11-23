@@ -1,0 +1,10 @@
+[package]
+name = "drenyra-workspace"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Fiscal Workspaces, Hyprland dwindle tiling panes, Accounting Sidebar, and RDA guardrails for Drenyra GPUI"
+
+[dependencies]
+drenyra-protocol = { path = "../drenyra-protocol" }
