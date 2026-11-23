@@ -1,19 +1,21 @@
 <div align="center">
 
-<img width="1200" alt="Drenyra flow — operator → Drenyra Console planes → dual approval → receipt" src="assets/branding/drenyra-console-flow-banner.light.svg#gh-light-mode-only" />
-<img width="1200" alt="Drenyra flow — operator → Drenyra Console planes → dual approval → receipt" src="assets/branding/drenyra-console-flow-banner.dark.svg#gh-dark-mode-only" />
+<img width="1200" alt="Drenyra flow — operator → Drenyra GPUI planes → dual approval → receipt" src="assets/branding/drenyra-console-flow-banner.light.svg#gh-light-mode-only" />
+<img width="1200" alt="Drenyra flow — operator → Drenyra GPUI planes → dual approval → receipt" src="assets/branding/drenyra-console-flow-banner.dark.svg#gh-dark-mode-only" />
 
-<p><code>operator → console planes → dual approval → receipt</code></p>
+<p><code>operator → drenyra-gpui planes → dual approval → receipt</code></p>
 
 </div>
 
-# Drenyra — Verifiable Financial Engineering Operating System
+# Drenyra GPUI — Native Financial Engineering Operating System
 
-> **Drenyra is the verifiable financial operating system for businesses, accountants, and governments across Latin America.**
+> **Drenyra GPUI** is the native Rust + [GPUI](https://gpui.rs/) desktop home for **Drenyra** — the verifiable financial operating system for businesses, accountants, and governments across Latin America.
 >
-> Financial Engineering Environment: agents propose, deterministic validators check, professionals approve material decisions, and every action produces an immutable evidence receipt.
+> Inspired by the philosophy of [gentle-shell-gpui](https://github.com/Gentleman-Programming/gentle-shell-gpui) (*"The app hosts, Shell does the work"*) and adapted for accounting: each tab hosts **Drenyra Shell (`drenyra-pi`)** over JSON-RPC stdio and connects to **Drenyra AI (`drenyra-ai mcp serve`)**. Agents propose, deterministic validators check, professionals approve material decisions, and every action produces an immutable evidence receipt.
 >
-> Drenyra runs on **Drenyra-AI**, the independent accounting agent operating system it consumes — framework, runtime, agents, skills, receipts, and accounting authority. Drenyra-AI also works standalone via CLI, API, other ERPs, other SaaS, and external integrations. Its product protocol is RDA (Receipt-Driven Accounting) built on the RED receipt mechanism.
+> **Philosophy & Architecture:** see [Drenyra GPUI Philosophy & Native Desktop Architecture](docs/architecture/drenyra-gpui-philosophy.md) for the 1:1 accounting adaptation of `gentle-shell-gpui`, the Rust workspace (`crates/`), and the phased retirement of the legacy `src-tauri` shell.
+>
+> **Drenyra-AI** is the independent accounting agent operating system it consumes — framework, runtime, agents, skills, receipts, and accounting authority. Drenyra-AI also works standalone via CLI, API, other ERPs, other SaaS, and external integrations. Its product protocol is RDA (Receipt-Driven Accounting) built on the RED receipt mechanism.
 >
 > **Drenyra-Shell** is the Pi-native harness that turns Pi into a disciplined accounting operator — accounting persona, commands, agents, skills, and safety guards layered over the Drenyra-AI runtime, in the same relationship Gentle Pi has to Gentle AI.
 >
@@ -22,7 +24,8 @@
 > **Ecosystem contract:** the approved boundary & authority separation (component responsibilities, chain of authority, dependency rule) is formalized in [ADR-010](docs/11-adr/ADR-010-ecosystem-boundary-authority.md) and mirrored in [Ecosystem Boundaries](docs/architecture/ecosystem-boundaries.md) across `drenyra-ai`, `drenyra-shell` and `drenyra-engram`.
 
 [![Status](https://img.shields.io/badge/Status-Active-22c55e)](#)
-[![Stack](https://img.shields.io/badge/TypeScript-Bun-3178c6)](#)
+[![Stack](https://img.shields.io/badge/Rust-GPUI-dea584)](#)
+[![Backend](https://img.shields.io/badge/TypeScript-Bun-3178c6)](#)
 [![License](https://img.shields.io/badge/License-MIT-yellow)](#)
 
 > **Private commercial product.** This repository is **private**. The ecosystem

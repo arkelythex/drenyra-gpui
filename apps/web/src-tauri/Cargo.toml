@@ -1,7 +1,11 @@
+# DEPRECATED: Legacy Tauri wrapper for apps/web.
+# Drenyra GPUI is migrating to the native Rust + GPUI host in `crates/drenyra-app`
+# (see `docs/architecture/drenyra-gpui-philosophy.md` for the phased retirement plan).
+
 [package]
-name = "drenyra-console"
+name = "drenyra-gpui"
 version = "0.1.0"
-description = "Drenyra Operational Workbench — Desktop Shell"
+description = "Drenyra GPUI — Legacy Tauri Shell (Deprecated; superseded by crates/drenyra-app)"
 authors = ["Drenyra Team"]
 edition = "2021"
 

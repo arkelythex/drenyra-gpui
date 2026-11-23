@@ -34,12 +34,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/arkelythex/drenyra-console.git"
+    "url": "git+https://github.com/arkelythex/drenyra-gpui.git"
   },
   "bugs": {
-    "url": "https://github.com/arkelythex/drenyra-console/issues"
+    "url": "https://github.com/arkelythex/drenyra-gpui/issues"
   },
-  "homepage": "https://github.com/arkelythex/drenyra-console#readme",
+  "homepage": "https://github.com/arkelythex/drenyra-gpui#readme",
   "engines": {
     "node": ">=18"
   },
