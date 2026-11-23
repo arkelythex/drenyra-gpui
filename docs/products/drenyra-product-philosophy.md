@@ -7,6 +7,8 @@
 > **Private product policy**: Drenyra is a **private, commercial product** (see
 > [Private Product Policy](./private-product-policy.md)). Repos, releases and
 > container images stay private; distribution is contractual, never public.
+>
+> **Native desktop surface (Drenyra GPUI)**: For the Rust + GPUI desktop host architecture — adapting `gentle-shell-gpui`'s *"The app hosts, Shell does the work"* philosophy to accounting — see [Drenyra GPUI Philosophy & Native Desktop Architecture](../architecture/drenyra-gpui-philosophy.md).
 
 ---
 

@@ -1,6 +1,6 @@
 # Drenyra GPUI — Rename & Native Rust/GPUI Accounting Host Pivot
 
-Feature: `drenyra-gpui-pivot` | Repo: `arkelythex/drenyra-gpui` (renamed from `arkelythex/drenyra-console`) | Status: in_progress
+Feature: `drenyra-gpui-pivot` | Repo: `arkelythex/drenyra-gpui` (renamed from `arkelythex/drenyra-console`) | Status: done
 
 ## Specs
 
@@ -17,11 +17,11 @@ Feature: `drenyra-gpui-pivot` | Repo: `arkelythex/drenyra-gpui` (renamed from `a
 
 | ID | Task | Specs | Route | Status | Commit |
 | --- | --- | --- | --- | --- | --- |
-| T1 | Rename GitHub repo, local dir, origin, and repair linked worktrees | S1 | inline | in_progress | - |
-| T2 | Update repo metadata, Go module, CI scripts, Tauri deprecation, and sibling refs | S1, S4 | inline | pending | - |
-| T3 | Author `drenyra-gpui` accounting philosophy & architecture doc + README/philosophy updates | S2 | inline | pending | - |
-| T4 | Build test-first Rust Cargo workspace (`drenyra-protocol`, `drenyra-workspace`, `drenyra-app`) | S3 | inline | pending | - |
-| T5 | Independent verification (`gentle-ai-verify`) and native review assessment | S1-S4 | verify | pending | - |
+| T1 | Rename GitHub repo, local dir, origin, and repair linked worktrees | S1 | inline | done | `bc70a968` |
+| T2 | Update repo metadata, Go module, CI scripts, Tauri deprecation, and sibling refs | S1, S4 | inline | done | `bc70a968` |
+| T3 | Author `drenyra-gpui` accounting philosophy & architecture doc + README/philosophy updates | S2 | inline | done | `bc70a968` |
+| T4 | Build test-first Rust Cargo workspace (`drenyra-protocol`, `drenyra-workspace`, `drenyra-app`) | S3 | inline | done | `4e71a216` |
+| T5 | Independent verification (`gentle-ai-verify`) and native review assessment | S1-S4 | verify | done | `review-21e554dbb30ad94d` (approved/burned) |
 
 ## Log
 
@@ -30,3 +30,7 @@ Feature: `drenyra-gpui-pivot` | Repo: `arkelythex/drenyra-gpui` (renamed from `a
 - **L2 — User scope answers (`ask_user_question`):**
   1. Renombre: `GitHub + local + ecosistema (completo)`
   2. Alcance GPUI: `Pivote completo a app nativa Rust/GPUI`
+- **L3 — Execution & T5 verification/review state:**
+  - Slice 1 (`bc70a968`): GitHub repo renamed to `arkelythex/drenyra-gpui`, local dir moved to `drenyra-gpui/`, 4 linked worktrees repaired, Go module + CI scripts + Tauri deprecation + `docs/architecture/drenyra-gpui-philosophy.md` + `README.md` updated. Sibling refs updated in `Arkelythex/` (uncommitted in `Arkelythex/`).
+  - Slice 2 (`4e71a216`): Rust Cargo workspace (`drenyra-protocol`, `drenyra-workspace`, `drenyra-app`) built test-first; 9/9 tests pass, `cargo clippy --workspace --all-targets -- -D warnings` passes, `go test ./...` passes, `./scripts/ci/odd-guard.sh` passes, DB migrations untouched.
+  - T5 closed: `review-21e554dbb30ad94d` resumed and closed with `acknowledge-approved` (`authority: burned`, `burn_evidence: gentle-ai.review-acknowledged/v1`) across `review-risk`, `review-readability`, and `review-reliability` (9 non-blocking advisories logged for Phase 2 hardening). Independent `gentle-ai-verify` (`mwsqds7s-1-dc0g`) ran and verified S1, S3, and S4 as MET, and flagged one S2 gap (missing cross-link in `docs/products/drenyra-product-philosophy.md`), which was fixed immediately.
