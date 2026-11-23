@@ -152,17 +152,199 @@ impl JsonRpcRequest {
         if trimmed.contains('\n') || trimmed.contains('\r') {
             return Err(ProtocolError::MultilineParams);
         }
-        let is_object = trimmed.starts_with('{') && trimmed.ends_with('}');
-        let is_array = trimmed.starts_with('[') && trimmed.ends_with(']');
-        if !is_object && !is_array {
-            return Err(ProtocolError::InvalidParamsContainer);
-        }
+        validate_json_container(trimmed)?;
 
         let escaped_method = escape_json_str(&self.method);
         Ok(format!(
             r#"{{"jsonrpc":"2.0","id":{},"method":"{}","params":{}}}"#,
             self.id, escaped_method, trimmed
         ))
+    }
+}
+
+const MAX_JSON_DEPTH: usize = 512;
+
+/// Validates that `input` is a single complete RFC 8259 JSON object (`{...}`) or array (`[...]`).
+pub fn validate_json_container(input: &str) -> Result<(), ProtocolError> {
+    let mut validator = JsonValidator::new(input.as_bytes());
+    validator.skip_ws();
+    match validator.peek() {
+        Some(b'{') => validator.parse_object(0)?,
+        Some(b'[') => validator.parse_array(0)?,
+        _ => return Err(ProtocolError::InvalidParamsContainer),
+    }
+    validator.skip_ws();
+    if validator.pos != validator.bytes.len() {
+        return Err(ProtocolError::InvalidParamsContainer);
+    }
+    Ok(())
+}
+
+struct JsonValidator<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> JsonValidator<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, pos: 0 }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
+    }
+
+    fn next(&mut self) -> Option<u8> {
+        let byte = self.bytes.get(self.pos).copied()?;
+        self.pos += 1;
+        Some(byte)
+    }
+
+    fn skip_ws(&mut self) {
+        while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            self.pos += 1;
+        }
+    }
+
+    fn expect_bytes(&mut self, expected: &[u8]) -> Result<(), ProtocolError> {
+        if self.bytes.get(self.pos..self.pos + expected.len()) == Some(expected) {
+            self.pos += expected.len();
+            Ok(())
+        } else {
+            Err(ProtocolError::InvalidParamsContainer)
+        }
+    }
+
+    fn parse_value(&mut self, depth: usize) -> Result<(), ProtocolError> {
+        if depth >= MAX_JSON_DEPTH {
+            return Err(ProtocolError::InvalidParamsContainer);
+        }
+        self.skip_ws();
+        match self.peek() {
+            Some(b'{') => self.parse_object(depth + 1),
+            Some(b'[') => self.parse_array(depth + 1),
+            Some(b'"') => self.parse_string(),
+            Some(b't') => self.expect_bytes(b"true"),
+            Some(b'f') => self.expect_bytes(b"false"),
+            Some(b'n') => self.expect_bytes(b"null"),
+            Some(b'-' | b'0'..=b'9') => self.parse_number(),
+            _ => Err(ProtocolError::InvalidParamsContainer),
+        }
+    }
+
+    fn parse_object(&mut self, depth: usize) -> Result<(), ProtocolError> {
+        if depth >= MAX_JSON_DEPTH {
+            return Err(ProtocolError::InvalidParamsContainer);
+        }
+        if self.next() != Some(b'{') {
+            return Err(ProtocolError::InvalidParamsContainer);
+        }
+        self.skip_ws();
+        if self.peek() == Some(b'}') {
+            self.pos += 1;
+            return Ok(());
+        }
+        loop {
+            self.skip_ws();
+            self.parse_string()?;
+            self.skip_ws();
+            if self.next() != Some(b':') {
+                return Err(ProtocolError::InvalidParamsContainer);
+            }
+            self.parse_value(depth)?;
+            self.skip_ws();
+            match self.next() {
+                Some(b',') => continue,
+                Some(b'}') => return Ok(()),
+                _ => return Err(ProtocolError::InvalidParamsContainer),
+            }
+        }
+    }
+
+    fn parse_array(&mut self, depth: usize) -> Result<(), ProtocolError> {
+        if depth >= MAX_JSON_DEPTH {
+            return Err(ProtocolError::InvalidParamsContainer);
+        }
+        if self.next() != Some(b'[') {
+            return Err(ProtocolError::InvalidParamsContainer);
+        }
+        self.skip_ws();
+        if self.peek() == Some(b']') {
+            self.pos += 1;
+            return Ok(());
+        }
+        loop {
+            self.parse_value(depth)?;
+            self.skip_ws();
+            match self.next() {
+                Some(b',') => continue,
+                Some(b']') => return Ok(()),
+                _ => return Err(ProtocolError::InvalidParamsContainer),
+            }
+        }
+    }
+
+    fn parse_string(&mut self) -> Result<(), ProtocolError> {
+        if self.next() != Some(b'"') {
+            return Err(ProtocolError::InvalidParamsContainer);
+        }
+        loop {
+            match self.next() {
+                None => return Err(ProtocolError::InvalidParamsContainer),
+                Some(b'"') => return Ok(()),
+                Some(b'\\') => match self.next() {
+                    Some(b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't') => {}
+                    Some(b'u') => {
+                        for _ in 0..4 {
+                            match self.next() {
+                                Some(b) if b.is_ascii_hexdigit() => {}
+                                _ => return Err(ProtocolError::InvalidParamsContainer),
+                            }
+                        }
+                    }
+                    _ => return Err(ProtocolError::InvalidParamsContainer),
+                },
+                Some(b) if b < 0x20 => return Err(ProtocolError::InvalidParamsContainer),
+                Some(_) => {}
+            }
+        }
+    }
+
+    fn parse_number(&mut self) -> Result<(), ProtocolError> {
+        if self.peek() == Some(b'-') {
+            self.pos += 1;
+        }
+        match self.next() {
+            Some(b'0') => {}
+            Some(b'1'..=b'9') => {
+                while matches!(self.peek(), Some(b'0'..=b'9')) {
+                    self.pos += 1;
+                }
+            }
+            _ => return Err(ProtocolError::InvalidParamsContainer),
+        }
+        if self.peek() == Some(b'.') {
+            self.pos += 1;
+            if !matches!(self.peek(), Some(b'0'..=b'9')) {
+                return Err(ProtocolError::InvalidParamsContainer);
+            }
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.pos += 1;
+            }
+        }
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            self.pos += 1;
+            if matches!(self.peek(), Some(b'+' | b'-')) {
+                self.pos += 1;
+            }
+            if !matches!(self.peek(), Some(b'0'..=b'9')) {
+                return Err(ProtocolError::InvalidParamsContainer);
+            }
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.pos += 1;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -347,5 +529,106 @@ mod tests {
             .to_ndjson(),
             Err(ProtocolError::InvalidParamsContainer)
         );
+    }
+
+    #[test]
+    fn json_validator_rejects_malformed_containers_injections_and_control_bytes() {
+        let invalid_cases = [
+            // Unbalanced braces/brackets
+            r#"{"a":1"#,
+            r#"{"a":1}}"#,
+            r#"[1,2"#,
+            r#"[1,2]]"#,
+            r#"{"a":[1,2}"#,
+            // Trailing commas
+            r#"{"a":1,}"#,
+            r#"[1,2,]"#,
+            r#"{"a":[1,]}"#,
+            // Unclosed strings / bad escapes
+            r#"{"a":"unclosed}"#,
+            r#"{"a":"bad\x41"}"#,
+            // Sibling-injection / multiple top-level objects / trailing garbage
+            r#"{"a":1},"injected":2"#,
+            r#"{"a":1}{"b":2}"#,
+            r#"[1][2]"#,
+            r#"{"a":1} trailing"#,
+            // Invalid numbers and non-container top-level values
+            r#"{"a":01}"#,
+            r#"{"a":1.}"#,
+            r#"{"a":.5}"#,
+            r#"{"a":1e}"#,
+            r#"{"a":+1}"#,
+            r#""string""#,
+            r#"123"#,
+            r#"true"#,
+            r#"null"#,
+        ];
+
+        for bad in invalid_cases {
+            assert_eq!(
+                validate_json_container(bad),
+                Err(ProtocolError::InvalidParamsContainer),
+                "expected validate_json_container to reject {bad:?}"
+            );
+            assert_eq!(
+                JsonRpcRequest {
+                    id: 1,
+                    method: "test".into(),
+                    params_json: bad.into(),
+                }
+                .to_ndjson(),
+                Err(ProtocolError::InvalidParamsContainer),
+                "expected to_ndjson to reject {bad:?}"
+            );
+        }
+
+        // All 32 ASCII control bytes (< 0x20) unescaped inside JSON strings must be rejected.
+        for byte in 0u8..0x20 {
+            let ch = byte as char;
+            let payload = format!(r#"{{"k":"{ch}"}}"#);
+            assert_eq!(
+                validate_json_container(&payload),
+                Err(ProtocolError::InvalidParamsContainer),
+                "expected validate_json_container to reject control byte 0x{byte:02x}"
+            );
+            let expected_ndjson_err = if ch == '\n' || ch == '\r' {
+                ProtocolError::MultilineParams
+            } else {
+                ProtocolError::InvalidParamsContainer
+            };
+            assert_eq!(
+                JsonRpcRequest {
+                    id: 1,
+                    method: "test".into(),
+                    params_json: payload,
+                }
+                .to_ndjson(),
+                Err(expected_ndjson_err),
+                "expected to_ndjson to reject control byte 0x{byte:02x}"
+            );
+
+            // And escape_json_str must produce a valid escaped string for every control byte < 0x20.
+            let escaped = escape_json_str(&ch.to_string());
+            let wrapped = format!(r#"{{"k":"{escaped}"}}"#);
+            assert_eq!(
+                validate_json_container(&wrapped),
+                Ok(()),
+                "expected escaped control byte 0x{byte:02x} ({wrapped}) to validate"
+            );
+        }
+
+        // Valid containers must pass.
+        for valid in [
+            r#"{}"#,
+            r#"[]"#,
+            r#"{"a":1,"b":[-0,0,12.34e-5,true,false,null],"c":["x\"y\\z\/\b\f\n\r\t\u0041"]}"#,
+            r#"  [ { "nested" : [ 1 , 2 , 3 ] } ]  "#,
+        ] {
+            assert_eq!(
+                validate_json_container(valid),
+                Ok(()),
+                "expected validate_json_container to accept {valid:?}"
+            );
+        }
     }
 }

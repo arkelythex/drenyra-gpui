@@ -1,0 +1,10 @@
+[package]
+name = "drenyra-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Accounting Generative UI domain surfaces (EntryDiffReview & ReconciliationTable) for Drenyra GPUI"
+
+[dependencies]
+drenyra-protocol = { path = "../drenyra-protocol" }

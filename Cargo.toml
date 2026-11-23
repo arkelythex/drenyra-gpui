@@ -4,6 +4,7 @@ members = [
     "crates/drenyra-protocol",
     "crates/drenyra-workspace",
     "crates/drenyra-rpc",
+    "crates/drenyra-ui",
     "crates/drenyra-app",
 ]
 exclude = [
