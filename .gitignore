@@ -23,6 +23,8 @@ drizzle/meta/
 pnpm-lock.yaml
 uv.lock
 Cargo.lock
+# The root Rust workspace ships a binary (drenyra-gpui): pin its dependency tree.
+!/Cargo.lock
 *.sum
 lighthouse-*.json
 .env

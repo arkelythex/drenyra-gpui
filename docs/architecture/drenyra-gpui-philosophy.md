@@ -67,6 +67,8 @@ cargo run -p drenyra-app --features gpui -- --window
 
 The window currently runs on deterministic demo data (two fiscal workspaces and one staged R2 proposal, labelled **DEMO DATA**) until panes are wired to live `drenyra-shell` RPC sessions. Keys: `Ctrl+D` split along the focused pane's longest side, `Ctrl+W` close, `Ctrl+Shift+T` undo close, `Ctrl+Tab` next pane, `Ctrl+K` next workspace, `J`/`K` move through review lines, `A` accept, `R` reject, `Ctrl+Q` quit. Linux needs the Wayland or X11 development libraries GPUI links against (`xkbcommon`, `wayland-client` or `xcb`, `fontconfig`, `freetype`, `vulkan`).
 
+The root `Cargo.lock` is committed so the binary and its GPUI dependency tree build reproducibly; pass `--locked` in CI and release builds. Other Rust projects in the monorepo (for example `apps/web/src-tauri`) keep their lockfiles ignored.
+
 ### Design Invariants
 
 - **Strict dependency direction:** `drenyra-app` → `drenyra-workspace` → `drenyra-protocol`. Neither `drenyra-protocol` nor `drenyra-workspace` may depend on UI/windowing crates.
