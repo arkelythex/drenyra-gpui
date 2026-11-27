@@ -296,6 +296,16 @@ impl WorkspaceManager {
         }
     }
 
+    /// Index of the active workspace; stable for the manager's lifetime because workspaces are never removed.
+    pub fn active_index(&self) -> usize {
+        self.active_index
+    }
+
+    /// Mutable access to the workspace at `index` without changing focus.
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut FiscalWorkspace> {
+        self.workspaces.get_mut(index)
+    }
+
     pub fn active(&self) -> &FiscalWorkspace {
         &self.workspaces[self.active_index]
     }

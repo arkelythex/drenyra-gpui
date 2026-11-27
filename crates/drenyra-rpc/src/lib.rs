@@ -5,7 +5,7 @@ use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use drenyra_protocol::{JsonRpcRequest, ProtocolError};
 
@@ -14,6 +14,9 @@ pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Default maximum byte length of a single JSON-RPC response line (4 MiB).
 pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Default time a child gets to exit on its own after stdin EOF before `Drop` sends SIGKILL.
+pub const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
 
 /// Maximum bytes retained in the bounded background `stderr` diagnostic buffer (64 KiB).
 const STDERR_BUFFER_CAP: usize = 64 * 1024;
@@ -27,6 +30,7 @@ pub enum RpcError {
     EmptyCommand,
     Timeout,
     ResponseTooLarge { limit: usize },
+    SessionPoisoned,
 }
 
 impl fmt::Display for RpcError {
@@ -38,8 +42,14 @@ impl fmt::Display for RpcError {
             Self::EmptyCommand => f.write_str("RPC transport command must not be empty"),
             Self::Timeout => f.write_str("RPC request timed out waiting for response"),
             Self::ResponseTooLarge { limit } => {
-                write!(f, "RPC response exceeded max_response_bytes limit ({limit})")
+                write!(
+                    f,
+                    "RPC response exceeded max_response_bytes limit ({limit})"
+                )
             }
+            Self::SessionPoisoned => f.write_str(
+                "RPC session is poisoned after a timeout or framing violation; spawn a new session",
+            ),
         }
     }
 }
@@ -52,7 +62,8 @@ impl std::error::Error for RpcError {
             Self::UnexpectedEof
             | Self::EmptyCommand
             | Self::Timeout
-            | Self::ResponseTooLarge { .. } => None,
+            | Self::ResponseTooLarge { .. }
+            | Self::SessionPoisoned => None,
         }
     }
 }
@@ -76,16 +87,23 @@ pub struct RpcTransportConfig {
     pub args: Vec<String>,
     pub request_timeout: Duration,
     pub max_response_bytes: usize,
+    /// Time the child gets to exit cleanly after stdin EOF before `Drop` kills it.
+    ///
+    /// Worst-case `Drop` latency is roughly `shutdown_grace` + kill/reap + a 50ms reader-join
+    /// window, so raising it directly lengthens teardown of an unresponsive child.
+    pub shutdown_grace: Duration,
 }
 
 impl RpcTransportConfig {
-    /// Builds a transport configuration with safe defaults (`30s` timeout, `4 MiB` response cap).
+    /// Builds a transport configuration with safe defaults (`30s` timeout, `4 MiB` response cap,
+    /// `250ms` shutdown grace).
     pub fn new(program: impl Into<String>, args: Vec<String>) -> Self {
         Self {
             program: program.into(),
             args,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+            shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
         }
     }
 }
@@ -96,6 +114,8 @@ pub struct RpcSession {
     stdin: Option<BufWriter<ChildStdin>>,
     stdout_rx: mpsc::Receiver<Result<Option<String>, RpcError>>,
     request_timeout: Duration,
+    shutdown_grace: Duration,
+    poisoned: bool,
     stderr_buffer: Arc<Mutex<Vec<u8>>>,
     stderr_done: Arc<(Mutex<bool>, Condvar)>,
     stdout_thread: Option<JoinHandle<()>>,
@@ -179,6 +199,8 @@ impl RpcSession {
             stdin: Some(BufWriter::new(stdin)),
             stdout_rx,
             request_timeout: config.request_timeout,
+            shutdown_grace: config.shutdown_grace,
+            poisoned: false,
             stderr_buffer,
             stderr_done,
             stdout_thread: Some(stdout_thread),
@@ -201,12 +223,20 @@ impl RpcSession {
 
     /// Sends one validated NDJSON `JsonRpcRequest` line and reads one NDJSON response line.
     pub fn request(&mut self, req: &JsonRpcRequest) -> Result<String, RpcError> {
+        if self.poisoned {
+            return Err(RpcError::SessionPoisoned);
+        }
+
         let frame = req.to_ndjson()?;
 
-        let stdin = self.stdin.as_mut().ok_or(RpcError::UnexpectedEof)?;
+        let Some(stdin) = self.stdin.as_mut() else {
+            self.poisoned = true;
+            return Err(RpcError::UnexpectedEof);
+        };
 
         if let Err(err) = write_frame(stdin, &frame) {
             self.wait_stderr_briefly();
+            self.poisoned = true;
             if err.kind() == io::ErrorKind::BrokenPipe {
                 return Err(RpcError::UnexpectedEof);
             }
@@ -217,21 +247,38 @@ impl RpcSession {
             Ok(Ok(Some(line))) => Ok(line),
             Ok(Ok(None)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
                 self.wait_stderr_briefly();
+                self.poisoned = true;
                 Err(RpcError::UnexpectedEof)
             }
             Ok(Err(err)) => {
                 self.wait_stderr_briefly();
+                self.poisoned = true;
                 Err(err)
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => Err(RpcError::Timeout),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                self.poisoned = true;
+                Err(RpcError::Timeout)
+            }
         }
     }
 
     fn wait_stderr_briefly(&self) {
         let (lock, cvar) = &*self.stderr_done;
-        if let Ok(done) = lock.lock() {
-            if !*done {
-                let _ = cvar.wait_timeout(done, Duration::from_millis(20));
+        let deadline = Instant::now() + Duration::from_millis(20);
+        if let Ok(mut done) = lock.lock() {
+            while !*done {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let (guard, timeout_res) = match cvar.wait_timeout(done, remaining) {
+                    Ok(res) => res,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                done = guard;
+                if timeout_res.timed_out() {
+                    break;
+                }
             }
         }
     }
@@ -298,15 +345,18 @@ impl Drop for RpcSession {
         // Close stdin first so cooperative subprocesses can exit cleanly on EOF.
         drop(self.stdin.take());
 
+        let grace_deadline = Instant::now() + self.shutdown_grace;
         let mut exited = false;
-        for _ in 0..10 {
+        loop {
             match self.child.try_wait() {
                 Ok(Some(_)) => {
                     exited = true;
                     break;
                 }
-                Ok(None) => thread::sleep(Duration::from_millis(5)),
-                Err(_) => break,
+                Ok(None) if Instant::now() < grace_deadline => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Ok(None) | Err(_) => break,
             }
         }
         if !exited {
@@ -319,11 +369,30 @@ impl Drop for RpcSession {
             let _ = self.child.wait();
         }
 
-        if let Some(handle) = self.stdout_thread.take() {
-            let _ = handle.join();
-        }
-        if let Some(handle) = self.stderr_thread.take() {
-            let _ = handle.join();
+        let join_deadline = Instant::now() + Duration::from_millis(50);
+        let mut stdout_handle = self.stdout_thread.take();
+        let mut stderr_handle = self.stderr_thread.take();
+        loop {
+            if let Some(handle) = stdout_handle.take() {
+                if handle.is_finished() {
+                    let _ = handle.join();
+                } else {
+                    stdout_handle = Some(handle);
+                }
+            }
+            if let Some(handle) = stderr_handle.take() {
+                if handle.is_finished() {
+                    let _ = handle.join();
+                } else {
+                    stderr_handle = Some(handle);
+                }
+            }
+            if (stdout_handle.is_none() && stderr_handle.is_none())
+                || Instant::now() >= join_deadline
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
         }
     }
 }
@@ -405,6 +474,7 @@ mod tests {
         assert_eq!(cfg.args, vec!["--mode", "rpc"]);
         assert_eq!(cfg.request_timeout, Duration::from_secs(30));
         assert_eq!(cfg.max_response_bytes, 4 * 1024 * 1024);
+        assert_eq!(cfg.shutdown_grace, Duration::from_millis(250));
     }
 
     #[cfg(unix)]
@@ -425,7 +495,9 @@ mod tests {
             method: "ping".into(),
             params_json: "{}".into(),
         };
-        let resp = session.request(&req).expect("noisy child should not deadlock");
+        let resp = session
+            .request(&req)
+            .expect("noisy child should not deadlock");
         assert!(resp.contains(r#""result":"ok""#));
 
         let snap = session.stderr_snapshot();
@@ -486,7 +558,9 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&marker);
 
-        let script = r#"cat >/dev/null; sleep 0.01; printf 'clean' > "$1""#;
+        // Handshake first so the child is already running and blocked on stdin when Drop
+        // closes it; this removes the race between `sh` startup and the Drop grace window.
+        let script = r#"IFS= read -r _; printf '{"jsonrpc":"2.0","id":1,"result":"ready"}\n'; cat >/dev/null; printf 'clean' > "$1""#;
         let cfg = RpcTransportConfig::new(
             "sh",
             vec![
@@ -496,7 +570,15 @@ mod tests {
                 marker.to_string_lossy().into_owned(),
             ],
         );
-        let session = RpcSession::spawn(&cfg).expect("spawn cooperative child");
+        let mut session = RpcSession::spawn(&cfg).expect("spawn cooperative child");
+        let ready = session
+            .request(&JsonRpcRequest {
+                id: 1,
+                method: "ping".into(),
+                params_json: "{}".into(),
+            })
+            .expect("cooperative child handshake");
+        assert!(ready.contains(r#""result":"ready""#));
         drop(session);
 
         let contents = std::fs::read_to_string(&marker).unwrap_or_default();
@@ -505,5 +587,187 @@ mod tests {
             contents, "clean",
             "cooperative child should exit cleanly on stdin EOF before SIGKILL"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reusing_timed_out_session_returns_session_poisoned_instead_of_stale_reply() {
+        let script = r#"IFS= read -r _; sleep 0.1; printf '{"jsonrpc":"2.0","id":1,"result":"late"}\n'; IFS= read -r _"#;
+        let mut cfg = RpcTransportConfig::new("sh", vec!["-c".into(), script.into()]);
+        cfg.request_timeout = Duration::from_millis(20);
+        let mut session = RpcSession::spawn(&cfg).expect("spawn delayed responder");
+
+        let req1 = JsonRpcRequest {
+            id: 1,
+            method: "ping".into(),
+            params_json: "{}".into(),
+        };
+        let err1 = session.request(&req1).expect_err("expected Timeout");
+        assert!(matches!(err1, RpcError::Timeout), "got {err1:?}");
+
+        // Wait until the delayed reply has definitely arrived in the stdout channel.
+        thread::sleep(Duration::from_millis(120));
+
+        let req2 = JsonRpcRequest {
+            id: 2,
+            method: "ping".into(),
+            params_json: "{}".into(),
+        };
+        let err2 = session
+            .request(&req2)
+            .expect_err("expected SessionPoisoned on second request");
+        assert!(
+            matches!(err2, RpcError::SessionPoisoned),
+            "expected SessionPoisoned, got {err2:?}"
+        );
+        assert_eq!(
+            err2.to_string(),
+            "RPC session is poisoned after a timeout or framing violation; spawn a new session"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_stderr_briefly_continues_waiting_after_spurious_wakeup_until_done() {
+        let cfg = RpcTransportConfig::new("sh", vec!["-c".into(), "exec sleep 1".into()]);
+        let session = RpcSession::spawn(&cfg).expect("spawn child");
+
+        let done_pair = Arc::clone(&session.stderr_done);
+        let done_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+        let done_at_writer = Arc::clone(&done_at);
+        let notifier = thread::spawn(move || {
+            // Several spurious wakeups while `*done == false`, so at least one reaches the waiter.
+            for _ in 0..8 {
+                thread::sleep(Duration::from_millis(1));
+                done_pair.1.notify_all();
+            }
+            // Real completion, timestamped under the same lock the waiter observes.
+            if let Ok(mut done) = done_pair.0.lock() {
+                *done = true;
+                *done_at_writer.lock().expect("done_at lock") = Some(Instant::now());
+                done_pair.1.notify_all();
+            }
+        });
+
+        let start = Instant::now();
+        session.wait_stderr_briefly();
+        let returned_at = Instant::now();
+        let _ = notifier.join();
+
+        let done_at = done_at
+            .lock()
+            .expect("done_at lock")
+            .expect("notifier completed");
+        // Correct behaviour: return only after completion, or after the full 20ms deadline.
+        assert!(
+            returned_at >= done_at
+                || returned_at.duration_since(start) >= Duration::from_millis(20),
+            "wait_stderr_briefly returned on a spurious wakeup after {:?}, before completion",
+            returned_at.duration_since(start)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reusing_oversized_response_session_returns_session_poisoned() {
+        let script = r#"IFS= read -r _; printf '%0256d\n' 0; IFS= read -r _; printf '{"jsonrpc":"2.0","id":2,"result":"ok"}\n'"#;
+        let mut cfg = RpcTransportConfig::new("sh", vec!["-c".into(), script.into()]);
+        cfg.max_response_bytes = 64;
+        let mut session = RpcSession::spawn(&cfg).expect("spawn oversized responder");
+
+        let req1 = JsonRpcRequest {
+            id: 1,
+            method: "ping".into(),
+            params_json: "{}".into(),
+        };
+        let err1 = session
+            .request(&req1)
+            .expect_err("expected ResponseTooLarge");
+        assert!(
+            matches!(err1, RpcError::ResponseTooLarge { limit: 64 }),
+            "got {err1:?}"
+        );
+
+        let req2 = JsonRpcRequest {
+            id: 2,
+            method: "ping".into(),
+            params_json: "{}".into(),
+        };
+        let err2 = session
+            .request(&req2)
+            .expect_err("expected SessionPoisoned after framing violation");
+        assert!(
+            matches!(err2, RpcError::SessionPoisoned),
+            "expected SessionPoisoned, got {err2:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drop_returns_promptly_even_when_grandchild_inherits_pipes() {
+        let cfg = RpcTransportConfig::new("sh", vec!["-c".into(), "(sleep 2) & exit 0".into()]);
+        let session = RpcSession::spawn(&cfg).expect("spawn child with detached grandchild");
+        let start = std::time::Instant::now();
+        drop(session);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "Drop took {elapsed:?}, expected < 500ms even with detached grandchild holding pipes"
+        );
+    }
+
+    #[cfg(unix)]
+    fn marker_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "drenyra-rpc-{tag}-{}-{}.marker",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ))
+    }
+
+    #[cfg(unix)]
+    fn drop_slow_flushing_child(shutdown_grace: Duration) -> String {
+        let marker = marker_path("grace");
+        let _ = std::fs::remove_file(&marker);
+        // The child needs ~100ms after stdin EOF to flush, like a real server persisting state.
+        let script = r#"IFS= read -r _; printf '{"jsonrpc":"2.0","id":1,"result":"ready"}\n'; cat >/dev/null; sleep 0.1; printf 'clean' > "$1""#;
+        let mut cfg = RpcTransportConfig::new(
+            "sh",
+            vec![
+                "-c".into(),
+                script.into(),
+                "_".into(),
+                marker.to_string_lossy().into_owned(),
+            ],
+        );
+        cfg.shutdown_grace = shutdown_grace;
+        let mut session = RpcSession::spawn(&cfg).expect("spawn slow-flushing child");
+        session
+            .request(&JsonRpcRequest {
+                id: 1,
+                method: "ping".into(),
+                params_json: "{}".into(),
+            })
+            .expect("slow-flushing child handshake");
+        drop(session);
+        thread::sleep(Duration::from_millis(200));
+        let contents = std::fs::read_to_string(&marker).unwrap_or_default();
+        let _ = std::fs::remove_file(&marker);
+        contents
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drop_waits_up_to_shutdown_grace_for_slow_cooperative_child() {
+        assert_eq!(drop_slow_flushing_child(Duration::from_secs(2)), "clean");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drop_kills_child_that_outlives_zero_shutdown_grace() {
+        assert_eq!(drop_slow_flushing_child(Duration::ZERO), "");
     }
 }

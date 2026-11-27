@@ -1,6 +1,8 @@
 //! Drenyra GPUI — native desktop host binary entrypoint.
 
 #[cfg_attr(not(test), allow(dead_code))]
+pub mod controller;
+#[cfg_attr(not(test), allow(dead_code))]
 mod ui;
 
 use std::env;
@@ -8,9 +10,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use drenyra_protocol::{escape_json_str, JsonRpcRequest, MoneyCents};
+use controller::{ControllerError, DrenyraHostController};
+use drenyra_protocol::{
+    escape_json_str, validate_json_container, JournalEntryProposal, JournalLine, JsonRpcRequest,
+    MoneyCents, RiskTier,
+};
 use drenyra_rpc::{RpcSession, RpcTransportConfig};
-use drenyra_workspace::SessionGuardrails;
+use drenyra_workspace::{FiscalWorkspace, PaneKind, SessionGuardrails};
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -49,15 +55,98 @@ pub fn probe_rpc(command: &str, args: &[String]) -> Result<String, String> {
     })
 }
 
+pub fn run_demo_session_json() -> Result<String, ControllerError> {
+    let workspace = FiscalWorkspace::new("20123456789", "Andino SAC", "2026-10");
+    let mut controller = DrenyraHostController::new(workspace);
+    controller
+        .workspaces_mut()
+        .active_mut()
+        .split_focused(PaneKind::LedgerViewer, 1440, 900);
+    let pane_count = controller.workspaces().active().pane_count();
+
+    let proposal = JournalEntryProposal {
+        id: "je-demo-2026-10-001".into(),
+        entity_ruc: "20123456789".into(),
+        fiscal_period: "2026-10".into(),
+        risk_tier: RiskTier::R2Material,
+        lines: vec![
+            JournalLine {
+                account_code: "1212".into(),
+                debit: MoneyCents::from_cents(11_800),
+                credit: MoneyCents::ZERO,
+                description: "Accounts receivable".into(),
+            },
+            JournalLine {
+                account_code: "7011".into(),
+                debit: MoneyCents::ZERO,
+                credit: MoneyCents::from_cents(10_000),
+                description: "Sales revenue".into(),
+            },
+            JournalLine {
+                account_code: "40111".into(),
+                debit: MoneyCents::ZERO,
+                credit: MoneyCents::from_cents(1_800),
+                description: "IGV 18%".into(),
+            },
+        ],
+    };
+    controller.stage_proposal(proposal)?;
+
+    let blocked_before_approval = matches!(
+        controller.build_post_request(),
+        Err(ControllerError::ReviewNotReadyToPost)
+    );
+
+    let review = controller
+        .active_review_mut()
+        .ok_or(ControllerError::NoStagedReview)?;
+    review.accept_all();
+    if !review.record_human_approval("CPA-PERU-001") {
+        return Err(ControllerError::ReviewNotReadyToPost);
+    }
+
+    let frame = controller.build_post_request()?;
+    let unposted_before_confirmation = controller.workspaces().active().guardrails.unposted_entries;
+    // The demo has no live transport, so it confirms the in-flight post deterministically.
+    let request_id = controller
+        .pending_post_request()
+        .ok_or(ControllerError::UnknownPostRequest)?;
+    controller.confirm_posted(request_id)?;
+    let posted_frame_valid = !frame.contains('\n')
+        && !frame.contains('\r')
+        && validate_json_container(&frame).is_ok()
+        && frame.contains(r#""method":"tools/call""#)
+        && frame.contains(r#""name":"ledger_post""#);
+
+    let active = controller.workspaces().active();
+    Ok(format!(
+        r#"{{"entity_ruc":"{}","fiscal_period":"{}","pane_count":{},"blocked_before_approval":{},"posted_frame_valid":{},"unposted_before_confirmation":{},"unposted_entries":{},"frame":{}}}"#,
+        escape_json_str(&active.entity_ruc),
+        escape_json_str(&active.fiscal_period),
+        pane_count,
+        blocked_before_approval,
+        posted_frame_valid,
+        unposted_before_confirmation,
+        active.guardrails.unposted_entries,
+        frame,
+    ))
+}
+
 pub fn run_cli(args: &[String]) -> ExitCode {
     match args {
-        [] | [_] if matches!(args.first().map(String::as_str), None | Some("--help" | "-h")) => {
+        [] | [_]
+            if matches!(
+                args.first().map(String::as_str),
+                None | Some("--help" | "-h")
+            ) =>
+        {
             println!("drenyra-gpui {}", env!("CARGO_PKG_VERSION"));
             println!("Native Rust + GPUI accounting desktop host for Drenyra Shell & Drenyra AI.");
             println!();
             println!("Usage:");
             println!("  drenyra-gpui --help                       Show this help message");
             println!("  drenyra-gpui --check-env                  Print headless RPC host environment diagnostics (JSON)");
+            println!("  drenyra-gpui --demo-session               Run deterministic end-to-end controller & approval gate demo (JSON)");
             println!("  drenyra-gpui --probe-rpc <cmd> [args...]  Probe an NDJSON stdio JSON-RPC 2.0 server");
             ExitCode::SUCCESS
         }
@@ -76,6 +165,16 @@ pub fn run_cli(args: &[String]) -> ExitCode {
             );
             ExitCode::SUCCESS
         }
+        [flag] if flag == "--demo-session" => match run_demo_session_json() {
+            Ok(json) => {
+                println!("{json}");
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("drenyra-gpui: --demo-session failed: {err}");
+                ExitCode::FAILURE
+            }
+        },
         [flag] if flag == "--probe-rpc" => {
             eprintln!("drenyra-gpui: --probe-rpc requires a <command> argument");
             ExitCode::FAILURE
@@ -92,7 +191,7 @@ pub fn run_cli(args: &[String]) -> ExitCode {
         },
         _ => {
             eprintln!(
-                "drenyra-gpui: unrecognized arguments: {} (try --help, --check-env, or --probe-rpc)",
+                "drenyra-gpui: unrecognized arguments: {} (try --help, --check-env, --demo-session, or --probe-rpc)",
                 args.join(" ")
             );
             ExitCode::FAILURE
@@ -174,7 +273,12 @@ mod tests {
         );
         #[cfg(unix)]
         assert_eq!(
-            run_cli(&["--probe-rpc".into(), "sh".into(), "-c".into(), "exit 0".into()]),
+            run_cli(&[
+                "--probe-rpc".into(),
+                "sh".into(),
+                "-c".into(),
+                "exit 0".into()
+            ]),
             ExitCode::FAILURE
         );
     }
@@ -182,8 +286,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn probe_rpc_failure_includes_non_empty_stderr_snapshot() {
-        let err = probe_rpc("sh", &["-c".into(), "echo 'boom on stderr' >&2; exit 1".into()])
-            .expect_err("expected probe_rpc failure");
+        let err = probe_rpc(
+            "sh",
+            &["-c".into(), "echo 'boom on stderr' >&2; exit 1".into()],
+        )
+        .expect_err("expected probe_rpc failure");
         let msg = err.to_string();
         assert!(
             msg.contains("boom on stderr"),
@@ -231,5 +338,25 @@ mod tests {
 
         assert!(!non_exec_ok);
         assert!(exec_ok);
+    }
+
+    #[test]
+    fn demo_session_json_and_cli_succeed_with_expected_fields() {
+        let json = run_demo_session_json().expect("demo session should succeed");
+        assert_eq!(drenyra_protocol::validate_json_container(&json), Ok(()));
+        assert!(json.contains(r#""entity_ruc":"20123456789""#));
+        assert!(json.contains(r#""pane_count":2"#));
+        assert!(json.contains(r#""blocked_before_approval":true"#));
+        assert!(json.contains(r#""posted_frame_valid":true"#));
+        assert!(json.contains(r#""unposted_before_confirmation":1"#));
+        assert!(json.contains(r#""unposted_entries":0"#));
+        assert!(json.contains(r#""name":"ledger_post""#));
+        assert!(json.contains(r#""approved_by":"CPA-PERU-001""#));
+
+        assert_eq!(run_cli(&["--demo-session".into()]), ExitCode::SUCCESS);
+        assert_eq!(
+            run_cli(&["--demo-session".into(), "--extra".into()]),
+            ExitCode::FAILURE
+        );
     }
 }
