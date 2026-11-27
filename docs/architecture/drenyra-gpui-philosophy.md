@@ -77,6 +77,8 @@ The window currently runs on deterministic demo data (two fiscal workspaces and 
 
 **Settings › Themes.** `Ctrl+,` (or the **Settings** chip in the top bar) opens the Settings overlay. Its Themes section offers **Dreamcoder Dark** (default) and **Dreamcoder Light**; choose with `J`/`K` and `Enter`, or click a theme card. The choice is saved to `$XDG_CONFIG_HOME/drenyra-gpui/settings.toml` (falling back to `~/.config/drenyra-gpui/settings.toml`) and used on the next start; an unreadable or unknown value falls back to the default. Theme colors are copied verbatim from the canonical Dreamcoder palette (`dreamcoder-workbench/DreamcoderThemes/dreamcoder/tokens.json`), and `shell::theme` tests enforce WCAG AA contrast for every text and status role on every surface the window uses. `shell::window` defines no colors of its own.
 
+**End-to-end check.** `scripts/drenyra-gpui-e2e.sh [output-dir]` runs the real window inside its own Xvfb display (never the operator's desktop), drives it with xdotool, asserts the non-visual outcomes (theme saved, `Ctrl+Q` exits 0, every agent process exits) and leaves screenshots of each step: approval blocked and recorded, palette, workspace switch, sidebar toggle, composer typing (`@`, `ñ`, letters that are shortcuts elsewhere), Settings › Themes. It needs Xvfb (`xorg-server-xvfb` on Arch), xdotool and ImageMagick; Vulkan presents through Mesa's software path (`MESA_VK_WSI_DEBUG=sw`) because Xvfb has no DRI3. No prompt is sent to the agent.
+
 The root `Cargo.lock` is committed so the binary and its GPUI dependency tree build reproducibly; pass `--locked` in CI and release builds. Other Rust projects in the monorepo (for example `apps/web/src-tauri`) keep their lockfiles ignored.
 
 ### Design Invariants

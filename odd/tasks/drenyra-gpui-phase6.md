@@ -1,6 +1,6 @@
 # Drenyra GPUI — Phase 6: Live Agent Pane, Settings & DreamCoder Themes, Operator Surfaces
 
-Feature: `drenyra-gpui-phase6` | Branch: `feat/drenyra-gpui-phase6` stacked on `fix/gpui-approval-invalidated-on-edit` (PR #401) | Delivery: `ask-on-risk` (chain strategy already established: stacked PRs) | Runner: `cargo test --workspace --locked` (+ `--all-features`) | Status: ready for review (PRs #402–#406); S4 extra pane kinds pending
+Feature: `drenyra-gpui-phase6` | Branch: `feat/drenyra-gpui-phase6` stacked on `fix/gpui-approval-invalidated-on-edit` (PR #401) | Delivery: `ask-on-risk` (chain strategy already established: stacked PRs) | Runner: `cargo test --workspace --locked` (+ `--all-features`) | Status: ready for review (PRs #402–#406), E2E-verified; S4 extra pane kinds pending
 
 ## Specs
 
@@ -96,3 +96,9 @@ Assumptions (marked): keys keep Ctrl on Linux; the selected theme persists acros
   - #406 `feat/drenyra-gpui-phase6` (d3bf29fb, 725f88da, 2a35bfe7, dbb0cd81, this log)
   - Every slice passes tests, clippy (with and without `gpui`) and fmt in isolation with its own target dir (111 → 154 tests). A first run with a shared target dir reported stale counts and was discarded.
   - Open: S4 additional pane kinds (not started); live checks of the approval dialog, palette and sidebar (left to the operator); follow-ups 1–8 in L11; merge is the user's decision.
+- **L13 — 2026-11-27 isolated E2E.** User (verbatim): "prueba tu vos median mcp , cli o /u api has como los mejores del mundo o los que estan en la vanguardia 2026".
+  - Approach: the real binary on its own Xvfb display (operator installed `xorg-server-xvfb`), xdotool/XTEST input confined to that display, screenshots via ImageMagick. Rejected: driving the operator's Hyprland (incident in L7), rootful Xwayland (visible window, focus theft), GPUI test harness (pulls `git2`).
+  - Findings: Vulkan needs `MESA_VK_WSI_DEBUG=sw` on Xvfb (no DRI3), and the first frame appears after the first configure/expose; both are harness details, not product defects.
+  - Verified live, previously unverified: approval dialog blocked → typed `CPA-PERU-001` → "Approved by CPA-PERU-001" + "Ready to post" (sidebar updated); palette filter + run (switch to Sierra); Sierra starts its own pi (two agent processes, R0 Read, review hidden; Andino keeps its state); `Ctrl+B` sidebar toggle; composer typed `saldo@caja ñ jk` without triggering shortcuts; Settings › Themes applied Light and saved it; `Ctrl+Q` exit 0 and both agents exited.
+  - Committed as `scripts/drenyra-gpui-e2e.sh` (shellcheck clean): 5/5 assertions PASS in 45 s, no Xvfb left behind, all 10 screenshots non-blank.
+  - Still not exercised: sending a real prompt (calls a paid model), clicks (keyboard paths only).
