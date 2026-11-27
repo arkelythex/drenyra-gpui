@@ -61,15 +61,15 @@ impl WindowBootstrapPlan {
 }
 
 /// Mount boundary for native GPUI builds (`cargo build --features gpui`): validates the
-/// configuration, then blocks in the GPUI event loop until the window closes.
+/// configuration, then blocks in the GPUI event loop until the window closes. Fails if the
+/// configuration is invalid or the window cannot be opened.
 #[cfg(feature = "gpui")]
 pub fn mount_native_window(
     config: DesktopShellConfig,
     state: crate::shell::commands::ShellState,
 ) -> Result<(), String> {
     config.validate()?;
-    crate::shell::window::run(config, state);
-    Ok(())
+    crate::shell::window::run(config, state)
 }
 
 #[cfg(test)]

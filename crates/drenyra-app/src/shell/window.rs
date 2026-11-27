@@ -3,6 +3,9 @@
 //! This module holds no domain logic. Everything it shows comes from the view model and every
 //! key it handles goes through [`ShellState::apply`], both unit-tested without a display.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use gpui::{
     actions, div, prelude::*, px, rgb, size, App, Application, Bounds, Context, FocusHandle,
     KeyBinding, Rgba, SharedString, Window, WindowBounds, WindowOptions,
@@ -46,7 +49,12 @@ const RED: u32 = 0xef6b6b;
 const FOOTER_HINT: &str = "Ctrl+D split · Ctrl+W close · Ctrl+Shift+T undo · Ctrl+Tab next pane · Ctrl+K next workspace · J/K line · A accept · R reject · Ctrl+Q quit";
 
 /// Opens the native window and runs the GPUI event loop until the window closes.
-pub fn run(config: DesktopShellConfig, state: ShellState) {
+///
+/// Returns `Err` when the window could not be opened, so `--window` exits non-zero instead of
+/// reporting success after the event loop quits.
+pub fn run(config: DesktopShellConfig, state: ShellState) -> Result<(), String> {
+    let open_error: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    let open_error_slot = Rc::clone(&open_error);
     Application::new().run(move |cx: &mut App| {
         cx.bind_keys(key_bindings());
         cx.bind_keys([KeyBinding::new("ctrl-q", Quit, None)]);
@@ -83,12 +91,14 @@ pub fn run(config: DesktopShellConfig, state: ShellState) {
             })
         });
         if let Err(err) = opened {
-            eprintln!("drenyra-gpui: failed to open native window: {err}");
+            *open_error_slot.borrow_mut() = Some(format!("failed to open native window: {err}"));
             cx.quit();
             return;
         }
         cx.activate(true);
     });
+    let error = open_error.borrow_mut().take();
+    error.map_or(Ok(()), Err)
 }
 
 /// GPUI key bindings derived from [`KEY_BINDINGS`]; the match is exhaustive, so every command
