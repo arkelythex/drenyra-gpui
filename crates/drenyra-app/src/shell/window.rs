@@ -51,6 +51,7 @@ actions!(
         OpenApproval,
         OpenPalette,
         ToggleSidebar,
+        RestartAgent,
         Quit
     ]
 );
@@ -178,6 +179,7 @@ fn key_bindings() -> Vec<KeyBinding> {
             ShellCommand::OpenApproval => KeyBinding::new(key, OpenApproval, context),
             ShellCommand::OpenPalette => KeyBinding::new(key, OpenPalette, context),
             ShellCommand::ToggleSidebar => KeyBinding::new(key, ToggleSidebar, context),
+            ShellCommand::RestartAgent => KeyBinding::new(key, RestartAgent, context),
         })
         .collect()
 }
@@ -227,6 +229,11 @@ impl ShellWindow {
         let key = self.state.active_workspace_key();
         if self.state.agent_pane(&key).status() != &AgentStatus::NotStarted {
             return false;
+        }
+        // A restarted pane may still own its previous session. Its Drop can wait for the agent's
+        // grace period, so it runs off the UI thread.
+        if let Some(previous) = self.sessions.remove(&key) {
+            std::thread::spawn(move || drop(previous));
         }
         let pane = self.state.agent_pane_mut(&key);
         match agent_launch(crate::find_in_path) {
@@ -412,6 +419,9 @@ impl Render for ShellWindow {
             }))
             .on_action(cx.listener(|this, _: &OpenPalette, w, cx| {
                 this.dispatch(ShellCommand::OpenPalette, w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &RestartAgent, w, cx| {
+                this.dispatch(ShellCommand::RestartAgent, w, cx)
             }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, w, cx| {
                 this.dispatch(ShellCommand::ToggleSidebar, w, cx)
@@ -770,6 +780,9 @@ fn agent_body(
                         .child("Ask the Fiscal Agent about this company. Press I or click below to start typing.")
                 }))
                 .children(agent.transcript.iter().map(|entry| transcript_entry(entry.role, &entry.text, t)))
+                .children(agent.restart_hint.as_ref().map(|hint| {
+                    div().text_color(rgb(t.warning)).child(hint.clone())
+                }))
                 .children((!agent.streaming_text.is_empty()).then(|| {
                     transcript_entry(EntryRole::Agent, &format!("{}▍", agent.streaming_text), t)
                 })),

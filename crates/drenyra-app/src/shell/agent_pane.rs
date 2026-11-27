@@ -27,6 +27,9 @@ pub fn agent_launch(
     ))
 }
 
+/// Transcript notice written when the operator restarts a stopped agent.
+pub const RESTART_NOTICE: &str = "Restarting the agent…";
+
 /// Transcript entries kept per pane; older entries are dropped first.
 pub const TRANSCRIPT_LIMIT: usize = 500;
 
@@ -116,6 +119,28 @@ impl AgentPane {
         self.status = AgentStatus::Starting;
         let id = self.next_command_id("s");
         self.outbox.push(get_state_command(&id));
+    }
+
+    /// True when the agent stopped or could not start, so the operator can restart it.
+    pub fn can_restart(&self) -> bool {
+        matches!(
+            self.status,
+            AgentStatus::Stopped(_) | AgentStatus::Unavailable(_)
+        )
+    }
+
+    /// Asks the window to start a fresh agent process: back to `NotStarted`, keeping the
+    /// transcript and the composer draft. Returns `false` unless [`Self::can_restart`].
+    pub fn restart(&mut self) -> bool {
+        if !self.can_restart() {
+            return false;
+        }
+        self.outbox.clear();
+        self.streaming_text.clear();
+        self.model = None;
+        self.push(EntryRole::Notice, RESTART_NOTICE.to_owned());
+        self.status = AgentStatus::NotStarted;
+        true
     }
 
     /// Records that no agent could be started.
@@ -315,6 +340,40 @@ mod tests {
             streaming: false,
         }));
         pane
+    }
+
+    #[test]
+    fn restart_is_offered_only_after_the_agent_stopped_or_was_unavailable() {
+        let mut pane = ready_pane();
+        assert!(!pane.can_restart());
+        assert!(!pane.restart(), "a ready agent is not restarted");
+
+        pane.composer_insert("borrador");
+        pane.apply(AgentUpdate::Failed("broken pipe".into()));
+        assert!(pane.can_restart());
+        assert!(pane.restart());
+        assert_eq!(pane.status(), &AgentStatus::NotStarted);
+        assert!(
+            pane.take_outbox().is_empty(),
+            "the old session gets nothing"
+        );
+        assert_eq!(pane.composer(), "borrador", "the draft survives");
+        let last = pane.transcript().last().expect("restart notice");
+        assert_eq!(
+            (last.role, last.text.as_str()),
+            (EntryRole::Notice, RESTART_NOTICE)
+        );
+        assert!(
+            pane.transcript()
+                .iter()
+                .any(|e| e.text == "Agent session stopped: broken pipe"),
+            "history is kept"
+        );
+
+        let mut missing = AgentPane::default();
+        missing.mark_unavailable(NO_AGENT_MESSAGE);
+        assert!(missing.restart());
+        assert!(!missing.restart(), "already waiting for a new start");
     }
 
     fn json(line: &str) -> Value {

@@ -95,6 +95,7 @@ const fn command_label(command: ShellCommand) -> Option<&'static str> {
         ShellCommand::OpenSettings => "Open settings",
         ShellCommand::FocusComposer => "Ask the Fiscal Agent",
         ShellCommand::StopAgent => "Stop the running agent",
+        ShellCommand::RestartAgent => "Restart the agent",
         ShellCommand::OpenApproval => "Record human approval…",
         ShellCommand::ToggleSidebar => "Toggle sidebar",
         ShellCommand::CloseOverlay | ShellCommand::Confirm | ShellCommand::OpenPalette => {
@@ -173,6 +174,8 @@ pub enum ShellCommand {
     FocusComposer,
     /// Stop the active workspace's running agent.
     StopAgent,
+    /// Start a fresh agent for the active workspace after it stopped or could not start.
+    RestartAgent,
     /// Open the human-approval dialog for the staged entry.
     OpenApproval,
     /// Open the command palette.
@@ -197,6 +200,7 @@ pub const ALL_COMMANDS: &[ShellCommand] = &[
     ShellCommand::Confirm,
     ShellCommand::FocusComposer,
     ShellCommand::StopAgent,
+    ShellCommand::RestartAgent,
     ShellCommand::OpenApproval,
     ShellCommand::OpenPalette,
     ShellCommand::ToggleSidebar,
@@ -220,6 +224,7 @@ pub const KEY_BINDINGS: &[(&str, ShellCommand)] = &[
     ("enter", ShellCommand::Confirm),
     ("i", ShellCommand::FocusComposer),
     ("ctrl-c", ShellCommand::StopAgent),
+    ("ctrl-shift-r", ShellCommand::RestartAgent),
     ("ctrl-p", ShellCommand::OpenApproval),
     ("ctrl-shift-p", ShellCommand::OpenPalette),
     ("ctrl-b", ShellCommand::ToggleSidebar),
@@ -442,7 +447,14 @@ impl ShellState {
             ShellViewModel::build(&self.controller, pane_area, self.review_cursor, self.demo);
         view.theme = self.settings.theme;
         let pane = self.agent_pane(&self.active_workspace_key());
-        view.agent = Some(AgentPaneView::from_pane(&pane, self.composer_active));
+        let mut agent = AgentPaneView::from_pane(&pane, self.composer_active);
+        agent.restart_hint = pane.can_restart().then(|| {
+            format!(
+                "Press {} to restart the agent.",
+                key_hint(ShellCommand::RestartAgent)
+            )
+        });
+        view.agent = Some(agent);
         view.sidebar = self.sidebar_open.then(|| SidebarView {
             companies: self
                 .controller
@@ -562,6 +574,10 @@ impl ShellState {
             ShellCommand::StopAgent => {
                 let key = self.active_workspace_key();
                 self.agent_pane_mut(&key).stop()
+            }
+            ShellCommand::RestartAgent => {
+                let key = self.active_workspace_key();
+                self.agent_pane_mut(&key).restart()
             }
             ShellCommand::OpenSettings => {
                 let current = ThemeId::ALL
@@ -832,6 +848,39 @@ mod tests {
         assert_eq!(
             s.agent_pane(&sierra).status(),
             &AgentStatus::Unavailable("sierra only".into())
+        );
+    }
+
+    #[test]
+    fn restart_agent_acts_only_on_the_active_workspace_s_stopped_agent() {
+        let mut s = state();
+        let (andino, sierra) = (key(&s, 0), key(&s, 1));
+        assert!(
+            !s.apply(ShellCommand::RestartAgent, WIDE),
+            "nothing to restart"
+        );
+        s.agent_pane_mut(&andino).mark_started();
+        s.agent_pane_mut(&andino)
+            .apply(drenyra_rpc::agent::AgentUpdate::Exited);
+        s.agent_pane_mut(&sierra)
+            .apply(drenyra_rpc::agent::AgentUpdate::Exited);
+
+        assert_eq!(
+            command_label(ShellCommand::RestartAgent),
+            Some("Restart the agent")
+        );
+        assert_eq!(key_hint(ShellCommand::RestartAgent), "Ctrl+Shift+R");
+        assert!(s.apply(ShellCommand::RestartAgent, WIDE));
+        assert_eq!(s.agent_pane(&andino).status(), &AgentStatus::NotStarted);
+        assert!(
+            matches!(s.agent_pane(&sierra).status(), AgentStatus::Stopped(_)),
+            "the other company's agent is untouched"
+        );
+        assert!(s.view(WIDE).agent.expect("agent").restart_hint.is_none());
+        assert!(s.apply(ShellCommand::NextWorkspace, WIDE));
+        assert_eq!(
+            s.view(WIDE).agent.expect("agent").restart_hint.as_deref(),
+            Some("Press Ctrl+Shift+R to restart the agent.")
         );
     }
 
