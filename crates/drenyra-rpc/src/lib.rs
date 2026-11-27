@@ -633,26 +633,37 @@ mod tests {
         let session = RpcSession::spawn(&cfg).expect("spawn child");
 
         let done_pair = Arc::clone(&session.stderr_done);
+        let done_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+        let done_at_writer = Arc::clone(&done_at);
         let notifier = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(3));
-            // Spurious wakeup while `*done == false`
-            done_pair.1.notify_all();
-            thread::sleep(Duration::from_millis(5));
-            // Real completion
+            // Several spurious wakeups while `*done == false`, so at least one reaches the waiter.
+            for _ in 0..8 {
+                thread::sleep(Duration::from_millis(1));
+                done_pair.1.notify_all();
+            }
+            // Real completion, timestamped under the same lock the waiter observes.
             if let Ok(mut done) = done_pair.0.lock() {
                 *done = true;
+                *done_at_writer.lock().expect("done_at lock") = Some(Instant::now());
                 done_pair.1.notify_all();
             }
         });
 
         let start = Instant::now();
         session.wait_stderr_briefly();
-        let elapsed = start.elapsed();
+        let returned_at = Instant::now();
         let _ = notifier.join();
 
+        let done_at = done_at
+            .lock()
+            .expect("done_at lock")
+            .expect("notifier completed");
+        // Correct behaviour: return only after completion, or after the full 20ms deadline.
         assert!(
-            elapsed >= Duration::from_millis(7),
-            "wait_stderr_briefly returned too early on spurious wakeup ({elapsed:?})"
+            returned_at >= done_at
+                || returned_at.duration_since(start) >= Duration::from_millis(20),
+            "wait_stderr_briefly returned on a spurious wakeup after {:?}, before completion",
+            returned_at.duration_since(start)
         );
     }
 
