@@ -3,6 +3,40 @@
 use drenyra_protocol::{JournalEntryProposal, MoneyCents};
 
 /// Per-line human review decision for a proposed double-entry journal line.
+/// Characters that render invisibly, reorder text or break lines: controls, line and paragraph
+/// separators, zero-width and joiner characters, the soft hyphen, the byte-order mark, Unicode
+/// bidirectional formatting, variation selectors, tag characters, interlinear annotation marks
+/// and blank "filler" letters.
+fn is_hidden_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{00AD}'
+                | '\u{034F}'
+                | '\u{061C}'
+                | '\u{115F}'
+                | '\u{1160}'
+                | '\u{17B4}'
+                | '\u{17B5}'
+                | '\u{180B}'..='\u{180F}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{206F}'
+                | '\u{3164}'
+                | '\u{FE00}'..='\u{FE0F}'
+                | '\u{FEFF}'
+                | '\u{FFA0}'
+                | '\u{FFF9}'..='\u{FFFB}'
+                | '\u{1D173}'..='\u{1D17A}'
+                | '\u{E0000}'..='\u{E007F}'
+                | '\u{E0100}'..='\u{E01EF}'
+        )
+}
+
+/// Longest approver ID accepted by [`EntryDiffReview::record_human_approval`], in characters.
+pub const MAX_APPROVER_ID_CHARS: usize = 128;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LineDecision {
     Pending,
@@ -97,11 +131,18 @@ impl EntryDiffReview {
             .all(|decision| !matches!(decision, LineDecision::Pending))
     }
 
-    /// Records explicit human approval for posting. Rejects empty or whitespace-only approver IDs.
+    /// Records explicit human approval for posting.
+    ///
+    /// The ID is trimmed and must then be 1 to [`MAX_APPROVER_ID_CHARS`] characters with no
+    /// control, zero-width or bidirectional-formatting characters, so the recorded approver is
+    /// always exactly what a reader sees. A rejected ID leaves any previous approval in place.
     pub fn record_human_approval(&mut self, approver: impl Into<String>) -> bool {
         let raw = approver.into();
         let trimmed = raw.trim();
-        if trimmed.is_empty() {
+        if trimmed.is_empty()
+            || trimmed.chars().count() > MAX_APPROVER_ID_CHARS
+            || trimmed.chars().any(is_hidden_char)
+        {
             return false;
         }
         self.approved_by = Some(trimmed.to_string());
@@ -390,6 +431,48 @@ mod tests {
         assert!(!r.can_post());
         assert!(r.record_human_approval("CPA-2"));
         assert!(r.can_post());
+    }
+
+    #[test]
+    fn approver_ids_must_be_visible_and_bounded() {
+        let mut review = EntryDiffReview::new(sample_proposal(RiskTier::R2Material, true));
+        review.accept_all();
+        for invisible in [
+            "\u{200B}",
+            " \u{FEFF} ",
+            "\u{2060}\u{00AD}",
+            "CPA\u{202E}100-APC",
+            "CPA\u{2066}1",
+            "CPA\u{200D}1",
+            "CPA\n1",
+            "CPA\u{2028}1",
+            "CPA\u{3164}",
+            "\u{115F}\u{1160}",
+            "CPA\u{FE0F}1",
+            "CPA\u{E0041}1",
+            "CPA\u{206F}1",
+        ] {
+            assert!(
+                !review.record_human_approval(invisible),
+                "{invisible:?} must be rejected"
+            );
+            assert_eq!(review.approved_by(), None);
+        }
+        let longest = "C".repeat(MAX_APPROVER_ID_CHARS);
+        assert!(review.record_human_approval(longest.clone()));
+        assert_eq!(review.approved_by(), Some(longest.as_str()));
+        assert!(!review.record_human_approval("C".repeat(MAX_APPROVER_ID_CHARS + 1)));
+        assert_eq!(
+            review.approved_by(),
+            Some(longest.as_str()),
+            "a rejected ID keeps the previous one"
+        );
+        assert!(review.record_human_approval("  CPA-PERU-001 "));
+        assert_eq!(review.approved_by(), Some("CPA-PERU-001"));
+        assert!(
+            review.record_human_approval("Contadora Ñuñez Ü"),
+            "non-ASCII letters are visible"
+        );
     }
 
     #[test]

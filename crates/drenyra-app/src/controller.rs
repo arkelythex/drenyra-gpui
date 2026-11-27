@@ -124,6 +124,11 @@ impl DrenyraHostController {
         self.reviews.get(&self.workspaces.active_index())
     }
 
+    /// Staged review of the workspace at `index`, read-only (for overviews such as the sidebar).
+    pub fn review(&self, index: usize) -> Option<&EntryDiffReview> {
+        self.reviews.get(&index)
+    }
+
     pub fn active_review_mut(&mut self) -> Option<&mut EntryDiffReview> {
         self.reviews.get_mut(&self.workspaces.active_index())
     }
@@ -512,7 +517,10 @@ mod tests {
         {
             let review = controller.active_review_mut().expect("staged review");
             review.accept_all();
-            assert!(review.record_human_approval("CPA\\\"01\nPERU"));
+            // Approver IDs cannot carry newlines or other hidden characters (drenyra-ui guard);
+            // quotes and backslashes are visible and still need escaping in the frame.
+            assert!(!review.record_human_approval("CPA\\\"01\nPERU"));
+            assert!(review.record_human_approval("CPA\\\"01 PERU"));
         }
 
         let frame = controller

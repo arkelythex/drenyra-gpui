@@ -17,11 +17,20 @@ pub const REVIEW_PANEL_WIDTH: u32 = 440;
 
 /// Region left for the dwindle panes in a `width` x `height` viewport (pane-area coordinates).
 pub const fn pane_area(width: u32, height: u32, has_review: bool) -> Rect {
+    pane_area_with(width, height, has_review, false)
+}
+
+/// Width of the sidebar, in pixels.
+pub const SIDEBAR_WIDTH: u32 = 260;
+
+/// Like [`pane_area`], also excluding the sidebar when it is open.
+pub const fn pane_area_with(width: u32, height: u32, has_review: bool, has_sidebar: bool) -> Rect {
     let panel = if has_review { REVIEW_PANEL_WIDTH } else { 0 };
+    let sidebar = if has_sidebar { SIDEBAR_WIDTH } else { 0 };
     Rect {
         x: 0,
         y: 0,
-        width: width.saturating_sub(panel),
+        width: width.saturating_sub(panel).saturating_sub(sidebar),
         height: height.saturating_sub(TOP_BAR_HEIGHT + FOOTER_HEIGHT),
     }
 }
@@ -122,6 +131,49 @@ pub struct ApprovalDialogView {
     pub error: Option<&'static str>,
 }
 
+/// A staged journal entry listed in the sidebar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidebarEntry {
+    pub proposal_id: String,
+    pub risk_tier_label: &'static str,
+    pub status: &'static str,
+}
+
+/// One fiscal workspace in the sidebar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidebarCompany {
+    pub index: usize,
+    pub legal_name: String,
+    pub entity_ruc: String,
+    pub fiscal_period: String,
+    pub activity: WorkspaceActivity,
+    pub active: bool,
+    pub unposted_entries: usize,
+    pub staged: Option<SidebarEntry>,
+}
+
+/// The sidebar: every company and its unposted entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidebarView {
+    pub companies: Vec<SidebarCompany>,
+}
+
+/// One row of the command palette.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaletteEntry {
+    pub label: String,
+    /// Key hint such as `Ctrl+D`; empty when the action has no shortcut.
+    pub keys: String,
+    pub selected: bool,
+}
+
+/// The command palette: typed query and the entries that match it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaletteView {
+    pub query: String,
+    pub entries: Vec<PaletteEntry>,
+}
+
 /// Transcript entries rendered per frame (the pane keeps more; the oldest scroll out first).
 pub const VISIBLE_TRANSCRIPT: usize = 200;
 
@@ -211,6 +263,10 @@ pub struct ShellViewModel {
     pub agent: Option<AgentPaneView>,
     /// The approval dialog, when open.
     pub approval: Option<ApprovalDialogView>,
+    /// The command palette, when open.
+    pub palette: Option<PaletteView>,
+    /// The sidebar, when open.
+    pub sidebar: Option<SidebarView>,
 }
 
 impl ShellViewModel {
@@ -268,6 +324,8 @@ impl ShellViewModel {
             settings: None,
             agent: None,
             approval: None,
+            palette: None,
+            sidebar: None,
         }
     }
 
@@ -623,6 +681,19 @@ mod tests {
         let panel = vm.review.expect("review panel");
         assert!(panel.rows[2].cursor);
         assert_eq!(panel.rows.iter().filter(|r| r.cursor).count(), 1);
+    }
+
+    #[test]
+    fn pane_area_with_sidebar_also_excludes_the_sidebar() {
+        assert_eq!(
+            pane_area_with(1440, 900, true, true).width,
+            1440 - REVIEW_PANEL_WIDTH - SIDEBAR_WIDTH
+        );
+        assert_eq!(
+            pane_area_with(1440, 900, false, false),
+            pane_area(1440, 900, false)
+        );
+        assert_eq!(pane_area_with(100, 10, true, true).width, 0, "no underflow");
     }
 
     #[test]

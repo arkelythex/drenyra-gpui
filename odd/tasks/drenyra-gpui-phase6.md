@@ -1,6 +1,6 @@
 # Drenyra GPUI — Phase 6: Live Agent Pane, Settings & DreamCoder Themes, Operator Surfaces
 
-Feature: `drenyra-gpui-phase6` | Branch: `feat/drenyra-gpui-phase6` stacked on `fix/gpui-approval-invalidated-on-edit` (PR #401) | Delivery: `ask-on-risk` (chain strategy already established: stacked PRs) | Runner: `cargo test --workspace --locked` (+ `--all-features`) | Status: in progress
+Feature: `drenyra-gpui-phase6` | Branch: `feat/drenyra-gpui-phase6` stacked on `fix/gpui-approval-invalidated-on-edit` (PR #401) | Delivery: `ask-on-risk` (chain strategy already established: stacked PRs) | Runner: `cargo test --workspace --locked` (+ `--all-features`) | Status: ready for review (PRs #402–#406), E2E-verified; S4 extra pane kinds pending
 
 ## Specs
 
@@ -21,9 +21,9 @@ Assumptions (marked): keys keep Ctrl on Linux; the selected theme persists acros
 | T2 | Settings section with Themes selector | S2 | inline | done | see L4 |
 | T3 | Live agent session protocol + pane (prompt input, streamed output, failure states) | S1 | inline | done (a: `4150a5b8`; b: see L6) | — |
 | T4 | Approval command/dialog | S4 | inline | done (see L7) | — |
-| T5 | Command palette | S4 | inline | pending | — |
-| T6 | Sidebar | S4 | inline | pending | — |
-| T7 | Checks, visual check both themes, verifier, RDD, PRs | S5 | verify | pending | — |
+| T5 | Command palette | S4 | inline | done (see L8) | — |
+| T6 | Sidebar | S4 | inline | done (see L9) | — |
+| T7 | Checks, visual check both themes, verifier, RDD, PRs | S5 | verify | done (see L12) | #402–#406 |
 
 ## Log
 
@@ -63,3 +63,42 @@ Assumptions (marked): keys keep Ctrl on Linux; the selected theme persists acros
   - Incident: an absolute `ydotool mousemove` landed outside the app (scaling mismatch) and one left click hit the operator's Herdr window. Desktop automation stopped for the rest of this phase; remaining live checks are left to the operator.
   - Not verified live: the approval dialog (open, blocked state, typing, Enter), `Ctrl+P`, the Approve… click.
   - Risk: item 2 (human-approval guard UI) → independent verifier.
+- **L8 — 2026-11-27 T5 command palette.**
+  - RED → GREEN: 14 compile errors → 3 palette tests + key-hint/fuzzy test. Palette entries run through `ShellState::apply` (no second command path); workspace and theme entries reuse `switch_to` / `select_theme`. The exhaustive `KEY_BINDINGS` match in the window caught the new command at compile time.
+  - Checks: 145 tests headless / 144 with features; clippy `-D warnings` both ways; fmt.
+  - Not verified live (desktop automation stopped, see L7): `Ctrl+Shift+P`, the ⌘ Commands click, arrow keys in the palette.
+  - Risk: none of items 1-6 (new command and overlay; existing commands unchanged).
+- **L9 — 2026-11-27 T6 sidebar.**
+  - RED → GREEN: 18 compile errors → 3 tests (sidebar listing and statuses, toggle, `switch_workspace`, `pane_area_with`). The palette's workspace entries now reuse `switch_workspace` (one path that also leaves the composer and resets the cursor).
+  - Data shown is real only: companies, staged entries and their status; documents and ledgers show a note (no source yet). New read-only `DrenyraHostController::review(index)`; mutations still go only through the active workspace.
+  - Checks: 148 tests headless / 147 with features; clippy `-D warnings` both ways; fmt.
+  - Not verified live (desktop automation stopped, see L7): sidebar rendering, `Ctrl+B`, company clicks.
+  - Risk: none of items 1-6 (adds a read-only accessor; layout gains a column).
+  - Remaining from S4: additional pane kinds (Ledger, Evidence, CLI bodies) — pending, not started.
+- **L10 — 2026-11-27 T4 verifier and approver-ID hardening.**
+  - T4 verifier: PASS, no blockers (no sequence records an approval on an unbalanced entry, with pending/rejected lines, a blank ID, or on another workspace; dialog/composer text separate; CLI output byte-identical; static review: the only `record_human_approval` call is `ShellState::apply_in_approval`).
+  - Advisories A1 (invisible IDs such as U+200B or bidi overrides accepted) and A2 (no length cap) fixed in `EntryDiffReview::record_human_approval`: trimmed ID must be 1..=128 chars with no control, zero-width or bidi-formatting characters; a rejected ID keeps the previous approval. RED observed ("\u{200b}" must be rejected) → GREEN.
+  - Contract change (item 3, tightening): an approver ID with a newline is now refused. The only consumer is `drenyra-app`; the controller escaping test kept its quote/backslash approver and now pins the refusal; newline escaping stays covered by the proposal ID.
+  - Adopted 3 verifier probes (tenant isolation of approval into the post frame, unbalanced entry, dialog/composer separation) plus one test tying the dialog message to `MAX_APPROVER_ID_CHARS`.
+  - Not fixed (recorded): A3 Ctrl+C cannot stop the agent while the dialog is open; A4 the dialog backdrop does not block clicks (all handlers behind it go through the modal `dispatch`); A5 R0/R1 entries can carry an optional approval (existing drenyra-ui behavior; product decision).
+  - Checks: 153 tests headless / 152 with features; clippy both ways; fmt.
+- **L11 — 2026-11-27 native reviews (RDD), consent granted by the operator for all four.**
+  - Slice 2 agent client `review-639e163d7612c9c7` (risk, resilience, reliability), slice 3 live agent pane `review-4770acc9ecf2b27f` (resilience, reliability), slice 4 approval dialog `review-64101cc35ae1f697` (risk, reliability), approver-ID hardening `review-ffb7583c4d016742` (risk, reliability): all approved and acknowledged; advisories only.
+  - Fixed after review: AltGr text was dropped by the composer/approval field (`@` is AltGr+Q on Latin American keyboards) → pure `typed_text` helper with tests; hidden-character denylist extended (line/paragraph separators, Hangul fillers, variation selectors, tag characters, interlinear annotations, deprecated format chars, musical formatting); architecture doc no longer claims a declined dialog "never grants anything". RED not observed for these (tests written with the fix).
+  - Already fixed earlier: Drop blocking on the writer lock (`c171fba4`, reported again on slice 2 which predates it).
+  - Follow-ups (not fixed, recorded): (1) `AgentSession::send` runs on the UI thread and can block it if the agent stops reading stdin with a full pipe — needs a dedicated writer thread; (2) agents are keyed by workspace index (safe while workspaces are never removed or reordered; key by RUC + period when removal exists); (3) a stopped/failed agent has no restart action; (4) re-approval overwrites the previous approver; (5) R0/R1 entries can carry an optional approval; (6) Ctrl+C cannot stop the agent while a modal is open; (7) keyboard routing in `window.rs` has no automated test (the GPUI harness needs `git2`); (8) the "focused" chip in pane headers was dropped.
+  - Checks: 154 tests headless / 153 with features; clippy both ways; fmt.
+- **L12 — 2026-11-27 delivery.** Stacked PRs (strategy: nested PRs, as established earlier by the user):
+  - #402 `feat/gpui-dreamcoder-themes` (67ed65b8) → base #401
+  - #403 `feat/gpui-agent-protocol-client` (4150a5b8)
+  - #404 `feat/gpui-live-agent-pane` (86d7330a, c171fba4)
+  - #405 `feat/gpui-approval-dialog` (86d470be)
+  - #406 `feat/drenyra-gpui-phase6` (d3bf29fb, 725f88da, 2a35bfe7, dbb0cd81, this log)
+  - Every slice passes tests, clippy (with and without `gpui`) and fmt in isolation with its own target dir (111 → 154 tests). A first run with a shared target dir reported stale counts and was discarded.
+  - Open: S4 additional pane kinds (not started); live checks of the approval dialog, palette and sidebar (left to the operator); follow-ups 1–8 in L11; merge is the user's decision.
+- **L13 — 2026-11-27 isolated E2E.** User (verbatim): "prueba tu vos median mcp , cli o /u api has como los mejores del mundo o los que estan en la vanguardia 2026".
+  - Approach: the real binary on its own Xvfb display (operator installed `xorg-server-xvfb`), xdotool/XTEST input confined to that display, screenshots via ImageMagick. Rejected: driving the operator's Hyprland (incident in L7), rootful Xwayland (visible window, focus theft), GPUI test harness (pulls `git2`).
+  - Findings: Vulkan needs `MESA_VK_WSI_DEBUG=sw` on Xvfb (no DRI3), and the first frame appears after the first configure/expose; both are harness details, not product defects.
+  - Verified live, previously unverified: approval dialog blocked → typed `CPA-PERU-001` → "Approved by CPA-PERU-001" + "Ready to post" (sidebar updated); palette filter + run (switch to Sierra); Sierra starts its own pi (two agent processes, R0 Read, review hidden; Andino keeps its state); `Ctrl+B` sidebar toggle; composer typed `saldo@caja ñ jk` without triggering shortcuts; Settings › Themes applied Light and saved it; `Ctrl+Q` exit 0 and both agents exited.
+  - Committed as `scripts/drenyra-gpui-e2e.sh` (shellcheck clean): 5/5 assertions PASS in 45 s, no Xvfb left behind, all 10 screenshots non-blank.
+  - Still not exercised: sending a real prompt (calls a paid model), clicks (keyboard paths only).
