@@ -122,6 +122,22 @@ pub struct ApprovalDialogView {
     pub error: Option<&'static str>,
 }
 
+/// One row of the command palette.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaletteEntry {
+    pub label: String,
+    /// Key hint such as `Ctrl+D`; empty when the action has no shortcut.
+    pub keys: String,
+    pub selected: bool,
+}
+
+/// The command palette: typed query and the entries that match it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaletteView {
+    pub query: String,
+    pub entries: Vec<PaletteEntry>,
+}
+
 /// Transcript entries rendered per frame (the pane keeps more; the oldest scroll out first).
 pub const VISIBLE_TRANSCRIPT: usize = 200;
 
@@ -211,6 +227,8 @@ pub struct ShellViewModel {
     pub agent: Option<AgentPaneView>,
     /// The approval dialog, when open.
     pub approval: Option<ApprovalDialogView>,
+    /// The command palette, when open.
+    pub palette: Option<PaletteView>,
 }
 
 impl ShellViewModel {
@@ -268,6 +286,7 @@ impl ShellViewModel {
             settings: None,
             agent: None,
             approval: None,
+            palette: None,
         }
     }
 

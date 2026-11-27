@@ -24,9 +24,9 @@ use super::commands::{ShellCommand, ShellState, KEY_BINDINGS};
 use super::settings::save_if_changed;
 use super::theme::{ThemeId, ThemeTokens};
 use super::view_model::{
-    pane_area, AgentPaneView, ApprovalDialogView, GuardrailChips, PaneTile, ReviewPanel,
-    RowDecision, SettingsPanel, ShellViewModel, StatusTone, ThemeOption, WorkspaceChip,
-    FOOTER_HEIGHT, REVIEW_PANEL_WIDTH, TOP_BAR_HEIGHT,
+    pane_area, AgentPaneView, ApprovalDialogView, GuardrailChips, PaletteView, PaneTile,
+    ReviewPanel, RowDecision, SettingsPanel, ShellViewModel, StatusTone, ThemeOption,
+    WorkspaceChip, FOOTER_HEIGHT, REVIEW_PANEL_WIDTH, TOP_BAR_HEIGHT,
 };
 use crate::ui::DesktopShellConfig;
 use drenyra_workspace::{PaneKind, WorkspaceActivity};
@@ -49,6 +49,7 @@ actions!(
         FocusComposer,
         StopAgent,
         OpenApproval,
+        OpenPalette,
         Quit
     ]
 );
@@ -57,7 +58,7 @@ actions!(
 const MONO_FONT: &str = "JetBrainsMono Nerd Font";
 
 /// Keys shown in the footer, in display order.
-const FOOTER_HINT: &str = "I ask the agent · Ctrl+P approve · Ctrl+D split · Ctrl+W close · Ctrl+Shift+T undo · Ctrl+Tab next pane · Ctrl+K next workspace · J/K line · A accept · R reject · Ctrl+, settings · Ctrl+Q quit";
+const FOOTER_HINT: &str = "Ctrl+Shift+P commands · I ask the agent · Ctrl+P approve · Ctrl+D split · Ctrl+W close · Ctrl+Shift+T undo · Ctrl+Tab next pane · Ctrl+K next workspace · J/K line · A accept · R reject · Ctrl+, settings · Ctrl+Q quit";
 /// Footer keys while typing a prompt.
 const COMPOSER_HINT: &str =
     "Type your question · Enter send · Esc stop typing · Ctrl+C stop the agent";
@@ -66,6 +67,9 @@ const AGENT_POLL_INTERVAL: Duration = Duration::from_millis(40);
 /// Key context for single-key bindings; absent while typing so letters reach the composer.
 const SHELL_CONTEXT: &str = "DrenyraShell";
 const COMPOSER_CONTEXT: &str = "DrenyraComposer";
+
+/// Footer keys while the command palette is open.
+const PALETTE_HINT: &str = "Type to filter · Up/Down choose · Enter run · Esc close";
 
 /// Footer keys while the approval dialog is open.
 const APPROVAL_HINT: &str = "Type the approver's ID · Enter record approval · Esc cancel";
@@ -171,6 +175,7 @@ fn key_bindings() -> Vec<KeyBinding> {
             ShellCommand::FocusComposer => KeyBinding::new(key, FocusComposer, context),
             ShellCommand::StopAgent => KeyBinding::new(key, StopAgent, context),
             ShellCommand::OpenApproval => KeyBinding::new(key, OpenApproval, context),
+            ShellCommand::OpenPalette => KeyBinding::new(key, OpenPalette, context),
         })
         .collect()
 }
@@ -253,6 +258,14 @@ impl ShellWindow {
                 false
             }
             "backspace" => self.state.backspace(),
+            "up" => {
+                self.dispatch(ShellCommand::ReviewCursorUp, window, cx);
+                false
+            }
+            "down" => {
+                self.dispatch(ShellCommand::ReviewCursorDown, window, cx);
+                false
+            }
             _ if mods.control || mods.alt || mods.platform || mods.function => return,
             _ => match keystroke.key_char.as_deref() {
                 Some(text) => self.state.type_text(text),
@@ -296,6 +309,13 @@ impl Render for ShellWindow {
         let vm = self.state.view(self.pane_area(window));
         let t = vm.theme.tokens();
 
+        let commands_button = div()
+            .id("open-palette")
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _: &ClickEvent, w, cx| {
+                this.dispatch(ShellCommand::OpenPalette, w, cx)
+            }))
+            .child(chip("⌘ Commands", t.text_muted, &t));
         let settings_button = div()
             .id("open-settings")
             .cursor_pointer()
@@ -365,6 +385,9 @@ impl Render for ShellWindow {
             .on_action(cx.listener(|this, _: &OpenApproval, w, cx| {
                 this.dispatch(ShellCommand::OpenApproval, w, cx)
             }))
+            .on_action(cx.listener(|this, _: &OpenPalette, w, cx| {
+                this.dispatch(ShellCommand::OpenPalette, w, cx)
+            }))
             .on_action(cx.listener(|this, _: &SplitFocused, w, cx| {
                 this.dispatch(ShellCommand::SplitFocused, w, cx)
             }))
@@ -409,7 +432,7 @@ impl Render for ShellWindow {
             .bg(rgb(t.canvas))
             .text_color(rgb(t.text))
             .text_sm()
-            .child(top_bar(&vm, settings_button, &t))
+            .child(top_bar(&vm, commands_button, settings_button, &t))
             .child(
                 div()
                     .flex_1()
@@ -431,6 +454,7 @@ impl Render for ShellWindow {
             )
             .child(footer(
                 vm.settings.is_some(),
+                vm.palette.is_some(),
                 vm.approval.is_some(),
                 vm.agent.as_ref().is_some_and(|a| a.composer_active),
                 self.save_error.as_deref(),
@@ -442,10 +466,20 @@ impl Render for ShellWindow {
                     .as_ref()
                     .map(|dialog| approval_dialog(dialog, &t)),
             )
+            .children(
+                vm.palette
+                    .as_ref()
+                    .map(|palette| command_palette(palette, &t)),
+            )
     }
 }
 
-fn top_bar(vm: &ShellViewModel, settings_button: impl IntoElement, t: &ThemeTokens) -> gpui::Div {
+fn top_bar(
+    vm: &ShellViewModel,
+    commands_button: impl IntoElement,
+    settings_button: impl IntoElement,
+    t: &ThemeTokens,
+) -> gpui::Div {
     div()
         .h(px(TOP_BAR_HEIGHT as f32))
         .flex_none()
@@ -478,6 +512,7 @@ fn top_bar(vm: &ShellViewModel, settings_button: impl IntoElement, t: &ThemeToke
                 .gap_2()
                 .items_center()
                 .child(guardrail_chips(&vm.guardrails, vm.demo, t))
+                .child(commands_button)
                 .child(settings_button),
         )
 }
@@ -897,6 +932,7 @@ fn review_row(row: &super::view_model::ReviewRow, t: &ThemeTokens) -> impl IntoE
 
 fn footer(
     settings_open: bool,
+    palette_open: bool,
     approving: bool,
     composing: bool,
     save_error: Option<&str>,
@@ -905,6 +941,7 @@ fn footer(
     let (text, color) = match save_error {
         Some(err) => (err.to_owned(), t.error),
         None if settings_open => (SETTINGS_HINT.to_owned(), t.text_subtle),
+        None if palette_open => (PALETTE_HINT.to_owned(), t.text_subtle),
         None if approving => (APPROVAL_HINT.to_owned(), t.text_subtle),
         None if composing => (COMPOSER_HINT.to_owned(), t.text_subtle),
         None => (FOOTER_HINT.to_owned(), t.text_subtle),
@@ -1197,5 +1234,84 @@ fn approval_dialog(dialog: &ApprovalDialogView, t: &ThemeTokens) -> impl IntoEle
                 .child(div().text_xs().text_color(rgb(t.text_subtle)).child(
                     "The ID is recorded as typed. Editing any line afterwards clears the approval.",
                 )),
+        )
+}
+
+/// Command palette: query field and the matching entries with their key hints.
+fn command_palette(palette: &PaletteView, t: &ThemeTokens) -> impl IntoElement {
+    let entries = palette.entries.iter().take(14).map(|entry| {
+        let row = div()
+            .flex()
+            .flex_row()
+            .justify_between()
+            .items_center()
+            .gap_3()
+            .px_3()
+            .py_1p5()
+            .rounded_md()
+            .child(div().min_w_0().truncate().child(entry.label.clone()))
+            .children((!entry.keys.is_empty()).then(|| {
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .font_family(MONO_FONT)
+                    .text_color(rgb(t.text_subtle))
+                    .child(entry.keys.clone())
+            }));
+        if entry.selected {
+            row.bg(rgb(t.selection)).text_color(rgb(t.on_selection))
+        } else {
+            row
+        }
+    });
+    let query = if palette.query.is_empty() {
+        div()
+            .text_color(rgb(t.text_subtle))
+            .child("Type a command, a company or a theme…▏")
+    } else {
+        div().child(format!("{}▏", palette.query))
+    };
+    div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+        .flex()
+        .flex_col()
+        .items_center()
+        .pt(px(96.0))
+        .bg(gpui::rgba(t.scrim))
+        .child(
+            div()
+                .w(px(560.0))
+                .max_w_full()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .p_2()
+                .rounded_lg()
+                .bg(rgb(t.surface_raised))
+                .border_1()
+                .border_color(rgb(t.border_ui))
+                .shadow_lg()
+                .child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .mb_1()
+                        .rounded_md()
+                        .bg(rgb(t.surface))
+                        .border_1()
+                        .border_color(rgb(t.focus))
+                        .child(query),
+                )
+                .children(entries)
+                .children(palette.entries.is_empty().then(|| {
+                    div()
+                        .px_3()
+                        .py_2()
+                        .text_color(rgb(t.text_subtle))
+                        .child("No matching commands.")
+                })),
         )
 }

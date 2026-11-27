@@ -21,7 +21,7 @@ Assumptions (marked): keys keep Ctrl on Linux; the selected theme persists acros
 | T2 | Settings section with Themes selector | S2 | inline | done | see L4 |
 | T3 | Live agent session protocol + pane (prompt input, streamed output, failure states) | S1 | inline | done (a: `4150a5b8`; b: see L6) | — |
 | T4 | Approval command/dialog | S4 | inline | done (see L7) | — |
-| T5 | Command palette | S4 | inline | pending | — |
+| T5 | Command palette | S4 | inline | done (see L8) | — |
 | T6 | Sidebar | S4 | inline | pending | — |
 | T7 | Checks, visual check both themes, verifier, RDD, PRs | S5 | verify | pending | — |
 
@@ -63,3 +63,8 @@ Assumptions (marked): keys keep Ctrl on Linux; the selected theme persists acros
   - Incident: an absolute `ydotool mousemove` landed outside the app (scaling mismatch) and one left click hit the operator's Herdr window. Desktop automation stopped for the rest of this phase; remaining live checks are left to the operator.
   - Not verified live: the approval dialog (open, blocked state, typing, Enter), `Ctrl+P`, the Approve… click.
   - Risk: item 2 (human-approval guard UI) → independent verifier.
+- **L8 — 2026-11-27 T5 command palette.**
+  - RED → GREEN: 14 compile errors → 3 palette tests + key-hint/fuzzy test. Palette entries run through `ShellState::apply` (no second command path); workspace and theme entries reuse `switch_to` / `select_theme`. The exhaustive `KEY_BINDINGS` match in the window caught the new command at compile time.
+  - Checks: 145 tests headless / 144 with features; clippy `-D warnings` both ways; fmt.
+  - Not verified live (desktop automation stopped, see L7): `Ctrl+Shift+P`, the ⌘ Commands click, arrow keys in the palette.
+  - Risk: none of items 1-6 (new command and overlay; existing commands unchanged).

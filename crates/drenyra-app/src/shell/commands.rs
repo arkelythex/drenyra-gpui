@@ -9,7 +9,8 @@ use super::demo;
 use super::settings::Settings;
 use super::theme::ThemeId;
 use super::view_model::{
-    AgentPaneView, ApprovalDialogView, Rect, SettingsPanel, ShellViewModel, ThemeOption,
+    AgentPaneView, ApprovalDialogView, PaletteEntry, PaletteView, Rect, SettingsPanel,
+    ShellViewModel, ThemeOption,
 };
 use crate::controller::DrenyraHostController;
 use drenyra_ui::LineDecision;
@@ -29,6 +30,75 @@ pub const APPROVAL_NEEDS_APPROVER: &str = "Enter the approver's ID.";
 struct ApprovalDraft {
     approver: String,
     error: Option<&'static str>,
+}
+
+/// What a command palette entry does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaletteAction {
+    Run(ShellCommand),
+    SwitchWorkspace(usize),
+    ApplyTheme(ThemeId),
+}
+
+/// The command palette's input state.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PaletteDraft {
+    query: String,
+    cursor: usize,
+}
+
+/// Palette label of a command, or `None` for commands that only make sense inside an overlay.
+const fn command_label(command: ShellCommand) -> Option<&'static str> {
+    Some(match command {
+        ShellCommand::SplitFocused => "Split focused pane",
+        ShellCommand::CloseFocused => "Close focused pane",
+        ShellCommand::UndoClose => "Reopen closed pane",
+        ShellCommand::FocusNextPane => "Focus next pane",
+        ShellCommand::NextWorkspace => "Next workspace",
+        ShellCommand::ReviewCursorDown => "Next review line",
+        ShellCommand::ReviewCursorUp => "Previous review line",
+        ShellCommand::AcceptLine => "Accept review line",
+        ShellCommand::RejectLine => "Reject review line",
+        ShellCommand::OpenSettings => "Open settings",
+        ShellCommand::FocusComposer => "Ask the Fiscal Agent",
+        ShellCommand::StopAgent => "Stop the running agent",
+        ShellCommand::OpenApproval => "Record human approval…",
+        ShellCommand::CloseOverlay | ShellCommand::Confirm | ShellCommand::OpenPalette => {
+            return None
+        }
+    })
+}
+
+/// Human-readable form of the first key bound to `command` (`ctrl-shift-t` → `Ctrl+Shift+T`).
+pub fn key_hint(command: ShellCommand) -> String {
+    let Some((key, _)) = KEY_BINDINGS.iter().find(|(_, bound)| *bound == command) else {
+        return String::new();
+    };
+    key.split('-')
+        .map(|part| match part {
+            "ctrl" => "Ctrl".to_owned(),
+            "shift" => "Shift".to_owned(),
+            "alt" => "Alt".to_owned(),
+            "escape" => "Esc".to_owned(),
+            other => {
+                let mut chars = other.chars();
+                chars.next().map_or_else(String::new, |first| {
+                    first.to_uppercase().chain(chars).collect()
+                })
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
+/// Case-insensitive subsequence match: every query character appears in `label`, in order.
+fn fuzzy_matches(label: &str, query: &str) -> bool {
+    let mut haystack = label.chars().flat_map(char::to_lowercase);
+    query
+        .chars()
+        .flat_map(char::to_lowercase)
+        .filter(|c| !c.is_whitespace())
+        .all(|needle| haystack.any(|c| c == needle))
 }
 
 /// Operator intents the native window maps from key bindings.
@@ -56,6 +126,8 @@ pub enum ShellCommand {
     StopAgent,
     /// Open the human-approval dialog for the staged entry.
     OpenApproval,
+    /// Open the command palette.
+    OpenPalette,
 }
 
 /// Every command, for exhaustiveness checks.
@@ -75,6 +147,7 @@ pub const ALL_COMMANDS: &[ShellCommand] = &[
     ShellCommand::FocusComposer,
     ShellCommand::StopAgent,
     ShellCommand::OpenApproval,
+    ShellCommand::OpenPalette,
 ];
 
 /// Single source of truth for window key bindings (GPUI keystroke syntax).
@@ -96,6 +169,7 @@ pub const KEY_BINDINGS: &[(&str, ShellCommand)] = &[
     ("i", ShellCommand::FocusComposer),
     ("ctrl-c", ShellCommand::StopAgent),
     ("ctrl-p", ShellCommand::OpenApproval),
+    ("ctrl-shift-p", ShellCommand::OpenPalette),
 ];
 
 /// Window-independent shell state: the host controller plus presentation cursors.
@@ -113,6 +187,8 @@ pub struct ShellState {
     composer_active: bool,
     /// The approval dialog, when open.
     approval: Option<ApprovalDraft>,
+    /// The command palette, when open.
+    palette: Option<PaletteDraft>,
 }
 
 impl ShellState {
@@ -126,6 +202,7 @@ impl ShellState {
             agents: BTreeMap::new(),
             composer_active: false,
             approval: None,
+            palette: None,
         }
     }
 
@@ -146,7 +223,7 @@ impl ShellState {
     /// True while keystrokes go to a text field (the composer or the approval dialog) instead of
     /// key bindings.
     pub fn text_input_active(&self) -> bool {
-        self.approval.is_some() || self.composer_active
+        self.approval.is_some() || self.palette.is_some() || self.composer_active
     }
 
     /// Types into the active text field; returns `false` when no text field is active.
@@ -159,6 +236,13 @@ impl ShellState {
                 .approver
                 .extend(text.chars().filter(|c| !c.is_control()));
             draft.error = None;
+            return true;
+        }
+        if let Some(palette) = &mut self.palette {
+            palette
+                .query
+                .extend(text.chars().filter(|c| !c.is_control()));
+            palette.cursor = 0;
             return true;
         }
         if !self.composer_active {
@@ -174,11 +258,65 @@ impl ShellState {
         if let Some(draft) = &mut self.approval {
             return draft.approver.pop().is_some();
         }
+        if let Some(palette) = &mut self.palette {
+            palette.cursor = 0;
+            return palette.query.pop().is_some();
+        }
         if !self.composer_active {
             return false;
         }
         let index = self.active_workspace();
         self.agent_pane_mut(index).composer_backspace()
+    }
+
+    /// Every palette entry with its action, in display order.
+    fn palette_items(&self) -> Vec<(String, String, PaletteAction)> {
+        let commands = ALL_COMMANDS.iter().filter_map(|&command| {
+            command_label(command).map(|label| {
+                (
+                    label.to_owned(),
+                    key_hint(command),
+                    PaletteAction::Run(command),
+                )
+            })
+        });
+        let workspaces = self
+            .controller
+            .workspaces()
+            .workspaces()
+            .iter()
+            .enumerate()
+            .map(|(index, ws)| {
+                (
+                    format!(
+                        "Switch to {} · {} · {}",
+                        ws.legal_name, ws.entity_ruc, ws.fiscal_period
+                    ),
+                    String::new(),
+                    PaletteAction::SwitchWorkspace(index),
+                )
+            });
+        let themes = ThemeId::ALL.iter().map(|&theme| {
+            (
+                format!("Theme: {}", theme.label()),
+                String::new(),
+                PaletteAction::ApplyTheme(theme),
+            )
+        });
+        commands.chain(workspaces).chain(themes).collect()
+    }
+
+    /// Palette entries matching the current query.
+    fn palette_matches(&self) -> Vec<(String, String, PaletteAction)> {
+        let query = self
+            .palette
+            .as_ref()
+            .map(|p| p.query.as_str())
+            .unwrap_or_default();
+        self.palette_items()
+            .into_iter()
+            .filter(|(label, _, _)| fuzzy_matches(label, query))
+            .collect()
     }
 
     /// Why the staged entry cannot be approved now, or `None` when it can.
@@ -229,6 +367,19 @@ impl ShellState {
         let index = self.active_workspace();
         let pane = self.agents.get(&index).cloned().unwrap_or_default();
         view.agent = Some(AgentPaneView::from_pane(&pane, self.composer_active));
+        view.palette = self.palette.as_ref().map(|draft| PaletteView {
+            query: draft.query.clone(),
+            entries: self
+                .palette_matches()
+                .into_iter()
+                .enumerate()
+                .map(|(index, (label, keys, _))| PaletteEntry {
+                    label,
+                    keys,
+                    selected: index == draft.cursor,
+                })
+                .collect(),
+        });
         view.approval = match (
             &self.approval,
             &view.review,
@@ -278,10 +429,17 @@ impl ShellState {
         if self.approval.is_some() {
             return self.apply_in_approval(command);
         }
+        if self.palette.is_some() {
+            return self.apply_in_palette(command, pane_area);
+        }
         if self.composer_active {
             return self.apply_in_composer(command);
         }
         match command {
+            ShellCommand::OpenPalette => {
+                self.palette = Some(PaletteDraft::default());
+                true
+            }
             ShellCommand::OpenApproval => {
                 if self.controller.active_review().is_none() {
                     return false;
@@ -342,6 +500,48 @@ impl ShellState {
                     .active_review_mut()
                     .is_some_and(|review| review.reject_line(cursor, REJECT_COMMENT))
             }
+        }
+    }
+
+    /// The palette is modal: J/K or arrows move, Enter runs the selected entry, Escape closes.
+    fn apply_in_palette(&mut self, command: ShellCommand, pane_area: Rect) -> bool {
+        let matches = self.palette_matches();
+        let Some(draft) = &mut self.palette else {
+            return false;
+        };
+        match command {
+            ShellCommand::ReviewCursorDown if draft.cursor + 1 < matches.len() => {
+                draft.cursor += 1;
+                true
+            }
+            ShellCommand::ReviewCursorUp if draft.cursor > 0 => {
+                draft.cursor -= 1;
+                true
+            }
+            ShellCommand::CloseOverlay => {
+                self.palette = None;
+                true
+            }
+            ShellCommand::Confirm => {
+                let Some(&(_, _, action)) = matches.get(draft.cursor) else {
+                    return false;
+                };
+                self.palette = None;
+                match action {
+                    PaletteAction::Run(command) => {
+                        self.apply(command, pane_area);
+                    }
+                    PaletteAction::SwitchWorkspace(index) => {
+                        self.review_cursor = 0;
+                        self.controller.workspaces_mut().switch_to(index);
+                    }
+                    PaletteAction::ApplyTheme(theme) => {
+                        self.select_theme(theme);
+                    }
+                }
+                true
+            }
+            _ => false,
         }
     }
 
@@ -900,6 +1100,104 @@ mod tests {
     }
 
     #[test]
+    fn palette_lists_commands_workspaces_and_themes_and_filters_by_typed_text() {
+        let mut s = state();
+        assert!(s.apply(ShellCommand::OpenPalette, WIDE));
+        assert!(s.text_input_active());
+        let palette = s.view(WIDE).palette.expect("open");
+        assert_eq!(palette.query, "");
+        let labels: Vec<_> = palette.entries.iter().map(|e| e.label.as_str()).collect();
+        assert!(labels.contains(&"Split focused pane"));
+        assert!(labels.contains(&"Switch to Sierra SRL · 20987654321 · 2026-11"));
+        assert!(labels.contains(&"Theme: Dreamcoder Light"));
+        assert!(
+            !labels.iter().any(|l| l.contains("palette")),
+            "no self entry"
+        );
+        assert!(palette.entries[0].selected);
+        assert_eq!(
+            palette
+                .entries
+                .iter()
+                .find(|e| e.label == "Split focused pane")
+                .map(|e| e.keys.as_str()),
+            Some("Ctrl+D")
+        );
+
+        s.type_text("splt");
+        let palette = s.view(WIDE).palette.expect("open");
+        assert_eq!(palette.entries.len(), 1, "fuzzy subsequence match");
+        assert_eq!(palette.entries[0].label, "Split focused pane");
+
+        let before = s.view(WIDE).panes.len();
+        assert!(s.apply(ShellCommand::Confirm, WIDE));
+        assert!(s.view(WIDE).palette.is_none(), "closes after running");
+        assert_eq!(s.view(WIDE).panes.len(), before + 1);
+    }
+
+    #[test]
+    fn palette_switches_workspace_applies_theme_and_handles_no_matches() {
+        let mut s = state();
+        s.apply(ShellCommand::OpenPalette, WIDE);
+        s.type_text("SIERRA");
+        assert!(s.apply(ShellCommand::Confirm, WIDE));
+        assert_eq!(s.active_workspace(), 1);
+
+        s.apply(ShellCommand::OpenPalette, WIDE);
+        s.type_text("theme");
+        assert_eq!(s.view(WIDE).palette.expect("open").entries.len(), 2);
+        assert!(s.apply(ShellCommand::ReviewCursorDown, WIDE));
+        assert!(!s.apply(ShellCommand::ReviewCursorDown, WIDE), "last entry");
+        assert!(s.apply(ShellCommand::Confirm, WIDE));
+        assert_eq!(s.settings().theme, ThemeId::DreamcoderLight);
+
+        s.apply(ShellCommand::OpenPalette, WIDE);
+        s.type_text("zzzz");
+        assert!(s.view(WIDE).palette.expect("open").entries.is_empty());
+        assert!(!s.apply(ShellCommand::Confirm, WIDE), "nothing to run");
+        assert!(s.backspace());
+        assert!(s.apply(ShellCommand::CloseOverlay, WIDE));
+        assert!(s.view(WIDE).palette.is_none());
+    }
+
+    #[test]
+    fn palette_is_modal_and_reopens_with_an_empty_query() {
+        let mut s = state();
+        s.apply(ShellCommand::OpenPalette, WIDE);
+        s.type_text("acc");
+        for cmd in [
+            ShellCommand::AcceptLine,
+            ShellCommand::NextWorkspace,
+            ShellCommand::OpenSettings,
+            ShellCommand::OpenApproval,
+        ] {
+            assert!(
+                !s.apply(cmd, WIDE),
+                "{cmd:?} blocked while the palette is open"
+            );
+        }
+        assert!(
+            s.agent_pane(0).composer().is_empty(),
+            "typing went to the query"
+        );
+        s.apply(ShellCommand::CloseOverlay, WIDE);
+        s.apply(ShellCommand::OpenPalette, WIDE);
+        assert_eq!(s.view(WIDE).palette.expect("open").query, "");
+    }
+
+    #[test]
+    fn key_hints_and_fuzzy_matching_follow_their_rules() {
+        assert_eq!(key_hint(ShellCommand::UndoClose), "Ctrl+Shift+T");
+        assert_eq!(key_hint(ShellCommand::OpenSettings), "Ctrl+,");
+        assert_eq!(key_hint(ShellCommand::ReviewCursorDown), "J");
+        assert_eq!(key_hint(ShellCommand::CloseOverlay), "Esc");
+        assert!(fuzzy_matches("Split focused pane", "SpLt"));
+        assert!(fuzzy_matches("Split focused pane", " f p "));
+        assert!(fuzzy_matches("Anything", ""));
+        assert!(!fuzzy_matches("Split focused pane", "tps"), "order matters");
+    }
+
+    #[test]
     fn key_bindings_cover_every_command_without_duplicate_keys() {
         for command in ALL_COMMANDS {
             assert!(
@@ -920,5 +1218,6 @@ mod tests {
         assert!(KEY_BINDINGS.contains(&("i", ShellCommand::FocusComposer)));
         assert!(KEY_BINDINGS.contains(&("ctrl-c", ShellCommand::StopAgent)));
         assert!(KEY_BINDINGS.contains(&("ctrl-p", ShellCommand::OpenApproval)));
+        assert!(KEY_BINDINGS.contains(&("ctrl-shift-p", ShellCommand::OpenPalette)));
     }
 }
