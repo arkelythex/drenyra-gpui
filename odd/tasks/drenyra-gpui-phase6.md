@@ -1,6 +1,6 @@
 # Drenyra GPUI — Phase 6: Live Agent Pane, Settings & DreamCoder Themes, Operator Surfaces
 
-Feature: `drenyra-gpui-phase6` | Branch: `feat/drenyra-gpui-phase6` stacked on `fix/gpui-approval-invalidated-on-edit` (PR #401) | Delivery: `ask-on-risk` (chain strategy already established: stacked PRs) | Runner: `cargo test --workspace --locked` (+ `--all-features`) | Status: in progress
+Feature: `drenyra-gpui-phase6` | Branch: `feat/drenyra-gpui-phase6` stacked on `fix/gpui-approval-invalidated-on-edit` (PR #401) | Delivery: `ask-on-risk` (chain strategy already established: stacked PRs) | Runner: `cargo test --workspace --locked` (+ `--all-features`) | Status: ready for review (PRs #402–#406); S4 extra pane kinds pending
 
 ## Specs
 
@@ -23,7 +23,7 @@ Assumptions (marked): keys keep Ctrl on Linux; the selected theme persists acros
 | T4 | Approval command/dialog | S4 | inline | done (see L7) | — |
 | T5 | Command palette | S4 | inline | done (see L8) | — |
 | T6 | Sidebar | S4 | inline | done (see L9) | — |
-| T7 | Checks, visual check both themes, verifier, RDD, PRs | S5 | verify | in progress (see L11) | — |
+| T7 | Checks, visual check both themes, verifier, RDD, PRs | S5 | verify | done (see L12) | #402–#406 |
 
 ## Log
 
@@ -88,3 +88,11 @@ Assumptions (marked): keys keep Ctrl on Linux; the selected theme persists acros
   - Already fixed earlier: Drop blocking on the writer lock (`c171fba4`, reported again on slice 2 which predates it).
   - Follow-ups (not fixed, recorded): (1) `AgentSession::send` runs on the UI thread and can block it if the agent stops reading stdin with a full pipe — needs a dedicated writer thread; (2) agents are keyed by workspace index (safe while workspaces are never removed or reordered; key by RUC + period when removal exists); (3) a stopped/failed agent has no restart action; (4) re-approval overwrites the previous approver; (5) R0/R1 entries can carry an optional approval; (6) Ctrl+C cannot stop the agent while a modal is open; (7) keyboard routing in `window.rs` has no automated test (the GPUI harness needs `git2`); (8) the "focused" chip in pane headers was dropped.
   - Checks: 154 tests headless / 153 with features; clippy both ways; fmt.
+- **L12 — 2026-11-27 delivery.** Stacked PRs (strategy: nested PRs, as established earlier by the user):
+  - #402 `feat/gpui-dreamcoder-themes` (67ed65b8) → base #401
+  - #403 `feat/gpui-agent-protocol-client` (4150a5b8)
+  - #404 `feat/gpui-live-agent-pane` (86d7330a, c171fba4)
+  - #405 `feat/gpui-approval-dialog` (86d470be)
+  - #406 `feat/drenyra-gpui-phase6` (d3bf29fb, 725f88da, 2a35bfe7, dbb0cd81, this log)
+  - Every slice passes tests, clippy (with and without `gpui`) and fmt in isolation with its own target dir (111 → 154 tests). A first run with a shared target dir reported stale counts and was discarded.
+  - Open: S4 additional pane kinds (not started); live checks of the approval dialog, palette and sidebar (left to the operator); follow-ups 1–8 in L11; merge is the user's decision.
