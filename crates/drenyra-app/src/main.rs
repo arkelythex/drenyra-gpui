@@ -106,6 +106,12 @@ pub fn run_demo_session_json() -> Result<String, ControllerError> {
     }
 
     let frame = controller.build_post_request()?;
+    let unposted_before_confirmation = controller.workspaces().active().guardrails.unposted_entries;
+    // The demo has no live transport, so it confirms the in-flight post deterministically.
+    let request_id = controller
+        .pending_post_request()
+        .ok_or(ControllerError::UnknownPostRequest)?;
+    controller.confirm_posted(request_id)?;
     let posted_frame_valid = !frame.contains('\n')
         && !frame.contains('\r')
         && validate_json_container(&frame).is_ok()
@@ -114,12 +120,13 @@ pub fn run_demo_session_json() -> Result<String, ControllerError> {
 
     let active = controller.workspaces().active();
     Ok(format!(
-        r#"{{"entity_ruc":"{}","fiscal_period":"{}","pane_count":{},"blocked_before_approval":{},"posted_frame_valid":{},"unposted_entries":{},"frame":{}}}"#,
+        r#"{{"entity_ruc":"{}","fiscal_period":"{}","pane_count":{},"blocked_before_approval":{},"posted_frame_valid":{},"unposted_before_confirmation":{},"unposted_entries":{},"frame":{}}}"#,
         escape_json_str(&active.entity_ruc),
         escape_json_str(&active.fiscal_period),
         pane_count,
         blocked_before_approval,
         posted_frame_valid,
+        unposted_before_confirmation,
         active.guardrails.unposted_entries,
         frame,
     ))
@@ -341,6 +348,8 @@ mod tests {
         assert!(json.contains(r#""pane_count":2"#));
         assert!(json.contains(r#""blocked_before_approval":true"#));
         assert!(json.contains(r#""posted_frame_valid":true"#));
+        assert!(json.contains(r#""unposted_before_confirmation":1"#));
+        assert!(json.contains(r#""unposted_entries":0"#));
         assert!(json.contains(r#""name":"ledger_post""#));
         assert!(json.contains(r#""approved_by":"CPA-PERU-001""#));
 

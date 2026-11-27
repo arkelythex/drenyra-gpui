@@ -301,6 +301,11 @@ impl WorkspaceManager {
         self.active_index
     }
 
+    /// Mutable access to the workspace at `index` without changing focus.
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut FiscalWorkspace> {
+        self.workspaces.get_mut(index)
+    }
+
     pub fn active(&self) -> &FiscalWorkspace {
         &self.workspaces[self.active_index]
     }
