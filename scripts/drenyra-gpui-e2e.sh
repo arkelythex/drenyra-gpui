@@ -14,7 +14,7 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${1:-$(mktemp -d "${TMPDIR:-/tmp}/drenyra-gpui-e2e.XXXXXX")}
-BIN="$ROOT/target/debug/drenyra-gpui"
+BIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug/drenyra-gpui"
 mkdir -p "$OUT/xdg"
 
 for tool in Xvfb xdotool import; do

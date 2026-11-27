@@ -411,7 +411,10 @@ impl AgentSession {
     }
 
     /// Queues one command line for the writer thread and returns at once. Safe to call while a
-    /// run is streaming. Fails once the agent no longer accepts input (its stdin broke).
+    /// run is streaming. Fails once the agent no longer accepts input (its stdin broke); the
+    /// first line queued after the agent dies can still return `Ok` and be dropped, because the
+    /// writer only learns about the broken pipe when it writes. The queue is unbounded: lines
+    /// stay in memory until written or until the session is dropped.
     pub fn send(&self, frame: &str) -> Result<(), RpcError> {
         self.writer
             .send(WriterMsg::Line(frame.to_owned()))
@@ -1006,5 +1009,88 @@ case "$answer" in *'"id":"d"'*) echo '{"type":"response","command":"first-answer
             .expect("send blocked the caller on a full pipe");
         assert!(sent < Duration::from_secs(1), "sends took {sent:?}");
         assert!(dropped < Duration::from_secs(2), "Drop took {dropped:?}");
+    }
+
+    // Regression tests adopted from the independent verifier (L14).
+
+    fn agent_with_grace(script: &str, grace_ms: u64) -> AgentSession {
+        let mut config = AgentSessionConfig::new("sh", vec!["-c".into(), script.into()]);
+        config.shutdown_grace = Duration::from_millis(grace_ms);
+        AgentSession::spawn(&config).expect("spawn sh")
+    }
+
+    #[test]
+    fn drop_is_bounded_when_a_grandchild_keeps_the_pipes_open() {
+        // SIGKILL reaches sh only; the forked sleep keeps stdin/stdout full and open.
+        let session = agent_with_grace("trap '' TERM; sleep 30; :", 300);
+        let frame = "y".repeat(200_000);
+        for _ in 0..5 {
+            session.send(&frame).expect("queued");
+        }
+        thread::sleep(Duration::from_millis(100));
+        let started = Instant::now();
+        drop(session);
+        assert!(
+            started.elapsed() < Duration::from_millis(700),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn queued_lines_and_dialog_answers_arrive_whole_and_in_order() {
+        let out = std::env::temp_dir().join(format!("agent-order-{}", std::process::id()));
+        let _ = std::fs::remove_file(&out);
+        let script = format!(
+            r#"for i in 1 2 3 4 5 6 7 8 9 10; do echo '{{"type":"extension_ui_request","id":"d'$i'","method":"confirm","title":"t","message":"m"}}'; done
+while read -r l; do printf '%s\n' "$l" >> '{}'; done"#,
+            out.display()
+        );
+        let session = agent_with_grace(&script, 3000);
+        let pad = "z".repeat(20_000);
+        for i in 0..40 {
+            session
+                .send(&format!("{{\"seq\":{i},\"pad\":\"{pad}\"}}"))
+                .expect("queued");
+            if i == 19 {
+                for _ in 0..10 {
+                    assert!(matches!(next(&session), AgentUpdate::Event(_)));
+                }
+            }
+        }
+        drop(session); // Close is queued after every line; the agent exits on EOF.
+        let text = std::fs::read_to_string(&out).expect("agent wrote lines");
+        let _ = std::fs::remove_file(&out);
+        let (mut seqs, mut dialogs) = (Vec::new(), 0);
+        for line in text.lines() {
+            let v: Value = serde_json::from_str(line).expect("whole JSON line");
+            match v.get("seq") {
+                Some(seq) => seqs.push(seq.as_u64().expect("number")),
+                None => {
+                    assert_eq!(v["type"], "extension_ui_response");
+                    dialogs += 1;
+                }
+            }
+        }
+        assert_eq!(seqs, (0..40).collect::<Vec<_>>());
+        assert_eq!(dialogs, 10);
+    }
+
+    #[test]
+    fn queued_lines_reach_the_agent_before_eof_on_drop() {
+        let out = std::env::temp_dir().join(format!("agent-eof-{}", std::process::id()));
+        let _ = std::fs::remove_file(&out);
+        let script = format!(
+            "n=0; while read -r l; do n=$((n+1)); done; echo $n > '{}'",
+            out.display()
+        );
+        let session = agent_with_grace(&script, 3000);
+        for i in 0..100 {
+            session.send(&format!("{{\"n\":{i}}}")).expect("queued");
+        }
+        drop(session);
+        let n = std::fs::read_to_string(&out).unwrap_or_default();
+        let _ = std::fs::remove_file(&out);
+        assert_eq!(n.trim(), "100");
     }
 }
