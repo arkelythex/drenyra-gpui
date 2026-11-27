@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use gpui::{
     actions, div, prelude::*, px, rgb, size, AnyElement, App, Application, Bounds, ClickEvent,
-    Context, FocusHandle, KeyBinding, KeyDownEvent, Rgba, SharedString, Window, WindowBounds,
-    WindowOptions,
+    Context, ElementId, FocusHandle, KeyBinding, KeyDownEvent, Rgba, ScrollHandle,
+    ScrollWheelEvent, SharedString, Window, WindowBounds, WindowOptions,
 };
 
 use drenyra_rpc::agent::{AgentSession, AgentUpdate};
@@ -21,6 +21,7 @@ use drenyra_rpc::agent::{AgentSession, AgentUpdate};
 use super::agent_pane::{agent_launch, AgentStatus, EntryRole};
 
 use super::commands::{typed_text, ShellCommand, ShellState, ENTRY_READY_TO_POST, KEY_BINDINGS};
+use super::scroll::ScrollSlots;
 use super::settings::save_if_changed;
 use super::theme::{ThemeId, ThemeTokens};
 use super::view_model::{
@@ -135,6 +136,7 @@ pub fn run(
                     settings_path,
                     save_error: None,
                     sessions: BTreeMap::new(),
+                    scrolls: ScrollSlots::default(),
                 }
             })
         });
@@ -190,33 +192,45 @@ struct ShellWindow {
     save_error: Option<String>,
     /// Running agent processes by company and period. Dropping one closes the agent gracefully.
     sessions: BTreeMap<WorkspaceKey, AgentSession>,
+    /// Scroll slot of every pane tile by company and pane id, kept across switches and closes.
+    /// Agent transcript slots also carry the follow intent, applied in `render`.
+    scrolls: ScrollSlots<ScrollHandle>,
 }
+
+/// Wheel listener attached to an agent transcript's scroll container.
+type WheelListener = Box<dyn Fn(&ScrollWheelEvent, &mut Window, &mut App)>;
 
 impl ShellWindow {
     fn dispatch(&mut self, command: ShellCommand, window: &mut Window, cx: &mut Context<Self>) {
         let area = self.pane_area(window);
         let before = self.state.settings();
         if self.state.apply(command, area) {
+            // No scroll bookkeeping here. A transcript that follows is pinned to its end by the
+            // next render whatever caused it (a sent prompt's entry, a resize); one the operator
+            // scrolled up is never moved by a command.
             self.persist_if_changed(before);
             cx.notify();
         }
     }
 
     /// Starts the active workspace's agent on first view, sends queued commands, and applies
-    /// whatever every agent wrote since the last poll.
+    /// whatever every agent wrote since the last poll. New output only asks for a render; the
+    /// render pins each following transcript to its end.
     fn poll_agents(&mut self, cx: &mut Context<Self>) {
         let mut changed = self.ensure_active_agent();
         for (key, session) in &self.sessions {
             let pane = self.state.agent_pane_mut(key);
+            let mut pane_changed = false;
             for frame in pane.take_outbox() {
                 if let Err(err) = session.send(&frame) {
-                    changed |= pane.apply(AgentUpdate::Failed(err.to_string()));
+                    pane_changed |= pane.apply(AgentUpdate::Failed(err.to_string()));
                     break;
                 }
             }
             for update in session.drain() {
-                changed |= pane.apply(update);
+                pane_changed |= pane.apply(update);
             }
+            changed |= pane_changed;
         }
         if changed {
             cx.notify();
@@ -371,10 +385,36 @@ impl Render for ShellWindow {
             sidebar_panel(sidebar, companies, &t)
         });
 
+        let active_key = self.state.active_workspace_key();
+        let scrolls = &mut self.scrolls;
         let panes: Vec<AnyElement> = vm
             .panes
             .iter()
             .map(|tile| {
+                let slot = scrolls.slot(&active_key, tile.id);
+                let on_wheel = (tile.kind == PaneKind::FiscalAgent).then(|| {
+                    // Resolve the operator's last scroll, then pin while following: this frame's
+                    // layout uses the new content and size, so output and resizes stay pinned.
+                    let offset_y = f32::from(slot.handle.offset().y);
+                    let max_scroll_y = f32::from(slot.handle.max_offset().height);
+                    if slot.follow.frame(offset_y, max_scroll_y) {
+                        slot.handle.scroll_to_bottom();
+                    }
+                    let (key, pane_id) = (active_key.clone(), tile.id);
+                    let listener = cx.listener(move |this, _: &ScrollWheelEvent, _, cx| {
+                        this.scrolls
+                            .slot(&key, pane_id)
+                            .follow
+                            .note_operator_scroll();
+                        cx.notify();
+                    });
+                    Box::new(listener) as WheelListener
+                });
+                let scroll = PaneScroll {
+                    id: ("pane-body", tile.id).into(),
+                    handle: slot.handle.clone(),
+                    on_wheel,
+                };
                 let body = match tile.kind {
                     PaneKind::FiscalAgent => vm.agent.as_ref().map(|agent| {
                         let composer = div()
@@ -384,20 +424,20 @@ impl Render for ShellWindow {
                                 this.dispatch(ShellCommand::FocusComposer, w, cx)
                             }))
                             .child(composer_box(agent, tile.focused, &t));
-                        agent_body(agent, composer, &t).into_any_element()
+                        agent_body(agent, composer, scroll, &t).into_any_element()
                     }),
                     PaneKind::LedgerViewer => vm
                         .ledger
                         .as_ref()
-                        .map(|ledger| ledger_body(ledger, &t).into_any_element()),
+                        .map(|ledger| ledger_body(ledger, scroll, &t).into_any_element()),
                     PaneKind::EvidenceVault => vm
                         .evidence
                         .as_ref()
-                        .map(|evidence| evidence_body(evidence, &t).into_any_element()),
+                        .map(|evidence| evidence_body(evidence, scroll, &t).into_any_element()),
                     PaneKind::FiscalCli => vm
                         .cli
                         .as_ref()
-                        .map(|cli| cli_body(cli, &t).into_any_element()),
+                        .map(|cli| cli_body(cli, scroll, &t).into_any_element()),
                 }
                 .unwrap_or_else(|| placeholder_body(&t).into_any_element());
                 pane_tile(
@@ -763,17 +803,41 @@ fn placeholder_body(t: &ThemeTokens) -> impl IntoElement {
         .child("Nothing to show in this pane.")
 }
 
-/// Scrollless column shared by the Ledger, Evidence and CLI bodies: content clipped at the
-/// bottom, the pane's limits pinned as a footnote.
-fn pane_column(limits: &'static str, t: &ThemeTokens) -> (gpui::Div, gpui::Div) {
-    let content = div()
+/// Where a pane body scrolls: a stable element id and this tile's own handle (each tile scrolls on
+/// its own), plus, for an agent transcript, the listener that tells its follow intent the operator
+/// scrolled.
+struct PaneScroll {
+    id: ElementId,
+    handle: ScrollHandle,
+    on_wheel: Option<WheelListener>,
+}
+
+/// Vertical scroll container for a pane's content; whatever sits outside it (header, footnote,
+/// composer) stays fixed.
+fn scroll_area(scroll: PaneScroll) -> gpui::Stateful<gpui::Div> {
+    let area = div()
+        .id(scroll.id)
         .flex_1()
         .min_h_0()
-        .overflow_hidden()
+        .overflow_y_scroll()
+        .track_scroll(&scroll.handle)
         .flex()
         .flex_col()
-        .gap_2()
         .p_3();
+    match scroll.on_wheel {
+        // Runs after GPUI's own wheel handler, but the position is read at the next render
+        // anyway, so the order does not matter.
+        Some(listener) => {
+            area.on_scroll_wheel(move |event, window, cx| listener(event, window, cx))
+        }
+        None => area,
+    }
+}
+
+/// Column shared by the Ledger, Evidence and CLI bodies: the content (filled by the caller)
+/// scrolls, the pane's limits stay pinned below it as a footnote.
+fn pane_column(limits: &'static str, t: &ThemeTokens) -> (gpui::Div, gpui::Div) {
+    let content = div().flex_none().flex().flex_col().gap_2();
     let footnote = div()
         .flex_none()
         .px_3()
@@ -794,18 +858,18 @@ fn pane_section_heading(text: impl Into<SharedString>, t: &ThemeTokens) -> impl 
         .child(text.into())
 }
 
-fn wrap_column(content: gpui::Div, footnote: gpui::Div) -> impl IntoElement {
+fn wrap_column(content: gpui::Div, footnote: gpui::Div, scroll: PaneScroll) -> impl IntoElement {
     div()
         .flex_1()
         .min_h_0()
         .flex()
         .flex_col()
-        .child(content)
+        .child(scroll_area(scroll).child(content))
         .child(footnote)
 }
 
 /// Ledger pane: the active workspace's staged entry and the entries posted in this session.
-fn ledger_body(ledger: &LedgerPaneView, t: &ThemeTokens) -> impl IntoElement {
+fn ledger_body(ledger: &LedgerPaneView, scroll: PaneScroll, t: &ThemeTokens) -> impl IntoElement {
     let (content, footnote) = pane_column(ledger.limits, t);
     let content = content
         .child(
@@ -834,7 +898,7 @@ fn ledger_body(ledger: &LedgerPaneView, t: &ThemeTokens) -> impl IntoElement {
             (!ledger.posted.is_empty()).then(|| pane_section_heading("POSTED IN THIS SESSION", t)),
         )
         .children(ledger.posted.iter().map(|entry| ledger_posted(entry, t)));
-    wrap_column(content, footnote)
+    wrap_column(content, footnote, scroll)
 }
 
 fn ledger_staged(staged: &LedgerStagedEntry, t: &ThemeTokens) -> impl IntoElement {
@@ -966,7 +1030,11 @@ fn ledger_posted(entry: &LedgerPostedEntry, t: &ThemeTokens) -> impl IntoElement
 }
 
 /// Evidence pane: the active workspace's session log, newest first.
-fn evidence_body(evidence: &EvidencePaneView, t: &ThemeTokens) -> impl IntoElement {
+fn evidence_body(
+    evidence: &EvidencePaneView,
+    scroll: PaneScroll,
+    t: &ThemeTokens,
+) -> impl IntoElement {
     let (content, footnote) = pane_column(evidence.limits, t);
     let content = content
         .child(
@@ -992,11 +1060,11 @@ fn evidence_body(evidence: &EvidencePaneView, t: &ThemeTokens) -> impl IntoEleme
                 .text_color(rgb(t.text))
                 .child(entry.clone())
         }));
-    wrap_column(content, footnote)
+    wrap_column(content, footnote, scroll)
 }
 
 /// Fiscal CLI pane: the captured environment check and the flag reference; runs nothing.
-fn cli_body(cli: &CliPaneView, t: &ThemeTokens) -> impl IntoElement {
+fn cli_body(cli: &CliPaneView, scroll: PaneScroll, t: &ThemeTokens) -> impl IntoElement {
     let (content, footnote) = pane_column(cli.limits, t);
     let content = content
         .child(pane_section_heading("drenyra-gpui --check-env", t))
@@ -1035,13 +1103,14 @@ fn cli_body(cli: &CliPaneView, t: &ThemeTokens) -> impl IntoElement {
                 )
                 .child(div().text_color(rgb(t.text_muted)).child(flag.description))
         }));
-    wrap_column(content, footnote)
+    wrap_column(content, footnote, scroll)
 }
 
-/// Transcript (newest at the bottom; older entries are clipped at the top) and the composer.
+/// Transcript (scrolls; a short one sits at the bottom, newest last) and the fixed composer.
 fn agent_body(
     agent: &AgentPaneView,
     composer: impl IntoElement,
+    scroll: PaneScroll,
     t: &ThemeTokens,
 ) -> impl IntoElement {
     let empty = agent.transcript.is_empty() && agent.streaming_text.is_empty();
@@ -1051,15 +1120,15 @@ fn agent_body(
         .flex()
         .flex_col()
         .child(
+            scroll_area(scroll).child(
+            // The auto top margin keeps a short transcript at the bottom; once it is taller than
+            // the pane the margin is zero and the list scrolls from its first entry.
             div()
-                .flex_1()
-                .min_h_0()
-                .overflow_hidden()
+                .mt_auto()
+                .flex_none()
                 .flex()
                 .flex_col()
-                .justify_end()
                 .gap_2()
-                .p_3()
                 .children(empty.then(|| {
                     div()
                         .text_color(rgb(t.text_subtle))
@@ -1072,6 +1141,7 @@ fn agent_body(
                 .children((!agent.streaming_text.is_empty()).then(|| {
                     transcript_entry(EntryRole::Agent, &format!("{}▍", agent.streaming_text), t)
                 })),
+            ),
         )
         .child(composer)
 }

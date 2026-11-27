@@ -348,7 +348,7 @@ impl LedgerPaneView {
 pub struct EvidencePaneView {
     pub entity_ruc: String,
     pub fiscal_period: String,
-    /// `#<seq>  <sentence>`, newest first.
+    /// `#<seq>  <HH:MM:SSZ>  <sentence>` (UTC time the event was recorded), newest first.
     pub entries: Vec<String>,
     /// Set when nothing was recorded; names the RUC and period.
     pub empty_message: Option<String>,
@@ -363,7 +363,14 @@ impl EvidencePaneView {
             .evidence(&active.key())
             .iter()
             .rev()
-            .map(|event| format!("#{}  {}", event.seq, evidence_sentence(&event.kind)))
+            .map(|event| {
+                format!(
+                    "#{}  {}  {}",
+                    event.seq,
+                    format_utc_time(event.recorded_at_ms),
+                    evidence_sentence(&event.kind)
+                )
+            })
             .collect();
         let empty_message = entries.is_empty().then(|| {
             format!(
@@ -379,6 +386,50 @@ impl EvidencePaneView {
             limits: EVIDENCE_LIMITS,
         }
     }
+}
+
+const MS_PER_SECOND: u64 = 1_000;
+const SECONDS_PER_DAY: u64 = 86_400;
+
+/// Time of day of `unix_ms` (Unix milliseconds) in UTC as `HH:MM:SSZ`; milliseconds are
+/// truncated.
+pub fn format_utc_time(unix_ms: u64) -> String {
+    let second_of_day = (unix_ms / MS_PER_SECOND) % SECONDS_PER_DAY;
+    format!(
+        "{:02}:{:02}:{:02}Z",
+        second_of_day / 3_600,
+        second_of_day % 3_600 / 60,
+        second_of_day % 60
+    )
+}
+
+/// `unix_ms` (Unix milliseconds) in UTC as `YYYY-MM-DDTHH:MM:SSZ` (proleptic Gregorian calendar);
+/// milliseconds are truncated.
+pub fn format_utc_datetime(unix_ms: u64) -> String {
+    let (year, month, day) = civil_from_days(unix_ms / MS_PER_SECOND / SECONDS_PER_DAY);
+    format!("{year:04}-{month:02}-{day:02}T{}", format_utc_time(unix_ms))
+}
+
+/// `(year, month, day)` of the day `days` after 1970-01-01, after Howard Hinnant's
+/// `civil_from_days`, in unsigned integers (days are never negative here). Eras are 400-year
+/// Gregorian cycles of 146 097 days; years start on March 1 so the leap day is the last day.
+/// Every intermediate stays below 2^40 for any `u64` millisecond input, so nothing overflows.
+fn civil_from_days(days: u64) -> (u64, u64, u64) {
+    let shifted = days + 719_468; // days since 0000-03-01
+    let era = shifted / 146_097;
+    let day_of_era = shifted % 146_097; // 0..=146_096
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365; // 0..=399
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100); // 0..=365
+    let march_month = (5 * day_of_year + 2) / 153; // 0 = March ..= 11 = February
+    let day = day_of_year - (153 * march_month + 2) / 5 + 1;
+    let month = if march_month < 10 {
+        march_month + 3
+    } else {
+        march_month - 9
+    };
+    let year = era * 400 + year_of_era + u64::from(month <= 2);
+    (year, month, day)
 }
 
 /// One-line English sentence for an evidence event.
@@ -769,6 +820,41 @@ mod tests {
         width: 1200,
         height: 800,
     };
+
+    #[test]
+    fn utc_formatting_matches_known_instants() {
+        // (Unix ms, date-time, time of day)
+        let cases = [
+            (0, "1970-01-01T00:00:00Z", "00:00:00Z"),
+            (1_709_210_096_000, "2024-02-29T12:34:56Z", "12:34:56Z"),
+            (1_709_251_200_000, "2024-03-01T00:00:00Z", "00:00:00Z"),
+            (1_795_823_999_000, "2026-11-27T23:59:59Z", "23:59:59Z"),
+            (946_684_799_000, "1999-12-31T23:59:59Z", "23:59:59Z"),
+            (946_684_800_000, "2000-01-01T00:00:00Z", "00:00:00Z"),
+            // 2100 is not a leap year: Feb 28 rolls over to Mar 1.
+            (4_107_542_399_000, "2100-02-28T23:59:59Z", "23:59:59Z"),
+            (4_107_542_400_000, "2100-03-01T00:00:00Z", "00:00:00Z"),
+            (253_402_300_799_000, "9999-12-31T23:59:59Z", "23:59:59Z"),
+            // Milliseconds are truncated, never rounded up into the next second.
+            (1_795_823_999_999, "2026-11-27T23:59:59Z", "23:59:59Z"),
+        ];
+        for (ms, datetime, time) in cases {
+            assert_eq!(format_utc_datetime(ms), datetime, "{ms}");
+            assert_eq!(format_utc_time(ms), time, "{ms}");
+        }
+        assert_eq!(
+            format_utc_datetime(946_684_799_000 + 1_000),
+            "2000-01-01T00:00:00Z",
+            "one second after the end of 1999"
+        );
+    }
+
+    #[test]
+    fn utc_formatting_never_panics_at_the_end_of_u64() {
+        assert_eq!(format_utc_time(u64::MAX), "14:25:51Z");
+        let far = format_utc_datetime(u64::MAX);
+        assert!(far.ends_with("T14:25:51Z"), "{far}");
+    }
 
     fn proposal() -> JournalEntryProposal {
         JournalEntryProposal {

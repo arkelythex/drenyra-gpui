@@ -12,6 +12,8 @@ pub mod view_model;
 
 #[cfg(test)]
 mod regression_tests;
+#[cfg(any(feature = "gpui", test))]
+pub mod scroll;
 #[cfg(test)]
 mod t10_probes;
 #[cfg(feature = "gpui")]

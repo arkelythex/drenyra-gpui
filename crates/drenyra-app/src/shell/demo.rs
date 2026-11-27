@@ -3,7 +3,7 @@
 use drenyra_protocol::{JournalEntryProposal, JournalLine, MoneyCents, RiskTier};
 use drenyra_workspace::FiscalWorkspace;
 
-use crate::controller::DrenyraHostController;
+use crate::controller::{Clock, DrenyraHostController};
 
 /// Primary demo entity: RUC, legal name, fiscal period.
 pub const DEMO_ENTITY: (&str, &str, &str) = ("20123456789", "Andino SAC", "2026-10");
@@ -45,9 +45,15 @@ pub fn demo_workspace() -> FiscalWorkspace {
     FiscalWorkspace::new(ruc, name, period)
 }
 
-/// Controller with Andino SAC (staged R2 proposal) and Sierra SRL (idle).
+/// Controller with Andino SAC (staged R2 proposal) and Sierra SRL (idle); evidence times come
+/// from the system clock.
 pub fn demo_controller() -> DrenyraHostController {
-    let mut controller = DrenyraHostController::new(demo_workspace());
+    demo_controller_with_clock(Clock::System)
+}
+
+/// Like [`demo_controller`], stamping evidence events (the staging included) with `clock`.
+pub fn demo_controller_with_clock(clock: Clock) -> DrenyraHostController {
+    let mut controller = DrenyraHostController::with_clock(demo_workspace(), clock);
     controller
         .workspaces_mut()
         .add_workspace(FiscalWorkspace::new("20987654321", "Sierra SRL", "2026-11"))
