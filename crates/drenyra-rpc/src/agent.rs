@@ -16,8 +16,8 @@
 use std::fmt;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::sync::{Arc, Mutex, TryLockError};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -285,25 +285,27 @@ pub enum AgentUpdate {
     Exited,
 }
 
-type SharedWriter = Arc<Mutex<Option<BufWriter<ChildStdin>>>>;
+/// Messages for the writer thread, the only owner of the agent's stdin.
+enum WriterMsg {
+    Line(String),
+    /// Close stdin (the agent's shutdown signal) and stop.
+    Close,
+}
 
 /// A running agent process speaking the agent protocol over stdio.
+///
+/// A dedicated writer thread owns stdin: [`Self::send`] only queues the line, so a caller (the
+/// window's UI thread) never blocks, even when the agent stops reading and the pipe is full.
 pub struct AgentSession {
     child: Child,
-    writer: SharedWriter,
+    writer: Sender<WriterMsg>,
     updates: Receiver<AgentUpdate>,
     shutdown_grace: Duration,
     stderr: Arc<Mutex<Vec<u8>>>,
     threads: Vec<JoinHandle<()>>,
 }
 
-fn write_line(writer: &SharedWriter, frame: &str) -> io::Result<()> {
-    let mut guard = writer
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let stdin = guard
-        .as_mut()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "agent stdin is closed"))?;
+fn write_line(stdin: &mut BufWriter<ChildStdin>, frame: &str) -> io::Result<()> {
     stdin.write_all(frame.as_bytes())?;
     stdin.write_all(b"\n")?;
     stdin.flush()
@@ -334,7 +336,16 @@ impl AgentSession {
             .take()
             .ok_or_else(|| io::Error::other("missing stderr"))?;
 
-        let writer: SharedWriter = Arc::new(Mutex::new(Some(BufWriter::new(stdin))));
+        let (writer, writer_rx) = mpsc::channel::<WriterMsg>();
+        let writer_thread = thread::spawn(move || {
+            let mut stdin = BufWriter::new(stdin);
+            while let Ok(WriterMsg::Line(frame)) = writer_rx.recv() {
+                if write_line(&mut stdin, &frame).is_err() {
+                    break;
+                }
+            }
+            // Dropping stdin here closes the pipe, which tells the agent to shut down.
+        });
         let stderr_buffer = Arc::new(Mutex::new(Vec::new()));
 
         let stderr_sink = Arc::clone(&stderr_buffer);
@@ -355,7 +366,7 @@ impl AgentSession {
         });
 
         let (tx, updates) = mpsc::channel();
-        let reply_writer = Arc::clone(&writer);
+        let reply_writer = writer.clone();
         let max_bytes = config.max_record_bytes;
         let stdout_thread = thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
@@ -373,7 +384,8 @@ impl AgentSession {
                                 // A dialog without an id cannot be answered. Best effort: if
                                 // stdin is gone the agent is exiting anyway.
                                 if !id.is_empty() {
-                                    let _ = write_line(&reply_writer, &cancel_dialog_response(id));
+                                    let _ = reply_writer
+                                        .send(WriterMsg::Line(cancel_dialog_response(id)));
                                 }
                             }
                             AgentUpdate::Event(event)
@@ -394,13 +406,21 @@ impl AgentSession {
             updates,
             shutdown_grace: config.shutdown_grace,
             stderr: stderr_buffer,
-            threads: vec![stdout_thread, stderr_thread],
+            threads: vec![stdout_thread, stderr_thread, writer_thread],
         })
     }
 
-    /// Sends one command line. Safe to call while a run is streaming.
+    /// Queues one command line for the writer thread and returns at once. Safe to call while a
+    /// run is streaming. Fails once the agent no longer accepts input (its stdin broke).
     pub fn send(&self, frame: &str) -> Result<(), RpcError> {
-        write_line(&self.writer, frame).map_err(RpcError::Io)
+        self.writer
+            .send(WriterMsg::Line(frame.to_owned()))
+            .map_err(|_| {
+                RpcError::Io(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "the agent no longer accepts input",
+                ))
+            })
     }
 
     /// Returns every update received so far without blocking.
@@ -427,44 +447,19 @@ impl AgentSession {
 }
 
 impl Drop for AgentSession {
-    /// Closes stdin (the agent's shutdown signal), waits up to the grace period, then kills.
-    ///
-    /// The reader thread may hold the writer while a dialog answer is blocked on a full pipe
-    /// (an agent that stopped reading stdin). Drop never waits on that lock past the grace
-    /// period: it kills the agent, which fails the blocked write and frees the lock.
+    /// Asks the writer thread to close stdin (the agent's shutdown signal), waits up to the grace
+    /// period, then kills. A writer stuck on a full pipe never delays this: the kill fails its
+    /// write and it exits.
     fn drop(&mut self) {
+        let _ = self.writer.send(WriterMsg::Close);
         let deadline = Instant::now() + self.shutdown_grace;
-        let mut killed = false;
-        loop {
-            match self.writer.try_lock() {
-                Ok(mut guard) => {
-                    guard.take();
-                    break;
-                }
-                Err(TryLockError::Poisoned(poisoned)) => {
-                    poisoned.into_inner().take();
-                    break;
-                }
-                Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
-                    thread::sleep(Duration::from_millis(5));
-                }
-                Err(TryLockError::WouldBlock) => {
-                    let _ = self.child.kill();
-                    killed = true;
-                    break;
-                }
+        let exited = loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => break true,
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+                Ok(None) | Err(_) => break false,
             }
-        }
-        let exited = killed
-            || loop {
-                match self.child.try_wait() {
-                    Ok(Some(_)) => break true,
-                    Ok(None) if Instant::now() < deadline => {
-                        thread::sleep(Duration::from_millis(10))
-                    }
-                    Ok(None) | Err(_) => break false,
-                }
-            };
+        };
         if !exited {
             let _ = self.child.kill();
         }
@@ -987,5 +982,29 @@ case "$answer" in *'"id":"d"'*) echo '{"type":"response","command":"first-answer
             next(&session),
             AgentUpdate::Event(AgentEvent::TextDelta("a\u{2028}b".into()))
         );
+    }
+
+    #[test]
+    fn send_never_blocks_the_caller_when_the_agent_stops_reading() {
+        // The agent never reads stdin. Writing ~2 MiB directly would fill the 64 KiB pipe and
+        // block the caller (the UI thread in the window); queued sends must return at once.
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let session = fake_agent("trap '' TERM; exec sleep 30");
+            let frame = "x".repeat(200_000);
+            let started = Instant::now();
+            for _ in 0..10 {
+                session.send(&frame).expect("queued");
+            }
+            let sent = started.elapsed();
+            let started = Instant::now();
+            drop(session);
+            let _ = tx.send((sent, started.elapsed()));
+        });
+        let (sent, dropped) = rx
+            .recv_timeout(Duration::from_secs(4))
+            .expect("send blocked the caller on a full pipe");
+        assert!(sent < Duration::from_secs(1), "sends took {sent:?}");
+        assert!(dropped < Duration::from_secs(2), "Drop took {dropped:?}");
     }
 }
