@@ -88,6 +88,9 @@ pub struct RpcTransportConfig {
     pub request_timeout: Duration,
     pub max_response_bytes: usize,
     /// Time the child gets to exit cleanly after stdin EOF before `Drop` kills it.
+    ///
+    /// Worst-case `Drop` latency is roughly `shutdown_grace` + kill/reap + a 50ms reader-join
+    /// window, so raising it directly lengthens teardown of an unresponsive child.
     pub shutdown_grace: Duration,
 }
 
