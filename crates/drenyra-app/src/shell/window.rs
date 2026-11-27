@@ -1184,7 +1184,18 @@ fn approval_dialog(dialog: &ApprovalDialogView, t: &ThemeTokens) -> impl IntoEle
     } else {
         "This risk tier does not require approval; recording one is optional."
     };
-    let message = dialog.error.or(dialog.blocker);
+    let message = dialog
+        .error
+        .clone()
+        .or_else(|| dialog.blocker.map(str::to_owned));
+    let current_approver = dialog.current_approver.as_ref().map(|current| {
+        div()
+            .text_xs()
+            .text_color(rgb(t.warning))
+            .child(format!(
+                "Approved by {current}. Confirming replaces that approval; both stay in the evidence log."
+            ))
+    });
     div()
         .absolute()
         .top_0()
@@ -1240,6 +1251,7 @@ fn approval_dialog(dialog: &ApprovalDialogView, t: &ThemeTokens) -> impl IntoEle
                         .text_color(rgb(t.text_muted))
                         .child(requirement),
                 )
+                .children(current_approver)
                 .child(
                     div()
                         .flex()

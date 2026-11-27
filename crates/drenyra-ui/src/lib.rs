@@ -37,6 +37,49 @@ fn is_hidden_char(c: char) -> bool {
 /// Longest approver ID accepted by [`EntryDiffReview::record_human_approval`], in characters.
 pub const MAX_APPROVER_ID_CHARS: usize = 128;
 
+/// Trimmed approver ID when it is 1 to [`MAX_APPROVER_ID_CHARS`] characters with no hidden
+/// characters (see [`is_hidden_char`]), otherwise `None`.
+fn valid_approver(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim();
+    let valid = !trimmed.is_empty()
+        && trimmed.chars().count() <= MAX_APPROVER_ID_CHARS
+        && !trimmed.chars().any(is_hidden_char);
+    valid.then_some(trimmed)
+}
+
+/// Why [`EntryDiffReview::replace_human_approval`] refused; the approval is unchanged.
+/// `Display` gives a sentence that can be shown to the operator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplaceApprovalError {
+    /// No approval is recorded, so there is nothing to replace.
+    NothingToReplace,
+    /// The recorded approver is not the one the caller expected (it changed in the meantime).
+    StaleApproval { current: String },
+    /// The new approver, trimmed, is the one already recorded.
+    SameApprover,
+    /// The new approver ID fails the same rules as [`EntryDiffReview::record_human_approval`].
+    InvalidApprover,
+}
+
+impl std::fmt::Display for ReplaceApprovalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NothingToReplace => f.write_str("There is no recorded approval to replace."),
+            Self::StaleApproval { current } => write!(
+                f,
+                "The approval changed to {current} in the meantime. Review it and try again."
+            ),
+            Self::SameApprover => f.write_str("That approver already approved this entry."),
+            Self::InvalidApprover => write!(
+                f,
+                "Enter the approver's ID: 1 to {MAX_APPROVER_ID_CHARS} visible characters."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReplaceApprovalError {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LineDecision {
     Pending,
@@ -131,22 +174,52 @@ impl EntryDiffReview {
             .all(|decision| !matches!(decision, LineDecision::Pending))
     }
 
-    /// Records explicit human approval for posting.
+    /// Records explicit human approval for posting when none is recorded yet.
     ///
     /// The ID is trimmed and must then be 1 to [`MAX_APPROVER_ID_CHARS`] characters with no
     /// control, zero-width or bidirectional-formatting characters, so the recorded approver is
-    /// always exactly what a reader sees. A rejected ID leaves any previous approval in place.
+    /// always exactly what a reader sees. Returns `false` and changes nothing when the ID is
+    /// rejected or an approval already exists: a second approver never silently replaces the
+    /// first; use [`Self::replace_human_approval`] for that.
     pub fn record_human_approval(&mut self, approver: impl Into<String>) -> bool {
-        let raw = approver.into();
-        let trimmed = raw.trim();
-        if trimmed.is_empty()
-            || trimmed.chars().count() > MAX_APPROVER_ID_CHARS
-            || trimmed.chars().any(is_hidden_char)
-        {
+        if self.approved_by.is_some() {
             return false;
         }
-        self.approved_by = Some(trimmed.to_string());
+        let raw = approver.into();
+        let Some(trimmed) = valid_approver(&raw) else {
+            return false;
+        };
+        self.approved_by = Some(trimmed.to_owned());
         true
+    }
+
+    /// Replaces the recorded approver, compare-and-swap style: `expected_previous` must be the
+    /// approver currently recorded (as the operator saw it), and `approver` must be a different,
+    /// valid ID (same rules as [`Self::record_human_approval`], compared after trimming).
+    ///
+    /// Every error leaves the approval unchanged. Line decisions are not touched, and a later
+    /// decision change still clears the replaced approval.
+    pub fn replace_human_approval(
+        &mut self,
+        expected_previous: &str,
+        approver: impl Into<String>,
+    ) -> Result<(), ReplaceApprovalError> {
+        let current = self
+            .approved_by
+            .as_deref()
+            .ok_or(ReplaceApprovalError::NothingToReplace)?;
+        if current != expected_previous {
+            return Err(ReplaceApprovalError::StaleApproval {
+                current: current.to_owned(),
+            });
+        }
+        let raw = approver.into();
+        let trimmed = valid_approver(&raw).ok_or(ReplaceApprovalError::InvalidApprover)?;
+        if trimmed == current {
+            return Err(ReplaceApprovalError::SameApprover);
+        }
+        self.approved_by = Some(trimmed.to_owned());
+        Ok(())
     }
 
     /// The recorded human approver, if any. It is cleared whenever a line decision changes,
@@ -426,11 +499,147 @@ mod tests {
         let mut r = EntryDiffReview::new(sample_proposal(RiskTier::R2Material, true));
         r.accept_all();
         assert!(r.record_human_approval("CPA-1"));
+        assert!(
+            !r.record_human_approval("CPA-2"),
+            "a second approval never silently replaces the first"
+        );
+        assert_eq!(r.approved_by(), Some("CPA-1"));
         assert!(r.reject_line(0, "x"));
         assert!(r.accept_line(0));
+        assert_eq!(r.approved_by(), None);
         assert!(!r.can_post());
         assert!(r.record_human_approval("CPA-2"));
+        assert_eq!(r.approved_by(), Some("CPA-2"));
         assert!(r.can_post());
+    }
+
+    fn approved_review(approver: &str) -> EntryDiffReview {
+        let mut r = EntryDiffReview::new(sample_proposal(RiskTier::R2Material, true));
+        r.accept_all();
+        assert!(r.record_human_approval(approver));
+        r
+    }
+
+    #[test]
+    fn record_refuses_a_second_approval_and_keeps_the_first() {
+        let mut r = approved_review("CPA-1");
+        let before = r.clone();
+        for second in ["CPA-2", "CPA-1", "  CPA-1 ", "", "\u{200B}"] {
+            assert!(
+                !r.record_human_approval(second),
+                "{second:?} must be refused"
+            );
+            assert_eq!(r, before, "{second:?} changed the review");
+        }
+        assert!(r.can_post());
+    }
+
+    #[test]
+    fn replace_human_approval_errors_leave_the_approval_unchanged() {
+        let mut fresh = EntryDiffReview::new(sample_proposal(RiskTier::R2Material, true));
+        fresh.accept_all();
+        let untouched = fresh.clone();
+        assert_eq!(
+            fresh.replace_human_approval("CPA-1", "CPA-2"),
+            Err(ReplaceApprovalError::NothingToReplace)
+        );
+        assert_eq!(fresh, untouched);
+
+        let mut r = approved_review("CPA-1");
+        let before = r.clone();
+        let cases: [(&str, &str, ReplaceApprovalError); 7] = [
+            (
+                "CPA-9",
+                "CPA-2",
+                ReplaceApprovalError::StaleApproval {
+                    current: "CPA-1".into(),
+                },
+            ),
+            ("CPA-1", "CPA-1", ReplaceApprovalError::SameApprover),
+            ("CPA-1", "  CPA-1 \t", ReplaceApprovalError::SameApprover),
+            ("CPA-1", "", ReplaceApprovalError::InvalidApprover),
+            ("CPA-1", "   ", ReplaceApprovalError::InvalidApprover),
+            (
+                "CPA-1",
+                "CPA\u{200B}2",
+                ReplaceApprovalError::InvalidApprover,
+            ),
+            (
+                "CPA-1",
+                "CPA\u{202E}2",
+                ReplaceApprovalError::InvalidApprover,
+            ),
+        ];
+        for (expected, approver, error) in cases {
+            assert_eq!(
+                r.replace_human_approval(expected, approver),
+                Err(error),
+                "replace({expected:?}, {approver:?})"
+            );
+            assert_eq!(
+                r, before,
+                "replace({expected:?}, {approver:?}) changed the review"
+            );
+        }
+        assert_eq!(
+            r.replace_human_approval("CPA-1", "C".repeat(MAX_APPROVER_ID_CHARS + 1)),
+            Err(ReplaceApprovalError::InvalidApprover)
+        );
+        assert_eq!(r, before);
+    }
+
+    #[test]
+    fn replace_human_approval_swaps_a_valid_new_approver() {
+        let mut r = approved_review("CPA-1");
+        let decisions = r.decisions().to_vec();
+        assert_eq!(r.replace_human_approval("CPA-1", "  CPA-2 "), Ok(()));
+        assert_eq!(r.approved_by(), Some("CPA-2"));
+        assert_eq!(r.decisions(), decisions.as_slice());
+        assert!(r.can_post());
+        assert_eq!(
+            r.replace_human_approval("CPA-1", "CPA-3"),
+            Err(ReplaceApprovalError::StaleApproval {
+                current: "CPA-2".into()
+            }),
+            "the old expectation is stale after a replace"
+        );
+    }
+
+    #[test]
+    fn line_change_after_a_replace_still_clears_the_approval() {
+        let mut r = approved_review("CPA-1");
+        assert_eq!(r.replace_human_approval("CPA-1", "CPA-2"), Ok(()));
+        assert!(r.reject_line(2, "wrong tax"));
+        assert_eq!(r.approved_by(), None);
+        assert!(r.accept_line(2));
+        assert!(!r.can_post());
+        assert_eq!(
+            r.replace_human_approval("CPA-2", "CPA-3"),
+            Err(ReplaceApprovalError::NothingToReplace)
+        );
+    }
+
+    #[test]
+    fn replace_approval_errors_read_as_sentences() {
+        assert_eq!(
+            ReplaceApprovalError::NothingToReplace.to_string(),
+            "There is no recorded approval to replace."
+        );
+        assert_eq!(
+            ReplaceApprovalError::StaleApproval {
+                current: "CPA-2".into()
+            }
+            .to_string(),
+            "The approval changed to CPA-2 in the meantime. Review it and try again."
+        );
+        assert_eq!(
+            ReplaceApprovalError::SameApprover.to_string(),
+            "That approver already approved this entry."
+        );
+        assert_eq!(
+            ReplaceApprovalError::InvalidApprover.to_string(),
+            format!("Enter the approver's ID: 1 to {MAX_APPROVER_ID_CHARS} visible characters.")
+        );
     }
 
     #[test]
@@ -467,10 +676,20 @@ mod tests {
             Some(longest.as_str()),
             "a rejected ID keeps the previous one"
         );
-        assert!(review.record_human_approval("  CPA-PERU-001 "));
-        assert_eq!(review.approved_by(), Some("CPA-PERU-001"));
         assert!(
-            review.record_human_approval("Contadora Ñuñez Ü"),
+            !review.record_human_approval("  CPA-PERU-001 "),
+            "an existing approval is never overwritten"
+        );
+        assert_eq!(review.approved_by(), Some(longest.as_str()));
+
+        let mut fresh = EntryDiffReview::new(sample_proposal(RiskTier::R2Material, true));
+        fresh.accept_all();
+        assert!(fresh.record_human_approval("  CPA-PERU-001 "));
+        assert_eq!(fresh.approved_by(), Some("CPA-PERU-001"));
+        let mut accented = EntryDiffReview::new(sample_proposal(RiskTier::R2Material, true));
+        accented.accept_all();
+        assert!(
+            accented.record_human_approval("Contadora Ñuñez Ü"),
             "non-ASCII letters are visible"
         );
     }

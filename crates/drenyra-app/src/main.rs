@@ -69,11 +69,17 @@ pub fn run_demo_session_json() -> Result<String, ControllerError> {
         Err(ControllerError::ReviewNotReadyToPost)
     );
 
-    let review = controller
-        .active_review_mut()
-        .ok_or(ControllerError::NoStagedReview)?;
-    review.accept_all();
-    if !review.record_human_approval("CPA-PERU-001") {
+    let line_count = controller
+        .active_review()
+        .ok_or(ControllerError::NoStagedReview)?
+        .proposal()
+        .lines
+        .len();
+    // Line decisions and the approval go through the controller so they reach its evidence log.
+    for line in 0..line_count {
+        controller.accept_active_line(line);
+    }
+    if !controller.approve_active("CPA-PERU-001") {
         return Err(ControllerError::ReviewNotReadyToPost);
     }
 

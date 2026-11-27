@@ -13,7 +13,7 @@ use super::view_model::{
     SettingsPanel, ShellViewModel, SidebarCompany, SidebarEntry, SidebarView, ThemeOption,
 };
 use crate::controller::DrenyraHostController;
-use drenyra_ui::{EntryDiffReview, LineDecision};
+use drenyra_ui::{EntryDiffReview, LineDecision, ReplaceApprovalError};
 
 /// Comment recorded when a line is rejected from the keyboard (no free-text input yet).
 pub const REJECT_COMMENT: &str = "Rejected by operator in Entry Diff Review";
@@ -29,7 +29,7 @@ pub const APPROVAL_NEEDS_APPROVER: &str = "Enter the approver's ID: 1 to 128 vis
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ApprovalDraft {
     approver: String,
-    error: Option<&'static str>,
+    error: Option<String>,
 }
 
 /// Sidebar status of a staged entry with pending lines.
@@ -505,9 +505,10 @@ impl ShellState {
                     total_credit: panel.total_credit.clone(),
                     required: review.proposal().risk_tier.requires_human_approval(),
                     approver: draft.approver.clone(),
+                    current_approver: review.approved_by().map(str::to_owned),
                     ready: blocker.is_none(),
                     blocker,
-                    error: draft.error,
+                    error: draft.error.clone(),
                 })
             }
             _ => None,
@@ -607,18 +608,10 @@ impl ShellState {
             ShellCommand::NextWorkspace => self.next_workspace(),
             ShellCommand::ReviewCursorDown => self.move_cursor_down(),
             ShellCommand::ReviewCursorUp => self.move_cursor_up(),
-            ShellCommand::AcceptLine => {
-                let cursor = self.review_cursor;
-                self.controller
-                    .active_review_mut()
-                    .is_some_and(|review| review.accept_line(cursor))
-            }
-            ShellCommand::RejectLine => {
-                let cursor = self.review_cursor;
-                self.controller
-                    .active_review_mut()
-                    .is_some_and(|review| review.reject_line(cursor, REJECT_COMMENT))
-            }
+            ShellCommand::AcceptLine => self.controller.accept_active_line(self.review_cursor),
+            ShellCommand::RejectLine => self
+                .controller
+                .reject_active_line(self.review_cursor, REJECT_COMMENT),
         }
     }
 
@@ -664,6 +657,10 @@ impl ShellState {
     }
 
     /// The approval dialog is modal: Enter records the approval, Escape closes.
+    ///
+    /// With no approval recorded, Enter records the typed ID. With one recorded (the dialog shows
+    /// it), Enter explicitly replaces it with a different ID; the same ID is refused with
+    /// "Already approved by <id>.". Both paths go through the controller, which logs them.
     fn apply_in_approval(&mut self, command: ShellCommand) -> bool {
         match command {
             ShellCommand::CloseOverlay => {
@@ -680,14 +677,35 @@ impl ShellState {
                     .as_ref()
                     .map(|draft| draft.approver.clone())
                     .unwrap_or_default();
-                let recorded = self
+                let current = self
                     .controller
-                    .active_review_mut()
-                    .is_some_and(|review| review.record_human_approval(approver));
-                if recorded {
-                    self.approval = None;
-                } else {
-                    self.set_approval_error(APPROVAL_NEEDS_APPROVER);
+                    .active_review()
+                    .and_then(EntryDiffReview::approved_by)
+                    .map(str::to_owned);
+                let outcome = match current {
+                    None => {
+                        if self.controller.approve_active(&approver) {
+                            Ok(())
+                        } else {
+                            Err(APPROVAL_NEEDS_APPROVER.to_owned())
+                        }
+                    }
+                    Some(current) => self
+                        .controller
+                        .replace_active_approval(&current, &approver)
+                        .map_err(|error| match error {
+                            ReplaceApprovalError::SameApprover => {
+                                format!("Already approved by {current}.")
+                            }
+                            ReplaceApprovalError::InvalidApprover => {
+                                APPROVAL_NEEDS_APPROVER.to_owned()
+                            }
+                            other => other.to_string(),
+                        }),
+                };
+                match outcome {
+                    Ok(()) => self.approval = None,
+                    Err(message) => self.set_approval_error(message),
                 }
                 true
             }
@@ -695,9 +713,9 @@ impl ShellState {
         }
     }
 
-    fn set_approval_error(&mut self, error: &'static str) {
+    fn set_approval_error(&mut self, error: impl Into<String>) {
         if let Some(draft) = &mut self.approval {
-            draft.error = Some(error);
+            draft.error = Some(error.into());
         }
     }
 
@@ -812,6 +830,7 @@ const fn next_pane_kind(kind: PaneKind) -> PaneKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::controller::EvidenceKind;
     use crate::shell::agent_pane::AgentStatus;
     use crate::shell::settings::Settings;
     use crate::shell::theme::ThemeId;
@@ -1238,7 +1257,7 @@ mod tests {
         assert!(s.type_text("   "));
         assert!(s.apply(ShellCommand::Confirm, WIDE));
         assert_eq!(
-            s.view(WIDE).approval.expect("still open").error,
+            s.view(WIDE).approval.expect("still open").error.as_deref(),
             Some(APPROVAL_NEEDS_APPROVER)
         );
 
@@ -1552,7 +1571,7 @@ mod tests {
             None
         );
         assert_eq!(
-            s.view(WIDE).approval.expect("open").error,
+            s.view(WIDE).approval.expect("open").error.as_deref(),
             Some(APPROVAL_NOT_BALANCED)
         );
     }
@@ -1573,6 +1592,103 @@ mod tests {
         assert_eq!(s.view(WIDE).approval.expect("open").approver, "");
     }
 
+    fn approve_from_dialog(s: &mut ShellState, approver: &str) {
+        assert!(s.apply(ShellCommand::OpenApproval, WIDE));
+        assert!(s.type_text(approver));
+        assert!(s.apply(ShellCommand::Confirm, WIDE));
+    }
+
+    fn evidence_kinds(s: &ShellState) -> Vec<EvidenceKind> {
+        s.controller()
+            .evidence(&key(s, 0))
+            .iter()
+            .map(|event| event.kind.clone())
+            .collect()
+    }
+
+    fn approver(s: &ShellState) -> Option<String> {
+        s.controller()
+            .active_review()
+            .and_then(|review| review.approved_by().map(str::to_owned))
+    }
+
+    #[test]
+    fn dialog_shows_the_current_approver_and_refuses_the_same_id() {
+        let mut s = state();
+        accept_every_line(&mut s);
+        assert!(s.apply(ShellCommand::OpenApproval, WIDE));
+        assert_eq!(s.view(WIDE).approval.expect("open").current_approver, None);
+        s.apply(ShellCommand::CloseOverlay, WIDE);
+        approve_from_dialog(&mut s, "CPA-1");
+        assert!(s.view(WIDE).approval.is_none());
+        let logged = evidence_kinds(&s);
+
+        assert!(s.apply(ShellCommand::OpenApproval, WIDE));
+        let dialog = s.view(WIDE).approval.expect("open");
+        assert_eq!(dialog.current_approver.as_deref(), Some("CPA-1"));
+        assert_eq!(dialog.approver, "", "input starts empty");
+        assert!(s.type_text(" CPA-1 "));
+        assert!(s.apply(ShellCommand::Confirm, WIDE));
+        let dialog = s.view(WIDE).approval.expect("stays open");
+        assert_eq!(dialog.error.as_deref(), Some("Already approved by CPA-1."));
+        assert_eq!(approver(&s).as_deref(), Some("CPA-1"));
+        assert_eq!(
+            evidence_kinds(&s),
+            logged,
+            "a refused approval logs nothing"
+        );
+    }
+
+    #[test]
+    fn dialog_replaces_the_approver_with_a_different_id_and_logs_it() {
+        let mut s = state();
+        accept_every_line(&mut s);
+        approve_from_dialog(&mut s, "CPA-1");
+        approve_from_dialog(&mut s, "CPA-2");
+        assert!(s.view(WIDE).approval.is_none(), "closes after replacing");
+        assert_eq!(approver(&s).as_deref(), Some("CPA-2"));
+        assert_eq!(
+            evidence_kinds(&s).last(),
+            Some(&EvidenceKind::ApprovalReplaced {
+                proposal_id: "je-demo-2026-10-001".into(),
+                previous: "CPA-1".into(),
+                approver: "CPA-2".into(),
+            })
+        );
+        assert!(s.view(WIDE).review.expect("panel").can_post);
+
+        // An invalid replacement keeps the current approver.
+        approve_from_dialog(&mut s, "\u{200B}");
+        assert_eq!(
+            s.view(WIDE).approval.expect("open").error.as_deref(),
+            Some(APPROVAL_NEEDS_APPROVER)
+        );
+        assert_eq!(approver(&s).as_deref(), Some("CPA-2"));
+    }
+
+    #[test]
+    fn line_decisions_go_through_the_controller_and_log_a_cleared_approval() {
+        let mut s = state();
+        accept_every_line(&mut s);
+        approve_from_dialog(&mut s, "CPA-1");
+        assert!(s.apply(ShellCommand::AcceptLine, WIDE), "same decision");
+        assert_eq!(approver(&s).as_deref(), Some("CPA-1"));
+        assert!(s.apply(ShellCommand::RejectLine, WIDE));
+        assert_eq!(approver(&s), None);
+        let cleared = EvidenceKind::ApprovalCleared {
+            proposal_id: "je-demo-2026-10-001".into(),
+            previous: "CPA-1".into(),
+        };
+        assert_eq!(evidence_kinds(&s).last(), Some(&cleared));
+        assert!(s.apply(ShellCommand::AcceptLine, WIDE));
+        assert_eq!(
+            evidence_kinds(&s).last(),
+            Some(&cleared),
+            "nothing to clear the second time"
+        );
+        assert_eq!(evidence_kinds(&s).len(), 3, "staged, approved, cleared");
+    }
+
     #[test]
     fn invisible_approver_ids_are_refused_with_the_documented_limit() {
         let mut s = state();
@@ -1588,7 +1704,7 @@ mod tests {
             None
         );
         assert_eq!(
-            s.view(WIDE).approval.expect("open").error,
+            s.view(WIDE).approval.expect("open").error.as_deref(),
             Some(APPROVAL_NEEDS_APPROVER)
         );
         assert!(APPROVAL_NEEDS_APPROVER.contains(&drenyra_ui::MAX_APPROVER_ID_CHARS.to_string()));

@@ -123,12 +123,14 @@ pub struct ApprovalDialogView {
     pub required: bool,
     /// Approver ID typed so far.
     pub approver: String,
+    /// Approver already recorded for this entry; confirming then replaces it explicitly.
+    pub current_approver: Option<String>,
     /// True when the entry can be approved now.
     pub ready: bool,
     /// Why the entry cannot be approved yet.
     pub blocker: Option<&'static str>,
     /// Feedback from the last Enter.
-    pub error: Option<&'static str>,
+    pub error: Option<String>,
 }
 
 /// A staged journal entry listed in the sidebar.
