@@ -8,11 +8,28 @@ use super::agent_pane::AgentPane;
 use super::demo;
 use super::settings::Settings;
 use super::theme::ThemeId;
-use super::view_model::{AgentPaneView, Rect, SettingsPanel, ShellViewModel, ThemeOption};
+use super::view_model::{
+    AgentPaneView, ApprovalDialogView, Rect, SettingsPanel, ShellViewModel, ThemeOption,
+};
 use crate::controller::DrenyraHostController;
+use drenyra_ui::LineDecision;
 
 /// Comment recorded when a line is rejected from the keyboard (no free-text input yet).
 pub const REJECT_COMMENT: &str = "Rejected by operator in Entry Diff Review";
+
+/// Shown when the approval dialog opens before every line is accepted.
+pub const APPROVAL_NEEDS_ACCEPTED_LINES: &str = "Accept every line before approving.";
+/// Shown when the entry does not balance.
+pub const APPROVAL_NOT_BALANCED: &str = "The entry is not balanced, so it cannot be approved.";
+/// Shown when Enter is pressed without an approver ID.
+pub const APPROVAL_NEEDS_APPROVER: &str = "Enter the approver's ID.";
+
+/// The approval dialog's input state.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ApprovalDraft {
+    approver: String,
+    error: Option<&'static str>,
+}
 
 /// Operator intents the native window maps from key bindings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +54,8 @@ pub enum ShellCommand {
     FocusComposer,
     /// Stop the active workspace's running agent.
     StopAgent,
+    /// Open the human-approval dialog for the staged entry.
+    OpenApproval,
 }
 
 /// Every command, for exhaustiveness checks.
@@ -55,6 +74,7 @@ pub const ALL_COMMANDS: &[ShellCommand] = &[
     ShellCommand::Confirm,
     ShellCommand::FocusComposer,
     ShellCommand::StopAgent,
+    ShellCommand::OpenApproval,
 ];
 
 /// Single source of truth for window key bindings (GPUI keystroke syntax).
@@ -75,6 +95,7 @@ pub const KEY_BINDINGS: &[(&str, ShellCommand)] = &[
     ("enter", ShellCommand::Confirm),
     ("i", ShellCommand::FocusComposer),
     ("ctrl-c", ShellCommand::StopAgent),
+    ("ctrl-p", ShellCommand::OpenApproval),
 ];
 
 /// Window-independent shell state: the host controller plus presentation cursors.
@@ -90,6 +111,8 @@ pub struct ShellState {
     agents: BTreeMap<usize, AgentPane>,
     /// True while keystrokes go to the active workspace's composer.
     composer_active: bool,
+    /// The approval dialog, when open.
+    approval: Option<ApprovalDraft>,
 }
 
 impl ShellState {
@@ -102,6 +125,7 @@ impl ShellState {
             settings_cursor: None,
             agents: BTreeMap::new(),
             composer_active: false,
+            approval: None,
         }
     }
 
@@ -119,14 +143,25 @@ impl ShellState {
         self.controller.workspaces().active_index()
     }
 
-    /// True while keystrokes go to the composer instead of key bindings.
-    pub fn composer_active(&self) -> bool {
-        self.composer_active
+    /// True while keystrokes go to a text field (the composer or the approval dialog) instead of
+    /// key bindings.
+    pub fn text_input_active(&self) -> bool {
+        self.approval.is_some() || self.composer_active
     }
 
-    /// Types into the active composer; returns `false` when the composer is not active.
-    pub fn composer_insert(&mut self, text: &str) -> bool {
-        if !self.composer_active || text.is_empty() {
+    /// Types into the active text field; returns `false` when no text field is active.
+    pub fn type_text(&mut self, text: &str) -> bool {
+        if text.is_empty() {
+            return false;
+        }
+        if let Some(draft) = &mut self.approval {
+            draft
+                .approver
+                .extend(text.chars().filter(|c| !c.is_control()));
+            draft.error = None;
+            return true;
+        }
+        if !self.composer_active {
             return false;
         }
         let index = self.active_workspace();
@@ -134,13 +169,29 @@ impl ShellState {
         true
     }
 
-    /// Deletes the last composer character; returns `false` when nothing changed.
-    pub fn composer_backspace(&mut self) -> bool {
+    /// Deletes the last character of the active text field; returns `false` when nothing changed.
+    pub fn backspace(&mut self) -> bool {
+        if let Some(draft) = &mut self.approval {
+            return draft.approver.pop().is_some();
+        }
         if !self.composer_active {
             return false;
         }
         let index = self.active_workspace();
         self.agent_pane_mut(index).composer_backspace()
+    }
+
+    /// Why the staged entry cannot be approved now, or `None` when it can.
+    fn approval_blocker(&self) -> Option<&'static str> {
+        let review = self.controller.active_review()?;
+        if !review.proposal().is_balanced() {
+            return Some(APPROVAL_NOT_BALANCED);
+        }
+        let all_accepted = review
+            .decisions()
+            .iter()
+            .all(|decision| matches!(decision, LineDecision::Accepted));
+        (!all_accepted).then_some(APPROVAL_NEEDS_ACCEPTED_LINES)
     }
 
     /// Replaces the operator settings (for example, the ones loaded from disk).
@@ -178,6 +229,27 @@ impl ShellState {
         let index = self.active_workspace();
         let pane = self.agents.get(&index).cloned().unwrap_or_default();
         view.agent = Some(AgentPaneView::from_pane(&pane, self.composer_active));
+        view.approval = match (
+            &self.approval,
+            &view.review,
+            self.controller.active_review(),
+        ) {
+            (Some(draft), Some(panel), Some(review)) => {
+                let blocker = self.approval_blocker();
+                Some(ApprovalDialogView {
+                    proposal_id: panel.proposal_id.clone(),
+                    risk_tier_label: panel.risk_tier_label,
+                    total_debit: panel.total_debit.clone(),
+                    total_credit: panel.total_credit.clone(),
+                    required: review.proposal().risk_tier.requires_human_approval(),
+                    approver: draft.approver.clone(),
+                    ready: blocker.is_none(),
+                    blocker,
+                    error: draft.error,
+                })
+            }
+            _ => None,
+        };
         view.settings = self.settings_cursor.map(|cursor| SettingsPanel {
             sections: vec!["Themes"],
             active_section: 0,
@@ -203,10 +275,20 @@ impl ShellState {
         if let Some(cursor) = self.settings_cursor {
             return self.apply_in_settings(command, cursor);
         }
+        if self.approval.is_some() {
+            return self.apply_in_approval(command);
+        }
         if self.composer_active {
             return self.apply_in_composer(command);
         }
         match command {
+            ShellCommand::OpenApproval => {
+                if self.controller.active_review().is_none() {
+                    return false;
+                }
+                self.approval = Some(ApprovalDraft::default());
+                true
+            }
             ShellCommand::FocusComposer => {
                 let focused_is_agent = self
                     .view(pane_area)
@@ -260,6 +342,44 @@ impl ShellState {
                     .active_review_mut()
                     .is_some_and(|review| review.reject_line(cursor, REJECT_COMMENT))
             }
+        }
+    }
+
+    /// The approval dialog is modal: Enter records the approval, Escape closes.
+    fn apply_in_approval(&mut self, command: ShellCommand) -> bool {
+        match command {
+            ShellCommand::CloseOverlay => {
+                self.approval = None;
+                true
+            }
+            ShellCommand::Confirm => {
+                if let Some(blocker) = self.approval_blocker() {
+                    self.set_approval_error(blocker);
+                    return true;
+                }
+                let approver = self
+                    .approval
+                    .as_ref()
+                    .map(|draft| draft.approver.clone())
+                    .unwrap_or_default();
+                let recorded = self
+                    .controller
+                    .active_review_mut()
+                    .is_some_and(|review| review.record_human_approval(approver));
+                if recorded {
+                    self.approval = None;
+                } else {
+                    self.set_approval_error(APPROVAL_NEEDS_APPROVER);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn set_approval_error(&mut self, error: &'static str) {
+        if let Some(draft) = &mut self.approval {
+            draft.error = Some(error);
         }
     }
 
@@ -635,13 +755,13 @@ mod tests {
     #[test]
     fn composer_opens_only_on_a_focused_agent_pane_and_captures_text() {
         let mut s = state();
-        assert!(!s.composer_insert("x"), "typing needs the composer");
-        assert!(!s.composer_active());
+        assert!(!s.type_text("x"), "typing needs the composer");
+        assert!(!s.text_input_active());
         assert!(s.apply(ShellCommand::FocusComposer, WIDE));
-        assert!(s.composer_active());
+        assert!(s.text_input_active());
         assert!(s.view(WIDE).agent.expect("agent pane").composer_active);
-        assert!(s.composer_insert("hola"));
-        assert!(s.composer_backspace());
+        assert!(s.type_text("hola"));
+        assert!(s.backspace());
         assert_eq!(s.view(WIDE).agent.expect("agent").composer, "hol");
 
         // Focus a non-agent pane: the composer cannot open there.
@@ -664,7 +784,7 @@ mod tests {
                 },
             ));
         s.apply(ShellCommand::FocusComposer, WIDE);
-        s.composer_insert("¿saldo de caja?");
+        s.type_text("¿saldo de caja?");
         for cmd in [
             ShellCommand::SplitFocused,
             ShellCommand::NextWorkspace,
@@ -708,6 +828,78 @@ mod tests {
     }
 
     #[test]
+    fn approval_dialog_records_the_typed_approver_only_when_every_line_is_accepted() {
+        let mut s = state();
+        assert!(s.apply(ShellCommand::OpenApproval, WIDE));
+        assert!(s.text_input_active());
+        let dialog = s.view(WIDE).approval.expect("dialog open");
+        assert_eq!(dialog.proposal_id, "je-demo-2026-10-001");
+        assert_eq!(dialog.risk_tier_label, "R2 Material");
+        assert_eq!(dialog.total_debit, "118.00");
+        assert!(!dialog.ready);
+        assert_eq!(dialog.blocker, Some(APPROVAL_NEEDS_ACCEPTED_LINES));
+
+        // Not ready: Enter explains instead of approving, and other commands stay blocked.
+        assert!(s.type_text("CPA-PERU-001"));
+        assert!(s.apply(ShellCommand::Confirm, WIDE));
+        assert!(s
+            .controller()
+            .active_review()
+            .expect("review")
+            .approved_by()
+            .is_none());
+        assert!(!s.apply(ShellCommand::AcceptLine, WIDE), "modal");
+        assert!(s.apply(ShellCommand::CloseOverlay, WIDE));
+        assert!(s.view(WIDE).approval.is_none());
+
+        for _ in 0..3 {
+            s.apply(ShellCommand::AcceptLine, WIDE);
+            s.apply(ShellCommand::ReviewCursorDown, WIDE);
+        }
+        assert!(s.apply(ShellCommand::OpenApproval, WIDE));
+        let dialog = s.view(WIDE).approval.expect("open");
+        assert!(dialog.ready && dialog.blocker.is_none());
+        assert_eq!(dialog.approver, "", "input starts empty each time");
+
+        assert!(s.type_text("   "));
+        assert!(s.apply(ShellCommand::Confirm, WIDE));
+        assert_eq!(
+            s.view(WIDE).approval.expect("still open").error,
+            Some(APPROVAL_NEEDS_APPROVER)
+        );
+
+        assert!(s.backspace());
+        s.type_text("  CPA-PERU-001 ");
+        assert!(s.apply(ShellCommand::Confirm, WIDE));
+        assert!(s.view(WIDE).approval.is_none(), "closes after approving");
+        let review = s.controller().active_review().expect("review");
+        assert_eq!(review.approved_by(), Some("CPA-PERU-001"));
+        assert!(review.can_post());
+        assert!(s.view(WIDE).review.expect("panel").can_post);
+
+        // Editing a line afterwards clears the approval (guard from drenyra-ui).
+        s.apply(ShellCommand::RejectLine, WIDE);
+        assert!(s
+            .controller()
+            .active_review()
+            .expect("review")
+            .approved_by()
+            .is_none());
+    }
+
+    #[test]
+    fn approval_dialog_needs_a_staged_review_in_the_active_workspace() {
+        let mut s = state();
+        s.apply(ShellCommand::NextWorkspace, WIDE);
+        assert!(
+            !s.apply(ShellCommand::OpenApproval, WIDE),
+            "Sierra has no staged review"
+        );
+        assert!(s.view(WIDE).approval.is_none());
+        assert!(!s.type_text("x"));
+    }
+
+    #[test]
     fn key_bindings_cover_every_command_without_duplicate_keys() {
         for command in ALL_COMMANDS {
             assert!(
@@ -727,5 +919,6 @@ mod tests {
         assert!(KEY_BINDINGS.contains(&("enter", ShellCommand::Confirm)));
         assert!(KEY_BINDINGS.contains(&("i", ShellCommand::FocusComposer)));
         assert!(KEY_BINDINGS.contains(&("ctrl-c", ShellCommand::StopAgent)));
+        assert!(KEY_BINDINGS.contains(&("ctrl-p", ShellCommand::OpenApproval)));
     }
 }
