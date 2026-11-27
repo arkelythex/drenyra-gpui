@@ -10,11 +10,11 @@
 
 ## 1. Core Thesis: The App Hosts, Shell & Kernel Do the Work
 
-`gentle-shell-gpui` proved a decisive architectural principle for software engineering: **the native desktop app never reimplements the agent harness or the compiler**. Each tab spawns `gentle-shell --mode rpc` over JSON-RPC stdio, so the harness, orchestration, permissions, memory, review, and skills run unchanged while GPUI delivers a zero-latency, workspace-native operator surface.
+`gentle-shell-gpui` proved a decisive architectural principle for software engineering: **the native desktop app never reimplements the agent harness or the compiler**. Each tab spawns `gentle-shell --mode rpc` and talks to it over stdio, so the harness, orchestration, permissions, memory, review, and skills run unchanged while GPUI delivers a zero-latency, workspace-native operator surface.
 
 **Drenyra GPUI applies the exact same boundary to accounting:**
 
-1. **One Drenyra Shell per tab (RPC host).** Each agent tab launches `drenyra-shell` / `pi --mode rpc` over JSON-RPC 2.0 stdio. Persona, `/drenyra:*` commands, fiscal scope guards, skills (`drenyra-skills`), institutional memory (`drenyra-engram`), and Receipt-Driven Accounting (RDA) run unchanged inside the shell.
+1. **One Drenyra Shell per tab (RPC host).** Each agent tab launches `pi --mode rpc` (with the `drenyra-shell` pi package installed, when available) and speaks the agent's own stdio record protocol: LF-delimited `{"type": ...}` commands, `response` records that echo a string `id`, an event stream for each run until `agent_settled`, and `extension_ui_request` dialogs. It is not JSON-RPC 2.0. `drenyra-shell` is a pi package (extensions, skills, prompts), not a standalone binary. Persona, `/drenyra:*` commands, fiscal scope guards, skills (`drenyra-skills`), institutional memory (`drenyra-engram`), and Receipt-Driven Accounting (RDA) run unchanged inside the shell.
 2. **Deterministic fiscal kernel over stdio MCP.** Whenever the UI inspects ledger state, validates double-entry invariants, verifies receipts, or advances missions, it speaks JSON-RPC 2.0 to `drenyra-ai mcp serve` — never reimplementing tax or accounting logic in the desktop layer.
 3. **Human authority is non-delegable.** Agents propose; deterministic validators check; certified professionals approve material decisions (R2/R3); `drenyra-ai` emits a signed, offline-verifiable receipt. Memory (`drenyra-engram`) informs; it never authorizes.
 4. **Zero-float monetary invariant.** Every monetary amount crossing `drenyra-protocol` is represented as signed integer cents (`MoneyCents(i128)`), matching Drenyra's ecosystem-wide BigInt-cent rule. Floating-point numbers are forbidden for money.
@@ -47,7 +47,7 @@ drenyra-gpui/
 ├── crates/
 │   ├── drenyra-protocol/       # JSON-RPC 2.0 stdio transport, MoneyCents(i128), Entry Diff & Receipt contracts
 │   ├── drenyra-workspace/      # Fiscal Workspaces, Hyprland dwindle tiling tree, Sidebar, Session Chips & RDA gate
-│   ├── drenyra-rpc/            # Supervised stdio JSON-RPC 2.0 session (timeouts, poisoning, response-id matching)
+│   ├── drenyra-rpc/            # Supervised stdio JSON-RPC 2.0 session (timeouts, poisoning, response-id matching) and `agent`: the pi agent protocol client
 │   ├── drenyra-ui/             # Accounting Generative UI state: Entry Diff Review, Reconciliation Table
 │   └── drenyra-app/            # Desktop host binary: tenant-scoped controller, shell view model & commands,
 │                               #   feature-gated GPUI window (--window), --check-env / --demo-session / --probe-rpc

@@ -8,3 +8,4 @@ description = "Live NDJSON stdio JSON-RPC 2.0 subprocess supervisor for Drenyra 
 
 [dependencies]
 drenyra-protocol = { path = "../drenyra-protocol" }
+serde_json = "1.0.154"

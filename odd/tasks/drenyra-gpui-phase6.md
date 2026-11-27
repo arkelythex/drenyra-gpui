@@ -42,3 +42,10 @@ Assumptions (marked): keys keep Ctrl on Linux; the selected theme persists acros
   - Checks: 110 tests headless / 109 with features; clippy `-D warnings` with and without `gpui`; fmt.
   - Size: ~1.1k changed lines in one unit (tokens, settings, window restyle share `shell::window` functions; splitting would be artificial).
   - Risk: none of items 1-6 (new optional settings file, new keys; existing keys and `--demo-session` unchanged).
+- **L5 — 2026-11-27 T3a agent protocol client (`drenyra-rpc::agent`).**
+  - New dependency `serde_json 1.0.154` (already in the lock via GPUI; lock diff is one edge). Hand-writing a nested JSON parser was rejected as a bug source.
+  - Tests: record parsing from the protocol docs' examples, command builders (escaping, `followUp` while streaming), fake-agent sessions (streamed run, dialog auto-cancel, protocol violation stops reading, `abort` while streaming, Drop reaps). A test failure exposed an order-dependent fake script (`json!` sorts keys); fixed the script, not the client. 29 tests, stable 3×.
+  - Contract against the real agent: `real_pi_answers_get_state_in_the_agent_protocol` (ignored by default; uses only `get_state`, no model call) passed against pi 1.6.0 in 7s.
+  - Policy: extension dialogs are answered `cancelled: true` (never grants) and forwarded so the pane shows them, until the window renders dialogs.
+  - Architecture doc corrected: the agent protocol is not JSON-RPC 2.0; `drenyra-shell` is a pi package.
+  - Risk: items 4 (threads sharing the agent's stdin) and 5 (new dependency) → independent verifier.
