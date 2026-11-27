@@ -318,6 +318,81 @@ mod tests {
     }
 
     #[test]
+    fn early_approval_does_not_survive_line_by_line_accepts() {
+        let mut r = EntryDiffReview::new(sample_proposal(RiskTier::R2Material, true));
+        assert!(r.accept_line(0));
+        assert!(r.record_human_approval("CPA-1"));
+        assert!(r.accept_line(1));
+        assert!(r.accept_line(2));
+        assert_eq!(r.approved_by(), None);
+        assert!(!r.can_post());
+    }
+
+    #[test]
+    fn accept_all_over_a_rejected_line_clears_approval() {
+        let mut r = EntryDiffReview::new(sample_proposal(RiskTier::R3Irreversible, true));
+        r.accept_all();
+        assert!(r.reject_line(0, "x"));
+        assert!(r.record_human_approval("CPA-1"));
+        r.accept_all();
+        assert_eq!(r.approved_by(), None);
+        assert!(!r.can_post());
+    }
+
+    #[test]
+    fn rejecting_again_with_a_different_comment_clears_approval() {
+        let mut r = EntryDiffReview::new(sample_proposal(RiskTier::R2Material, true));
+        r.accept_all();
+        assert!(r.reject_line(1, "first"));
+        assert!(r.record_human_approval("CPA-1"));
+        assert!(r.reject_line(1, "second"));
+        assert_eq!(r.approved_by(), None);
+        assert_eq!(
+            r.decisions()[1],
+            LineDecision::Rejected {
+                comment: "second".into()
+            }
+        );
+    }
+
+    #[test]
+    fn same_rejection_after_trim_keeps_approval() {
+        let mut r = EntryDiffReview::new(sample_proposal(RiskTier::R2Material, true));
+        r.accept_all();
+        assert!(r.reject_line(1, "dup"));
+        assert!(r.record_human_approval("CPA-1"));
+        assert!(r.reject_line(1, "  dup \n"));
+        assert_eq!(r.approved_by(), Some("CPA-1"));
+    }
+
+    #[test]
+    fn no_op_calls_leave_review_byte_identical() {
+        let mut r = EntryDiffReview::new(sample_proposal(RiskTier::R3Irreversible, true));
+        r.accept_all();
+        assert!(r.record_human_approval("CPA-1"));
+        let before = r.clone();
+        assert!(r.accept_line(1));
+        r.accept_all();
+        assert!(!r.accept_line(usize::MAX));
+        assert!(!r.reject_line(3, "oob"));
+        assert!(!r.reject_line(0, " \t\n"));
+        assert_eq!(r, before);
+        assert!(r.can_post());
+    }
+
+    #[test]
+    fn reapproval_after_an_edit_allows_posting_again() {
+        let mut r = EntryDiffReview::new(sample_proposal(RiskTier::R2Material, true));
+        r.accept_all();
+        assert!(r.record_human_approval("CPA-1"));
+        assert!(r.reject_line(0, "x"));
+        assert!(r.accept_line(0));
+        assert!(!r.can_post());
+        assert!(r.record_human_approval("CPA-2"));
+        assert!(r.can_post());
+    }
+
+    #[test]
     fn rejecting_line_blocks_posting_and_tracks_decided_count() {
         let mut review = EntryDiffReview::new(sample_proposal(RiskTier::R1Draft, true));
         assert!(!review.reject_line(0, ""));
