@@ -9,6 +9,7 @@ members = [
 ]
 exclude = [
     "apps/web/src-tauri",
+    "vendor/rust/xattr",
 ]
 
 [workspace.package]
@@ -17,3 +18,8 @@ edition = "2021"
 license = "MIT"
 repository = "https://github.com/arkelythex/drenyra-gpui"
 authors = ["Arkelythex / Drenyra Team"]
+
+# Temporary: xattr 0.2.3 (pulled in by gpui) does not build with libc >= 0.2.191 on Linux.
+# See vendor/rust/xattr/PATCHED.md for the one-line fix and the removal condition.
+[patch.crates-io]
+xattr = { path = "vendor/rust/xattr" }

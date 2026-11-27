@@ -3,7 +3,9 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use drenyra_protocol::{escape_json_str, JournalEntryProposal, JsonRpcRequest, ProtocolError};
+use drenyra_protocol::{
+    escape_json_str, JournalEntryProposal, JsonRpcRequest, ProtocolError, RiskTier,
+};
 use drenyra_ui::{EntryDiffReview, ReconciliationTable};
 use drenyra_workspace::{FiscalWorkspace, WorkspaceActivity, WorkspaceManager};
 
@@ -108,10 +110,12 @@ impl DrenyraHostController {
             return Err(ControllerError::ReviewAlreadyStaged);
         }
 
+        let risk_tier = proposal.risk_tier;
         self.reviews.insert(index, EntryDiffReview::new(proposal));
         let active = self.workspaces.active_mut();
         active.activity = WorkspaceActivity::AwaitingApproval;
         active.guardrails.unposted_entries = 1;
+        active.guardrails.active_risk_tier = risk_tier;
         Ok(())
     }
 
@@ -220,6 +224,7 @@ impl DrenyraHostController {
         self.reviews.remove(&index);
         if let Some(owner) = self.workspaces.get_mut(index) {
             owner.guardrails.unposted_entries = 0;
+            owner.guardrails.active_risk_tier = RiskTier::R0Read;
             owner.activity = WorkspaceActivity::Idle;
         }
         Ok(())
@@ -635,6 +640,41 @@ mod tests {
         let active = controller.workspaces().active();
         assert_eq!(active.guardrails.unposted_entries, 1);
         assert_eq!(active.activity, WorkspaceActivity::AwaitingApproval);
+    }
+
+    #[test]
+    fn active_risk_tier_follows_staged_review_until_post_is_confirmed() {
+        let ws = FiscalWorkspace::new("20123456789", "Andino SAC", "2026-10");
+        let mut controller = DrenyraHostController::new(ws);
+        assert_eq!(
+            controller.workspaces().active().guardrails.active_risk_tier,
+            RiskTier::R0Read
+        );
+
+        controller
+            .stage_proposal(sample_proposal("je-001", RiskTier::R2Material, true))
+            .expect("proposal matches workspace");
+        assert_eq!(
+            controller.workspaces().active().guardrails.active_risk_tier,
+            RiskTier::R2Material
+        );
+
+        {
+            let review = controller.active_review_mut().expect("staged review");
+            review.accept_all();
+            assert!(review.record_human_approval("CPA-PERU-001"));
+        }
+        controller.build_post_request().expect("frame");
+        assert_eq!(
+            controller.workspaces().active().guardrails.active_risk_tier,
+            RiskTier::R2Material,
+            "still gated while the post is in flight"
+        );
+        assert_eq!(controller.confirm_posted(1), Ok(()));
+        assert_eq!(
+            controller.workspaces().active().guardrails.active_risk_tier,
+            RiskTier::R0Read
+        );
     }
 
     #[test]

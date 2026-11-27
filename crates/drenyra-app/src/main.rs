@@ -3,6 +3,8 @@
 #[cfg_attr(not(test), allow(dead_code))]
 pub mod controller;
 #[cfg_attr(not(test), allow(dead_code))]
+mod shell;
+#[cfg_attr(not(test), allow(dead_code))]
 mod ui;
 
 use std::env;
@@ -11,12 +13,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use controller::{ControllerError, DrenyraHostController};
-use drenyra_protocol::{
-    escape_json_str, validate_json_container, JournalEntryProposal, JournalLine, JsonRpcRequest,
-    MoneyCents, RiskTier,
-};
+use drenyra_protocol::{escape_json_str, validate_json_container, JsonRpcRequest, MoneyCents};
 use drenyra_rpc::{RpcSession, RpcTransportConfig};
-use drenyra_workspace::{FiscalWorkspace, PaneKind, SessionGuardrails};
+use drenyra_workspace::{PaneKind, SessionGuardrails};
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -56,41 +55,14 @@ pub fn probe_rpc(command: &str, args: &[String]) -> Result<String, String> {
 }
 
 pub fn run_demo_session_json() -> Result<String, ControllerError> {
-    let workspace = FiscalWorkspace::new("20123456789", "Andino SAC", "2026-10");
-    let mut controller = DrenyraHostController::new(workspace);
+    let mut controller = DrenyraHostController::new(shell::demo::demo_workspace());
     controller
         .workspaces_mut()
         .active_mut()
         .split_focused(PaneKind::LedgerViewer, 1440, 900);
     let pane_count = controller.workspaces().active().pane_count();
 
-    let proposal = JournalEntryProposal {
-        id: "je-demo-2026-10-001".into(),
-        entity_ruc: "20123456789".into(),
-        fiscal_period: "2026-10".into(),
-        risk_tier: RiskTier::R2Material,
-        lines: vec![
-            JournalLine {
-                account_code: "1212".into(),
-                debit: MoneyCents::from_cents(11_800),
-                credit: MoneyCents::ZERO,
-                description: "Accounts receivable".into(),
-            },
-            JournalLine {
-                account_code: "7011".into(),
-                debit: MoneyCents::ZERO,
-                credit: MoneyCents::from_cents(10_000),
-                description: "Sales revenue".into(),
-            },
-            JournalLine {
-                account_code: "40111".into(),
-                debit: MoneyCents::ZERO,
-                credit: MoneyCents::from_cents(1_800),
-                description: "IGV 18%".into(),
-            },
-        ],
-    };
-    controller.stage_proposal(proposal)?;
+    controller.stage_proposal(shell::demo::demo_proposal())?;
 
     let blocked_before_approval = matches!(
         controller.build_post_request(),
@@ -132,6 +104,39 @@ pub fn run_demo_session_json() -> Result<String, ControllerError> {
     ))
 }
 
+/// Error printed for arguments no flag accepts (text kept stable for existing scripts).
+pub fn unrecognized_arguments_message(args: &[String]) -> String {
+    format!(
+        "drenyra-gpui: unrecognized arguments: {} (try --help, --check-env, --demo-session, or --probe-rpc)",
+        args.join(" ")
+    )
+}
+
+/// Message printed by `--window` in a headless build.
+pub const fn window_unavailable_message() -> &'static str {
+    "drenyra-gpui: --window requires a native build; rebuild with `cargo run -p drenyra-app --features gpui -- --window`"
+}
+
+#[cfg(feature = "gpui")]
+fn run_window() -> ExitCode {
+    match ui::mount_native_window(
+        ui::DesktopShellConfig::default(),
+        shell::commands::ShellState::demo(),
+    ) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("drenyra-gpui: --window failed: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(feature = "gpui"))]
+fn run_window() -> ExitCode {
+    eprintln!("{}", window_unavailable_message());
+    ExitCode::FAILURE
+}
+
 pub fn run_cli(args: &[String]) -> ExitCode {
     match args {
         [] | [_]
@@ -148,6 +153,7 @@ pub fn run_cli(args: &[String]) -> ExitCode {
             println!("  drenyra-gpui --check-env                  Print headless RPC host environment diagnostics (JSON)");
             println!("  drenyra-gpui --demo-session               Run deterministic end-to-end controller & approval gate demo (JSON)");
             println!("  drenyra-gpui --probe-rpc <cmd> [args...]  Probe an NDJSON stdio JSON-RPC 2.0 server");
+            println!("  drenyra-gpui --window                     Open the native GPUI window on demo data (requires --features gpui)");
             ExitCode::SUCCESS
         }
         [flag] if flag == "--check-env" => {
@@ -175,6 +181,7 @@ pub fn run_cli(args: &[String]) -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        [flag] if flag == "--window" => run_window(),
         [flag] if flag == "--probe-rpc" => {
             eprintln!("drenyra-gpui: --probe-rpc requires a <command> argument");
             ExitCode::FAILURE
@@ -190,10 +197,7 @@ pub fn run_cli(args: &[String]) -> ExitCode {
             }
         },
         _ => {
-            eprintln!(
-                "drenyra-gpui: unrecognized arguments: {} (try --help, --check-env, --demo-session, or --probe-rpc)",
-                args.join(" ")
-            );
+            eprintln!("{}", unrecognized_arguments_message(args));
             ExitCode::FAILURE
         }
     }
@@ -357,6 +361,33 @@ mod tests {
         assert_eq!(
             run_cli(&["--demo-session".into(), "--extra".into()]),
             ExitCode::FAILURE
+        );
+    }
+
+    #[cfg(not(feature = "gpui"))]
+    #[test]
+    fn window_flag_fails_with_rebuild_hint_without_gpui_feature() {
+        assert_eq!(run_cli(&["--window".into()]), ExitCode::FAILURE);
+        assert_eq!(
+            window_unavailable_message(),
+            "drenyra-gpui: --window requires a native build; rebuild with `cargo run -p drenyra-app --features gpui -- --window`"
+        );
+    }
+
+    #[test]
+    fn window_flag_rejects_extra_arguments() {
+        assert_eq!(
+            run_cli(&["--window".into(), "--extra".into()]),
+            ExitCode::FAILURE
+        );
+    }
+
+    #[test]
+    fn unrecognized_arguments_message_keeps_its_existing_text() {
+        assert_eq!(run_cli(&["--bogus".into()]), ExitCode::FAILURE);
+        assert_eq!(
+            unrecognized_arguments_message(&["--bogus".into(), "x".into()]),
+            "drenyra-gpui: unrecognized arguments: --bogus x (try --help, --check-env, --demo-session, or --probe-rpc)"
         );
     }
 }
