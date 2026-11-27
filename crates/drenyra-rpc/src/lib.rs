@@ -15,6 +15,9 @@ pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default maximum byte length of a single JSON-RPC response line (4 MiB).
 pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
+/// Default time a child gets to exit on its own after stdin EOF before `Drop` sends SIGKILL.
+pub const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
+
 /// Maximum bytes retained in the bounded background `stderr` diagnostic buffer (64 KiB).
 const STDERR_BUFFER_CAP: usize = 64 * 1024;
 
@@ -84,16 +87,20 @@ pub struct RpcTransportConfig {
     pub args: Vec<String>,
     pub request_timeout: Duration,
     pub max_response_bytes: usize,
+    /// Time the child gets to exit cleanly after stdin EOF before `Drop` kills it.
+    pub shutdown_grace: Duration,
 }
 
 impl RpcTransportConfig {
-    /// Builds a transport configuration with safe defaults (`30s` timeout, `4 MiB` response cap).
+    /// Builds a transport configuration with safe defaults (`30s` timeout, `4 MiB` response cap,
+    /// `250ms` shutdown grace).
     pub fn new(program: impl Into<String>, args: Vec<String>) -> Self {
         Self {
             program: program.into(),
             args,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+            shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
         }
     }
 }
@@ -104,6 +111,7 @@ pub struct RpcSession {
     stdin: Option<BufWriter<ChildStdin>>,
     stdout_rx: mpsc::Receiver<Result<Option<String>, RpcError>>,
     request_timeout: Duration,
+    shutdown_grace: Duration,
     poisoned: bool,
     stderr_buffer: Arc<Mutex<Vec<u8>>>,
     stderr_done: Arc<(Mutex<bool>, Condvar)>,
@@ -188,6 +196,7 @@ impl RpcSession {
             stdin: Some(BufWriter::new(stdin)),
             stdout_rx,
             request_timeout: config.request_timeout,
+            shutdown_grace: config.shutdown_grace,
             poisoned: false,
             stderr_buffer,
             stderr_done,
@@ -333,15 +342,18 @@ impl Drop for RpcSession {
         // Close stdin first so cooperative subprocesses can exit cleanly on EOF.
         drop(self.stdin.take());
 
+        let grace_deadline = Instant::now() + self.shutdown_grace;
         let mut exited = false;
-        for _ in 0..10 {
+        loop {
             match self.child.try_wait() {
                 Ok(Some(_)) => {
                     exited = true;
                     break;
                 }
-                Ok(None) => thread::sleep(Duration::from_millis(5)),
-                Err(_) => break,
+                Ok(None) if Instant::now() < grace_deadline => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Ok(None) | Err(_) => break,
             }
         }
         if !exited {
@@ -459,6 +471,7 @@ mod tests {
         assert_eq!(cfg.args, vec!["--mode", "rpc"]);
         assert_eq!(cfg.request_timeout, Duration::from_secs(30));
         assert_eq!(cfg.max_response_bytes, 4 * 1024 * 1024);
+        assert_eq!(cfg.shutdown_grace, Duration::from_millis(250));
     }
 
     #[cfg(unix)]
@@ -542,7 +555,9 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&marker);
 
-        let script = r#"cat >/dev/null; sleep 0.01; printf 'clean' > "$1""#;
+        // Handshake first so the child is already running and blocked on stdin when Drop
+        // closes it; this removes the race between `sh` startup and the Drop grace window.
+        let script = r#"IFS= read -r _; printf '{"jsonrpc":"2.0","id":1,"result":"ready"}\n'; cat >/dev/null; printf 'clean' > "$1""#;
         let cfg = RpcTransportConfig::new(
             "sh",
             vec![
@@ -552,7 +567,15 @@ mod tests {
                 marker.to_string_lossy().into_owned(),
             ],
         );
-        let session = RpcSession::spawn(&cfg).expect("spawn cooperative child");
+        let mut session = RpcSession::spawn(&cfg).expect("spawn cooperative child");
+        let ready = session
+            .request(&JsonRpcRequest {
+                id: 1,
+                method: "ping".into(),
+                params_json: "{}".into(),
+            })
+            .expect("cooperative child handshake");
+        assert!(ready.contains(r#""result":"ready""#));
         drop(session);
 
         let contents = std::fs::read_to_string(&marker).unwrap_or_default();
@@ -677,5 +700,60 @@ mod tests {
             elapsed < Duration::from_millis(500),
             "Drop took {elapsed:?}, expected < 500ms even with detached grandchild holding pipes"
         );
+    }
+
+    #[cfg(unix)]
+    fn marker_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "drenyra-rpc-{tag}-{}-{}.marker",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ))
+    }
+
+    #[cfg(unix)]
+    fn drop_slow_flushing_child(shutdown_grace: Duration) -> String {
+        let marker = marker_path("grace");
+        let _ = std::fs::remove_file(&marker);
+        // The child needs ~100ms after stdin EOF to flush, like a real server persisting state.
+        let script = r#"IFS= read -r _; printf '{"jsonrpc":"2.0","id":1,"result":"ready"}\n'; cat >/dev/null; sleep 0.1; printf 'clean' > "$1""#;
+        let mut cfg = RpcTransportConfig::new(
+            "sh",
+            vec![
+                "-c".into(),
+                script.into(),
+                "_".into(),
+                marker.to_string_lossy().into_owned(),
+            ],
+        );
+        cfg.shutdown_grace = shutdown_grace;
+        let mut session = RpcSession::spawn(&cfg).expect("spawn slow-flushing child");
+        session
+            .request(&JsonRpcRequest {
+                id: 1,
+                method: "ping".into(),
+                params_json: "{}".into(),
+            })
+            .expect("slow-flushing child handshake");
+        drop(session);
+        thread::sleep(Duration::from_millis(200));
+        let contents = std::fs::read_to_string(&marker).unwrap_or_default();
+        let _ = std::fs::remove_file(&marker);
+        contents
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drop_waits_up_to_shutdown_grace_for_slow_cooperative_child() {
+        assert_eq!(drop_slow_flushing_child(Duration::from_secs(2)), "clean");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drop_kills_child_that_outlives_zero_shutdown_grace() {
+        assert_eq!(drop_slow_flushing_child(Duration::ZERO), "");
     }
 }
