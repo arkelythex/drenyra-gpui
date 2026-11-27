@@ -24,9 +24,9 @@ use super::commands::{ShellCommand, ShellState, KEY_BINDINGS};
 use super::settings::save_if_changed;
 use super::theme::{ThemeId, ThemeTokens};
 use super::view_model::{
-    pane_area, AgentPaneView, GuardrailChips, PaneTile, ReviewPanel, RowDecision, SettingsPanel,
-    ShellViewModel, StatusTone, ThemeOption, WorkspaceChip, FOOTER_HEIGHT, REVIEW_PANEL_WIDTH,
-    TOP_BAR_HEIGHT,
+    pane_area, AgentPaneView, ApprovalDialogView, GuardrailChips, PaneTile, ReviewPanel,
+    RowDecision, SettingsPanel, ShellViewModel, StatusTone, ThemeOption, WorkspaceChip,
+    FOOTER_HEIGHT, REVIEW_PANEL_WIDTH, TOP_BAR_HEIGHT,
 };
 use crate::ui::DesktopShellConfig;
 use drenyra_workspace::{PaneKind, WorkspaceActivity};
@@ -48,6 +48,7 @@ actions!(
         Confirm,
         FocusComposer,
         StopAgent,
+        OpenApproval,
         Quit
     ]
 );
@@ -56,7 +57,7 @@ actions!(
 const MONO_FONT: &str = "JetBrainsMono Nerd Font";
 
 /// Keys shown in the footer, in display order.
-const FOOTER_HINT: &str = "I ask the agent · Ctrl+D split · Ctrl+W close · Ctrl+Shift+T undo · Ctrl+Tab next pane · Ctrl+K next workspace · J/K line · A accept · R reject · Ctrl+, settings · Ctrl+Q quit";
+const FOOTER_HINT: &str = "I ask the agent · Ctrl+P approve · Ctrl+D split · Ctrl+W close · Ctrl+Shift+T undo · Ctrl+Tab next pane · Ctrl+K next workspace · J/K line · A accept · R reject · Ctrl+, settings · Ctrl+Q quit";
 /// Footer keys while typing a prompt.
 const COMPOSER_HINT: &str =
     "Type your question · Enter send · Esc stop typing · Ctrl+C stop the agent";
@@ -65,6 +66,9 @@ const AGENT_POLL_INTERVAL: Duration = Duration::from_millis(40);
 /// Key context for single-key bindings; absent while typing so letters reach the composer.
 const SHELL_CONTEXT: &str = "DrenyraShell";
 const COMPOSER_CONTEXT: &str = "DrenyraComposer";
+
+/// Footer keys while the approval dialog is open.
+const APPROVAL_HINT: &str = "Type the approver's ID · Enter record approval · Esc cancel";
 
 /// Footer keys while the Settings overlay is open.
 const SETTINGS_HINT: &str =
@@ -166,6 +170,7 @@ fn key_bindings() -> Vec<KeyBinding> {
             ShellCommand::Confirm => KeyBinding::new(key, Confirm, context),
             ShellCommand::FocusComposer => KeyBinding::new(key, FocusComposer, context),
             ShellCommand::StopAgent => KeyBinding::new(key, StopAgent, context),
+            ShellCommand::OpenApproval => KeyBinding::new(key, OpenApproval, context),
         })
         .collect()
 }
@@ -230,15 +235,15 @@ impl ShellWindow {
         true
     }
 
-    /// Routes typing to the composer while it is active.
+    /// Routes typing to the active text field (composer or approval dialog).
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.state.composer_active() {
+        if !self.state.text_input_active() {
             return;
         }
         let keystroke = &event.keystroke;
         let mods = keystroke.modifiers;
         let changed = match keystroke.key.as_str() {
-            "enter" if mods.shift => self.state.composer_insert("\n"),
+            "enter" if mods.shift => self.state.type_text("\n"),
             "enter" => {
                 self.dispatch(ShellCommand::Confirm, window, cx);
                 false
@@ -247,10 +252,10 @@ impl ShellWindow {
                 self.dispatch(ShellCommand::CloseOverlay, window, cx);
                 false
             }
-            "backspace" => self.state.composer_backspace(),
+            "backspace" => self.state.backspace(),
             _ if mods.control || mods.alt || mods.platform || mods.function => return,
             _ => match keystroke.key_char.as_deref() {
-                Some(text) => self.state.composer_insert(text),
+                Some(text) => self.state.type_text(text),
                 None => return,
             },
         };
@@ -344,7 +349,7 @@ impl Render for ShellWindow {
             .collect();
 
         div()
-            .key_context(if vm.agent.as_ref().is_some_and(|a| a.composer_active) {
+            .key_context(if self.state.text_input_active() {
                 COMPOSER_CONTEXT
             } else {
                 SHELL_CONTEXT
@@ -356,6 +361,9 @@ impl Render for ShellWindow {
             }))
             .on_action(cx.listener(|this, _: &StopAgent, w, cx| {
                 this.dispatch(ShellCommand::StopAgent, w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &OpenApproval, w, cx| {
+                this.dispatch(ShellCommand::OpenApproval, w, cx)
             }))
             .on_action(cx.listener(|this, _: &SplitFocused, w, cx| {
                 this.dispatch(ShellCommand::SplitFocused, w, cx)
@@ -410,15 +418,30 @@ impl Render for ShellWindow {
                     .min_h_0()
                     .overflow_hidden()
                     .child(div().flex_1().relative().min_w_0().children(panes))
-                    .children(vm.review.as_ref().map(|panel| review_panel(panel, &t))),
+                    .children(vm.review.as_ref().map(|panel| {
+                        let approve = div()
+                            .id("open-approval")
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _: &ClickEvent, w, cx| {
+                                this.dispatch(ShellCommand::OpenApproval, w, cx)
+                            }))
+                            .child(chip("Approve…  Ctrl+P", t.accent, &t));
+                        review_panel(panel, approve, &t)
+                    })),
             )
             .child(footer(
                 vm.settings.is_some(),
+                vm.approval.is_some(),
                 vm.agent.as_ref().is_some_and(|a| a.composer_active),
                 self.save_error.as_deref(),
                 &t,
             ))
             .children(overlay)
+            .children(
+                vm.approval
+                    .as_ref()
+                    .map(|dialog| approval_dialog(dialog, &t)),
+            )
     }
 }
 
@@ -745,7 +768,11 @@ fn composer_box(agent: &AgentPaneView, pane_focused: bool, t: &ThemeTokens) -> i
         .child(text)
 }
 
-fn review_panel(panel: &ReviewPanel, t: &ThemeTokens) -> impl IntoElement {
+fn review_panel(
+    panel: &ReviewPanel,
+    approve: impl IntoElement,
+    t: &ThemeTokens,
+) -> impl IntoElement {
     let status = if panel.can_post {
         ("Ready to post", t.success)
     } else if !panel.balanced {
@@ -804,6 +831,7 @@ fn review_panel(panel: &ReviewPanel, t: &ThemeTokens) -> impl IntoElement {
                 .as_ref()
                 .map(|who| chip(format!("Approved by {who}"), t.success, t)),
         )
+        .children(panel.approved_by.is_none().then_some(approve))
 }
 
 fn review_header(t: &ThemeTokens) -> impl IntoElement {
@@ -869,6 +897,7 @@ fn review_row(row: &super::view_model::ReviewRow, t: &ThemeTokens) -> impl IntoE
 
 fn footer(
     settings_open: bool,
+    approving: bool,
     composing: bool,
     save_error: Option<&str>,
     t: &ThemeTokens,
@@ -876,6 +905,7 @@ fn footer(
     let (text, color) = match save_error {
         Some(err) => (err.to_owned(), t.error),
         None if settings_open => (SETTINGS_HINT.to_owned(), t.text_subtle),
+        None if approving => (APPROVAL_HINT.to_owned(), t.text_subtle),
         None if composing => (COMPOSER_HINT.to_owned(), t.text_subtle),
         None => (FOOTER_HINT.to_owned(), t.text_subtle),
     };
@@ -1057,5 +1087,115 @@ fn theme_card(option: &ThemeOption, t: &ThemeTokens) -> gpui::Stateful<gpui::Div
                 .bg(rgb(t.surface))
                 .child(div().text_color(rgb(t.text)).child(option.label))
                 .children(option.applied.then(|| chip("Active", t.success, t))),
+        )
+}
+
+/// Modal human-approval dialog: entry summary, approver field and the current blocker.
+fn approval_dialog(dialog: &ApprovalDialogView, t: &ThemeTokens) -> impl IntoElement {
+    let summary_row = |label: &'static str, value: String| {
+        div()
+            .flex()
+            .flex_row()
+            .justify_between()
+            .child(div().text_color(rgb(t.text_muted)).child(label))
+            .child(div().font_family(MONO_FONT).child(value))
+    };
+    let requirement = if dialog.required {
+        "This risk tier requires a recorded human approval before posting."
+    } else {
+        "This risk tier does not require approval; recording one is optional."
+    };
+    let message = dialog.error.or(dialog.blocker);
+    div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(gpui::rgba(t.scrim))
+        .child(
+            div()
+                .w(px(460.0))
+                .max_w_full()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .p_4()
+                .rounded_lg()
+                .bg(rgb(t.surface_raised))
+                .border_1()
+                .border_color(rgb(t.border_ui))
+                .shadow_lg()
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .justify_between()
+                        .items_center()
+                        .child(
+                            div()
+                                .text_lg()
+                                .text_color(rgb(t.text_heading))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .child("Record human approval"),
+                        )
+                        .child(chip(dialog.risk_tier_label, t.warning, t)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .p_3()
+                        .rounded_md()
+                        .bg(rgb(t.surface))
+                        .child(summary_row("Entry", dialog.proposal_id.clone()))
+                        .child(summary_row("Debit", dialog.total_debit.clone()))
+                        .child(summary_row("Credit", dialog.total_credit.clone())),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(t.text_muted))
+                        .child(requirement),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(t.text_subtle))
+                                .child("Approver ID"),
+                        )
+                        .child(
+                            div()
+                                .px_3()
+                                .py_2()
+                                .rounded_md()
+                                .bg(rgb(t.surface))
+                                .border_1()
+                                .border_color(rgb(t.focus))
+                                .font_family(MONO_FONT)
+                                .child(format!("{}▏", dialog.approver)),
+                        ),
+                )
+                .children(message.map(|text| {
+                    div()
+                        .text_xs()
+                        .text_color(rgb(if dialog.ready && dialog.error.is_none() {
+                            t.text_subtle
+                        } else {
+                            t.warning
+                        }))
+                        .child(text)
+                }))
+                .child(div().text_xs().text_color(rgb(t.text_subtle)).child(
+                    "The ID is recorded as typed. Editing any line afterwards clears the approval.",
+                )),
         )
 }

@@ -20,7 +20,7 @@ Assumptions (marked): keys keep Ctrl on Linux; the selected theme persists acros
 | T1 | Theme tokens (light/dark) + window uses tokens only | S2, S3 | inline | done | see L4 |
 | T2 | Settings section with Themes selector | S2 | inline | done | see L4 |
 | T3 | Live agent session protocol + pane (prompt input, streamed output, failure states) | S1 | inline | done (a: `4150a5b8`; b: see L6) | — |
-| T4 | Approval command/dialog | S4 | inline | pending | — |
+| T4 | Approval command/dialog | S4 | inline | done (see L7) | — |
 | T5 | Command palette | S4 | inline | pending | — |
 | T6 | Sidebar | S4 | inline | pending | — |
 | T7 | Checks, visual check both themes, verifier, RDD, PRs | S5 | verify | pending | — |
@@ -56,3 +56,10 @@ Assumptions (marked): keys keep Ctrl on Linux; the selected theme persists acros
   - Live (pi 1.6.0, real extensions): pane showed `openai/gpt-6.1-sol` + Ready and the extensions' notify messages; typing "saldo de caja jk ar" went to the composer without moving the review cursor or accepting lines; Ctrl+Q exited 0 and both child processes were gone (no orphans). No prompt was sent (it would call a paid model): sending, streaming and stop are covered by fake-agent and pane tests only.
   - Checks: 131 tests headless / 130 with features; clippy `-D warnings` both ways; fmt.
   - Risk: item 4 (window polls sessions owned by the UI thread; per-unit verifier already running on T3a covers the shared-stdin client). This unit touches no shared contract.
+- **L7 — 2026-11-27 T3a verifier + T4 approval dialog.**
+  - T3a verifier: PASS (protocol conformance against pi docs, no regressions, serde_json adds only already-locked crates). Advisories fixed in `c171fba4`: Drop could hang while a dialog answer write was blocked (RED observed: "Drop hung", 5.8 s → GREEN), id-less dialogs are no longer answered, module doc no longer promises what extensions do after a cancel. 8 verifier probes adopted. No blockers → no recheck needed.
+  - T4 RED → GREEN: 24 compile errors → 2 tests; text input generalized (`type_text`/`backspace` route to the approval field or the composer).
+  - Live: keys did not reach the app for ~3 s after launch; `Ctrl+Enter` never opened the dialog even with focus (other Ctrl+letter keys work; GPUI 0.2.2 keystroke matching and Hyprland binds checked, cause not found). Rebound to `Ctrl+P`. The headless GPUI harness (`gpui/test-support`) was rejected: it pulls `git2`, not in the lock.
+  - Incident: an absolute `ydotool mousemove` landed outside the app (scaling mismatch) and one left click hit the operator's Herdr window. Desktop automation stopped for the rest of this phase; remaining live checks are left to the operator.
+  - Not verified live: the approval dialog (open, blocked state, typing, Enter), `Ctrl+P`, the Approve… click.
+  - Risk: item 2 (human-approval guard UI) → independent verifier.

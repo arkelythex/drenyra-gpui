@@ -103,6 +103,25 @@ pub struct ReviewPanel {
     pub approved_by: Option<String>,
 }
 
+/// The human-approval dialog for the active workspace's staged entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalDialogView {
+    pub proposal_id: String,
+    pub risk_tier_label: &'static str,
+    pub total_debit: String,
+    pub total_credit: String,
+    /// Whether this risk tier requires a recorded approval before posting.
+    pub required: bool,
+    /// Approver ID typed so far.
+    pub approver: String,
+    /// True when the entry can be approved now.
+    pub ready: bool,
+    /// Why the entry cannot be approved yet.
+    pub blocker: Option<&'static str>,
+    /// Feedback from the last Enter.
+    pub error: Option<&'static str>,
+}
+
 /// Transcript entries rendered per frame (the pane keeps more; the oldest scroll out first).
 pub const VISIBLE_TRANSCRIPT: usize = 200;
 
@@ -190,6 +209,8 @@ pub struct ShellViewModel {
     pub settings: Option<SettingsPanel>,
     /// The active workspace's Fiscal Agent pane.
     pub agent: Option<AgentPaneView>,
+    /// The approval dialog, when open.
+    pub approval: Option<ApprovalDialogView>,
 }
 
 impl ShellViewModel {
@@ -246,6 +267,7 @@ impl ShellViewModel {
             theme: ThemeId::default(),
             settings: None,
             agent: None,
+            approval: None,
         }
     }
 
