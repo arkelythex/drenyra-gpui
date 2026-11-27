@@ -55,14 +55,23 @@ pub struct EvidenceEvent {
     pub kind: EvidenceKind,
 }
 
-/// A journal entry whose `ledger_post` the transport confirmed in this session, captured just
-/// before its review is removed.
+/// A journal entry whose `ledger_post` the transport confirmed in this session, exactly as the
+/// confirmed frame carried it (proposal and approver captured when the frame was built).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PostedEntry {
     pub proposal: JournalEntryProposal,
     /// `None` for tiers that need no human approval.
     pub approved_by: Option<String>,
     pub request_id: u64,
+}
+
+/// An in-flight `ledger_post`: its request id and exactly what the frame carried, so the posted
+/// record matches what was sent even if the review changes before the transport confirms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingPost {
+    request_id: u64,
+    proposal: JournalEntryProposal,
+    approved_by: Option<String>,
 }
 
 /// Errors produced by [`DrenyraHostController`] when gating or framing host operations.
@@ -134,8 +143,9 @@ impl From<ProtocolError> for ControllerError {
 pub struct DrenyraHostController {
     workspaces: WorkspaceManager,
     reviews: BTreeMap<usize, EntryDiffReview>,
-    /// In-flight `ledger_post` request id per workspace index, awaiting transport confirmation.
-    pending_posts: BTreeMap<usize, u64>,
+    /// In-flight `ledger_post` per workspace index (request id plus what its frame carried),
+    /// awaiting transport confirmation.
+    pending_posts: BTreeMap<usize, PendingPost>,
     reconciliation: ReconciliationTable,
     next_request_id: u64,
     /// Session evidence log per workspace identity (append-only, unsigned, not persisted).
@@ -386,9 +396,14 @@ impl DrenyraHostController {
             proposal_id: proposal.id.clone(),
             request_id: request.id,
         };
+        let pending = PendingPost {
+            request_id: request.id,
+            proposal: proposal.clone(),
+            approved_by: review.approved_by().map(str::to_owned),
+        };
 
         self.pending_posts
-            .insert(self.workspaces.active_index(), request.id);
+            .insert(self.workspaces.active_index(), pending);
         self.next_request_id = self.next_request_id.saturating_add(1);
         self.log(owner, requested);
         Ok(frame)
@@ -399,11 +414,16 @@ impl DrenyraHostController {
     pub fn pending_post_request(&self) -> Option<u64> {
         self.pending_posts
             .get(&self.workspaces.active_index())
-            .copied()
+            .map(|pending| pending.request_id)
     }
 
     /// Records that the transport confirmed the `ledger_post` request `request_id`, clearing the
     /// review and guardrails of the workspace that built it, even if another workspace is active.
+    ///
+    /// The posted record ([`PostedEntry`] and the [`EvidenceKind::Posted`] event) is what the
+    /// confirmed frame sent: the proposal and approver captured by [`Self::build_post_request`]
+    /// for `request_id`, even if the approval was replaced, or cleared by a line change, after
+    /// the frame was built.
     ///
     /// Fails with [`ControllerError::UnknownPostRequest`] for ids that are not in flight, such as
     /// one superseded by a retry or already confirmed.
@@ -411,20 +431,20 @@ impl DrenyraHostController {
         let index = self
             .pending_posts
             .iter()
-            .find_map(|(&index, &pending)| (pending == request_id).then_some(index))
+            .find_map(|(&index, pending)| (pending.request_id == request_id).then_some(index))
             .ok_or(ControllerError::UnknownPostRequest)?;
 
-        self.pending_posts.remove(&index);
-        if let Some(review) = self.reviews.remove(&index) {
-            let owner = Self::owner_key(review.proposal());
+        if let Some(sent) = self.pending_posts.remove(&index) {
+            self.reviews.remove(&index);
+            let owner = Self::owner_key(&sent.proposal);
             let posted = EvidenceKind::Posted {
-                proposal_id: review.proposal().id.clone(),
+                proposal_id: sent.proposal.id.clone(),
                 request_id,
             };
             self.log(owner.clone(), posted);
             self.posted.entry(owner).or_default().push(PostedEntry {
-                approved_by: review.approved_by().map(str::to_owned),
-                proposal: review.proposal().clone(),
+                proposal: sent.proposal,
+                approved_by: sent.approved_by,
                 request_id,
             });
         }

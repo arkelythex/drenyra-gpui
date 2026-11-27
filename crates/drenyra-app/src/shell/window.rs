@@ -20,11 +20,12 @@ use drenyra_rpc::agent::{AgentSession, AgentUpdate};
 
 use super::agent_pane::{agent_launch, AgentStatus, EntryRole};
 
-use super::commands::{typed_text, ShellCommand, ShellState, KEY_BINDINGS};
+use super::commands::{typed_text, ShellCommand, ShellState, ENTRY_READY_TO_POST, KEY_BINDINGS};
 use super::settings::save_if_changed;
 use super::theme::{ThemeId, ThemeTokens};
 use super::view_model::{
-    pane_area_with, AgentPaneView, ApprovalDialogView, GuardrailChips, PaletteView, PaneTile,
+    pane_area_with, AgentPaneView, ApprovalDialogView, CliPaneView, EvidencePaneView,
+    GuardrailChips, LedgerPaneView, LedgerPostedEntry, LedgerStagedEntry, PaletteView, PaneTile,
     ReviewPanel, RowDecision, SettingsPanel, ShellViewModel, SidebarView, StatusTone, ThemeOption,
     WorkspaceChip, FOOTER_HEIGHT, REVIEW_PANEL_WIDTH, SIDEBAR_WIDTH, TOP_BAR_HEIGHT,
 };
@@ -72,9 +73,6 @@ const COMPOSER_CONTEXT: &str = "DrenyraComposer";
 
 /// Footer keys while the command palette is open.
 const PALETTE_HINT: &str = "Type to filter · Up/Down choose · Enter run · Esc close";
-
-/// Footer keys while the approval dialog is open.
-const APPROVAL_HINT: &str = "Type the approver's ID · Enter record approval · Esc cancel";
 
 /// Footer keys while the Settings overlay is open.
 const SETTINGS_HINT: &str =
@@ -377,8 +375,8 @@ impl Render for ShellWindow {
             .panes
             .iter()
             .map(|tile| {
-                let body = match (tile.kind, vm.agent.as_ref()) {
-                    (PaneKind::FiscalAgent, Some(agent)) => {
+                let body = match tile.kind {
+                    PaneKind::FiscalAgent => vm.agent.as_ref().map(|agent| {
                         let composer = div()
                             .id(("composer", tile.id))
                             .cursor_text()
@@ -387,9 +385,21 @@ impl Render for ShellWindow {
                             }))
                             .child(composer_box(agent, tile.focused, &t));
                         agent_body(agent, composer, &t).into_any_element()
-                    }
-                    _ => placeholder_body(&t).into_any_element(),
-                };
+                    }),
+                    PaneKind::LedgerViewer => vm
+                        .ledger
+                        .as_ref()
+                        .map(|ledger| ledger_body(ledger, &t).into_any_element()),
+                    PaneKind::EvidenceVault => vm
+                        .evidence
+                        .as_ref()
+                        .map(|evidence| evidence_body(evidence, &t).into_any_element()),
+                    PaneKind::FiscalCli => vm
+                        .cli
+                        .as_ref()
+                        .map(|cli| cli_body(cli, &t).into_any_element()),
+                }
+                .unwrap_or_else(|| placeholder_body(&t).into_any_element());
                 pane_tile(
                     tile,
                     agent_header(tile.kind, vm.agent.as_ref(), &t),
@@ -494,7 +504,7 @@ impl Render for ShellWindow {
             .child(footer(
                 vm.settings.is_some(),
                 vm.palette.is_some(),
-                vm.approval.is_some(),
+                vm.approval.as_ref(),
                 vm.agent.as_ref().is_some_and(|a| a.composer_active),
                 self.save_error.as_deref(),
                 &t,
@@ -635,9 +645,9 @@ fn guardrail_chips(g: &GuardrailChips, demo: bool, t: &ThemeTokens) -> impl Into
 fn pane_caption(kind: PaneKind) -> &'static str {
     match kind {
         PaneKind::FiscalAgent => "Drenyra Shell agent session",
-        PaneKind::LedgerViewer => "Ledger and trial balance",
-        PaneKind::EvidenceVault => "Source vouchers: XML, PDF, CDR, bank statements",
-        PaneKind::FiscalCli => "Fiscal command line",
+        PaneKind::LedgerViewer => "Entries staged or posted in this session",
+        PaneKind::EvidenceVault => "Session evidence log (unsigned)",
+        PaneKind::FiscalCli => "Environment check and command reference",
     }
 }
 
@@ -743,13 +753,289 @@ fn pane_tile(
         )
 }
 
+/// Body used only when the view model carries no data for a pane (never from `ShellState`).
 fn placeholder_body(t: &ThemeTokens) -> impl IntoElement {
     div()
         .flex_1()
         .p_3()
         .text_xs()
         .text_color(rgb(t.text_muted))
-        .child("Not connected yet: this pane kind arrives in a later phase.")
+        .child("Nothing to show in this pane.")
+}
+
+/// Scrollless column shared by the Ledger, Evidence and CLI bodies: content clipped at the
+/// bottom, the pane's limits pinned as a footnote.
+fn pane_column(limits: &'static str, t: &ThemeTokens) -> (gpui::Div, gpui::Div) {
+    let content = div()
+        .flex_1()
+        .min_h_0()
+        .overflow_hidden()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .p_3();
+    let footnote = div()
+        .flex_none()
+        .px_3()
+        .py_2()
+        .border_t_1()
+        .border_color(rgb(t.divider))
+        .text_xs()
+        .text_color(rgb(t.text_subtle))
+        .child(limits);
+    (content, footnote)
+}
+
+fn pane_section_heading(text: impl Into<SharedString>, t: &ThemeTokens) -> impl IntoElement {
+    div()
+        .text_xs()
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(rgb(t.text_subtle))
+        .child(text.into())
+}
+
+fn wrap_column(content: gpui::Div, footnote: gpui::Div) -> impl IntoElement {
+    div()
+        .flex_1()
+        .min_h_0()
+        .flex()
+        .flex_col()
+        .child(content)
+        .child(footnote)
+}
+
+/// Ledger pane: the active workspace's staged entry and the entries posted in this session.
+fn ledger_body(ledger: &LedgerPaneView, t: &ThemeTokens) -> impl IntoElement {
+    let (content, footnote) = pane_column(ledger.limits, t);
+    let content = content
+        .child(
+            div()
+                .text_xs()
+                .font_family(MONO_FONT)
+                .text_color(rgb(t.text_muted))
+                .child(format!(
+                    "RUC {} · {}",
+                    ledger.entity_ruc, ledger.fiscal_period
+                )),
+        )
+        .children(
+            ledger
+                .empty_message
+                .as_ref()
+                .map(|message| div().text_color(rgb(t.text_subtle)).child(message.clone())),
+        )
+        .children(
+            ledger
+                .staged
+                .as_ref()
+                .map(|staged| ledger_staged(staged, t)),
+        )
+        .children(
+            (!ledger.posted.is_empty()).then(|| pane_section_heading("POSTED IN THIS SESSION", t)),
+        )
+        .children(ledger.posted.iter().map(|entry| ledger_posted(entry, t)));
+    wrap_column(content, footnote)
+}
+
+fn ledger_staged(staged: &LedgerStagedEntry, t: &ThemeTokens) -> impl IntoElement {
+    let status_color = if !staged.balanced {
+        t.error
+    } else if staged.status == ENTRY_READY_TO_POST {
+        t.success
+    } else {
+        t.warning
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .justify_between()
+                .items_center()
+                .gap_2()
+                .child(pane_section_heading("STAGED, NOT POSTED", t))
+                .child(chip(staged.status, status_color, t)),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .text_xs()
+                .child(
+                    div()
+                        .font_family(MONO_FONT)
+                        .text_color(rgb(t.text))
+                        .child(staged.proposal_id.clone()),
+                )
+                .child(
+                    div()
+                        .text_color(rgb(t.text_subtle))
+                        .child(staged.risk_tier_label),
+                ),
+        )
+        .child(review_header(t))
+        .children(staged.lines.iter().map(|line| {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .px_1()
+                .child(div().w(px(20.0)))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .font_family(MONO_FONT)
+                                .child(line.account_code.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(t.text_subtle))
+                                .truncate()
+                                .child(line.description.clone()),
+                        ),
+                )
+                .child(money_cell(line.debit.clone()))
+                .child(money_cell(line.credit.clone()))
+        }))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .px_1()
+                .border_t_1()
+                .border_color(rgb(t.divider))
+                .pt_1()
+                .child(div().flex_1().text_color(rgb(t.text_muted)).child("Totals"))
+                .child(money_cell(staged.total_debit.clone()))
+                .child(money_cell(staged.total_credit.clone())),
+        )
+}
+
+fn ledger_posted(entry: &LedgerPostedEntry, t: &ThemeTokens) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap_0p5()
+        .p_2()
+        .rounded_md()
+        .bg(rgb(t.surface_raised))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .justify_between()
+                .gap_2()
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .font_family(MONO_FONT)
+                        .text_color(rgb(t.text))
+                        .child(entry.proposal_id.clone()),
+                )
+                .child(chip("Posted", t.success, t)),
+        )
+        .child(div().text_xs().text_color(rgb(t.text_muted)).child(format!(
+            "{} · approved by {} · request {}",
+            entry.risk_tier_label, entry.approved_by, entry.request_id
+        )))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .child(
+                    div()
+                        .flex_1()
+                        .text_xs()
+                        .text_color(rgb(t.text_subtle))
+                        .child("Totals"),
+                )
+                .child(money_cell(entry.total_debit.clone()))
+                .child(money_cell(entry.total_credit.clone())),
+        )
+}
+
+/// Evidence pane: the active workspace's session log, newest first.
+fn evidence_body(evidence: &EvidencePaneView, t: &ThemeTokens) -> impl IntoElement {
+    let (content, footnote) = pane_column(evidence.limits, t);
+    let content = content
+        .child(
+            div()
+                .text_xs()
+                .font_family(MONO_FONT)
+                .text_color(rgb(t.text_muted))
+                .child(format!(
+                    "RUC {} · {}",
+                    evidence.entity_ruc, evidence.fiscal_period
+                )),
+        )
+        .children(
+            evidence
+                .empty_message
+                .as_ref()
+                .map(|message| div().text_color(rgb(t.text_subtle)).child(message.clone())),
+        )
+        .children(evidence.entries.iter().map(|entry| {
+            div()
+                .font_family(MONO_FONT)
+                .text_xs()
+                .text_color(rgb(t.text))
+                .child(entry.clone())
+        }));
+    wrap_column(content, footnote)
+}
+
+/// Fiscal CLI pane: the captured environment check and the flag reference; runs nothing.
+fn cli_body(cli: &CliPaneView, t: &ThemeTokens) -> impl IntoElement {
+    let (content, footnote) = pane_column(cli.limits, t);
+    let content = content
+        .child(pane_section_heading("drenyra-gpui --check-env", t))
+        .children(cli.environment.is_empty().then(|| {
+            div()
+                .text_color(rgb(t.text_subtle))
+                .child("No environment check was captured for this window.")
+        }))
+        .children(cli.environment.iter().map(|field| {
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .text_xs()
+                .font_family(MONO_FONT)
+                .child(
+                    div()
+                        .w(px(150.0))
+                        .flex_none()
+                        .text_color(rgb(t.text_muted))
+                        .child(field.name),
+                )
+                .child(div().text_color(rgb(t.text)).child(field.value.clone()))
+        }))
+        .child(pane_section_heading("FLAGS", t))
+        .children(cli.flags.iter().map(|flag| {
+            div()
+                .flex()
+                .flex_col()
+                .text_xs()
+                .child(
+                    div()
+                        .font_family(MONO_FONT)
+                        .text_color(rgb(t.accent))
+                        .child(format!("drenyra-gpui {}", flag.usage)),
+                )
+                .child(div().text_color(rgb(t.text_muted)).child(flag.description))
+        }));
+    wrap_column(content, footnote)
 }
 
 /// Transcript (newest at the bottom; older entries are clipped at the top) and the composer.
@@ -975,18 +1261,25 @@ fn review_row(row: &super::view_model::ReviewRow, t: &ThemeTokens) -> impl IntoE
 fn footer(
     settings_open: bool,
     palette_open: bool,
-    approving: bool,
+    approval: Option<&ApprovalDialogView>,
     composing: bool,
     save_error: Option<&str>,
     t: &ThemeTokens,
 ) -> impl IntoElement {
+    let hint = if settings_open {
+        SETTINGS_HINT
+    } else if palette_open {
+        PALETTE_HINT
+    } else if let Some(dialog) = approval {
+        dialog.footer_hint()
+    } else if composing {
+        COMPOSER_HINT
+    } else {
+        FOOTER_HINT
+    };
     let (text, color) = match save_error {
         Some(err) => (err.to_owned(), t.error),
-        None if settings_open => (SETTINGS_HINT.to_owned(), t.text_subtle),
-        None if palette_open => (PALETTE_HINT.to_owned(), t.text_subtle),
-        None if approving => (APPROVAL_HINT.to_owned(), t.text_subtle),
-        None if composing => (COMPOSER_HINT.to_owned(), t.text_subtle),
-        None => (FOOTER_HINT.to_owned(), t.text_subtle),
+        None => (hint.to_owned(), t.text_subtle),
     };
     div()
         .h(px(FOOTER_HEIGHT as f32))
@@ -1193,7 +1486,7 @@ fn approval_dialog(dialog: &ApprovalDialogView, t: &ThemeTokens) -> impl IntoEle
             .text_xs()
             .text_color(rgb(t.warning))
             .child(format!(
-                "Approved by {current}. Confirming replaces that approval; both stay in the evidence log."
+                "Approved by {current}. Confirming replaces that approval; both are recorded in this session's evidence log (in memory, unsigned)."
             ))
     });
     div()
@@ -1229,7 +1522,7 @@ fn approval_dialog(dialog: &ApprovalDialogView, t: &ThemeTokens) -> impl IntoEle
                                 .text_lg()
                                 .text_color(rgb(t.text_heading))
                                 .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .child("Record human approval"),
+                                .child(dialog.title()),
                         )
                         .child(chip(dialog.risk_tier_label, t.warning, t)),
                 )

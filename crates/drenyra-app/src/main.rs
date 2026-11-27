@@ -8,6 +8,7 @@ mod shell;
 mod ui;
 
 use std::env;
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -22,17 +23,107 @@ fn main() -> ExitCode {
     run_cli(&args)
 }
 
+/// Flags other than `--help`, with the one-line description `--help` prints for each. The
+/// window's Fiscal CLI pane lists the same table, so the two never drift apart.
+pub const CLI_FLAGS: &[(&str, &str)] = &[
+    (
+        "--check-env",
+        "Print headless RPC host environment diagnostics (JSON)",
+    ),
+    (
+        "--demo-session",
+        "Run deterministic end-to-end controller & approval gate demo (JSON)",
+    ),
+    (
+        "--probe-rpc <cmd> [args...]",
+        "Probe an NDJSON stdio JSON-RPC 2.0 server",
+    ),
+    (
+        "--window",
+        "Open the native GPUI window on demo data (requires --features gpui)",
+    ),
+];
+
+/// A value of the environment check: JSON text or a JSON boolean.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckValue {
+    Text(String),
+    Flag(bool),
+}
+
+impl fmt::Display for CheckValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Text(text) => f.write_str(text),
+            Self::Flag(flag) => write!(f, "{flag}"),
+        }
+    }
+}
+
+/// What `--check-env` reports. The window captures it once at start-up for its Fiscal CLI pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvironmentCheck {
+    pub version: String,
+    pub rda_default: bool,
+    pub shell_bin_found: bool,
+    pub kernel_bin_found: bool,
+}
+
+impl EnvironmentCheck {
+    /// Looks up the agent shell (`drenyra-shell`, else `pi`) and kernel binaries on `PATH`.
+    pub fn detect() -> Self {
+        Self {
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            rda_default: SessionGuardrails::default().rda_enabled,
+            shell_bin_found: find_in_path("drenyra-shell")
+                .or_else(|| find_in_path("pi"))
+                .is_some(),
+            kernel_bin_found: find_in_path("drenyra-ai").is_some(),
+        }
+    }
+
+    /// Every field in the order `--check-env` prints it: the single source of the field list.
+    pub fn fields(&self) -> [(&'static str, CheckValue); 6] {
+        [
+            ("app", CheckValue::Text("drenyra-gpui".to_owned())),
+            ("version", CheckValue::Text(self.version.clone())),
+            (
+                "zero_float_money",
+                CheckValue::Text(MoneyCents::ZERO.to_string()),
+            ),
+            ("rda_default", CheckValue::Flag(self.rda_default)),
+            ("shell_bin_found", CheckValue::Flag(self.shell_bin_found)),
+            ("kernel_bin_found", CheckValue::Flag(self.kernel_bin_found)),
+        ]
+    }
+
+    /// The one-line JSON object `--check-env` prints.
+    pub fn to_json(&self) -> String {
+        let body: Vec<String> = self
+            .fields()
+            .iter()
+            .map(|(name, value)| match value {
+                CheckValue::Text(text) => format!(r#""{name}":"{}""#, escape_json_str(text)),
+                CheckValue::Flag(flag) => format!(r#""{name}":{flag}"#),
+            })
+            .collect();
+        format!("{{{}}}", body.join(","))
+    }
+}
+
 pub fn format_check_env_json(
     version: &str,
     rda_default: bool,
     shell_found: bool,
     kernel_found: bool,
 ) -> String {
-    format!(
-        r#"{{"app":"drenyra-gpui","version":"{}","zero_float_money":"{}","rda_default":{rda_default},"shell_bin_found":{shell_found},"kernel_bin_found":{kernel_found}}}"#,
-        escape_json_str(version),
-        MoneyCents::ZERO,
-    )
+    EnvironmentCheck {
+        version: version.to_owned(),
+        rda_default,
+        shell_bin_found: shell_found,
+        kernel_bin_found: kernel_found,
+    }
+    .to_json()
 }
 
 pub fn probe_rpc(command: &str, args: &[String]) -> Result<String, String> {
@@ -77,7 +168,9 @@ pub fn run_demo_session_json() -> Result<String, ControllerError> {
         .len();
     // Line decisions and the approval go through the controller so they reach its evidence log.
     for line in 0..line_count {
-        controller.accept_active_line(line);
+        if !controller.accept_active_line(line) {
+            return Err(ControllerError::ReviewNotReadyToPost);
+        }
     }
     if !controller.approve_active("CPA-PERU-001") {
         return Err(ControllerError::ReviewNotReadyToPost);
@@ -132,7 +225,9 @@ fn run_window() -> ExitCode {
         .unwrap_or_default();
     match ui::mount_native_window(
         ui::DesktopShellConfig::default(),
-        shell::commands::ShellState::demo().with_settings(settings),
+        shell::commands::ShellState::demo()
+            .with_settings(settings)
+            .with_environment(EnvironmentCheck::detect()),
         settings_path,
     ) {
         Ok(()) => ExitCode::SUCCESS,
@@ -161,26 +256,14 @@ pub fn run_cli(args: &[String]) -> ExitCode {
             println!("Native Rust + GPUI accounting desktop host for Drenyra Shell & Drenyra AI.");
             println!();
             println!("Usage:");
-            println!("  drenyra-gpui --help                       Show this help message");
-            println!("  drenyra-gpui --check-env                  Print headless RPC host environment diagnostics (JSON)");
-            println!("  drenyra-gpui --demo-session               Run deterministic end-to-end controller & approval gate demo (JSON)");
-            println!("  drenyra-gpui --probe-rpc <cmd> [args...]  Probe an NDJSON stdio JSON-RPC 2.0 server");
-            println!("  drenyra-gpui --window                     Open the native GPUI window on demo data (requires --features gpui)");
+            println!("  drenyra-gpui {:<29}Show this help message", "--help");
+            for (usage, description) in CLI_FLAGS {
+                println!("  drenyra-gpui {usage:<29}{description}");
+            }
             ExitCode::SUCCESS
         }
         [flag] if flag == "--check-env" => {
-            let shell_found = find_in_path("drenyra-shell").or_else(|| find_in_path("pi"));
-            let kernel_found = find_in_path("drenyra-ai");
-            let rda_default = SessionGuardrails::default().rda_enabled;
-            println!(
-                "{}",
-                format_check_env_json(
-                    env!("CARGO_PKG_VERSION"),
-                    rda_default,
-                    shell_found.is_some(),
-                    kernel_found.is_some(),
-                )
-            );
+            println!("{}", EnvironmentCheck::detect().to_json());
             ExitCode::SUCCESS
         }
         [flag] if flag == "--demo-session" => match run_demo_session_json() {

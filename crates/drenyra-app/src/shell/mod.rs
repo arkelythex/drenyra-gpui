@@ -12,5 +12,7 @@ pub mod view_model;
 
 #[cfg(test)]
 mod regression_tests;
+#[cfg(test)]
+mod t10_probes;
 #[cfg(feature = "gpui")]
 pub mod window;

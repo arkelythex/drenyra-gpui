@@ -2,11 +2,12 @@
 
 use drenyra_protocol::{MoneyCents, RiskTier};
 use drenyra_ui::{EntryDiffReview, LineDecision};
-use drenyra_workspace::{PaneKind, PaneNode, SplitAxis, WorkspaceActivity};
+use drenyra_workspace::{PaneKind, PaneNode, SplitAxis, WorkspaceActivity, WorkspaceKey};
 
 use super::agent_pane::{AgentPane, AgentStatus, TranscriptEntry};
 use super::theme::ThemeId;
-use crate::controller::DrenyraHostController;
+use crate::controller::{DrenyraHostController, EvidenceKind};
+use crate::{EnvironmentCheck, CLI_FLAGS};
 
 /// Height of the workspace and guardrail chip bar, in pixels.
 pub const TOP_BAR_HEIGHT: u32 = 44;
@@ -133,6 +134,43 @@ pub struct ApprovalDialogView {
     pub error: Option<String>,
 }
 
+/// Dialog title when no approval was recorded when the dialog opened.
+pub const APPROVAL_TITLE_RECORD: &str = "Record human approval";
+/// Dialog title when the dialog replaces the approval it shows.
+pub const APPROVAL_TITLE_REPLACE: &str = "Replace approval";
+/// Footer keys while the dialog records a first approval.
+pub const APPROVAL_HINT_RECORD: &str =
+    "Type the approver's ID · Enter record approval · Esc cancel";
+/// Footer keys while the dialog replaces the approval it shows.
+pub const APPROVAL_HINT_REPLACE: &str =
+    "Type the new approver's ID · Enter replace approval · Esc cancel";
+
+impl ApprovalDialogView {
+    /// True when Enter replaces the approval the dialog shows instead of recording a first one.
+    pub fn replaces(&self) -> bool {
+        self.current_approver.is_some()
+    }
+
+    /// Dialog title: "Replace approval" when an approval is shown, otherwise "Record human
+    /// approval".
+    pub fn title(&self) -> &'static str {
+        if self.replaces() {
+            APPROVAL_TITLE_REPLACE
+        } else {
+            APPROVAL_TITLE_RECORD
+        }
+    }
+
+    /// Footer keys matching [`Self::title`].
+    pub fn footer_hint(&self) -> &'static str {
+        if self.replaces() {
+            APPROVAL_HINT_REPLACE
+        } else {
+            APPROVAL_HINT_RECORD
+        }
+    }
+}
+
 /// A staged journal entry listed in the sidebar.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidebarEntry {
@@ -174,6 +212,252 @@ pub struct PaletteEntry {
 pub struct PaletteView {
     pub query: String,
     pub entries: Vec<PaletteEntry>,
+}
+
+/// What the Ledger pane covers and what it cannot show yet.
+pub const LEDGER_LIMITS: &str =
+    "Entries staged or posted in this session. Posted ledger history arrives when Drenyra Shell serves it.";
+/// What the Evidence pane's log is (and is not).
+pub const EVIDENCE_LIMITS: &str =
+    "Session evidence: in memory, unsigned, cleared when the window closes.";
+/// What the Fiscal CLI pane shows and why it runs nothing.
+pub const CLI_LIMITS: &str =
+    "Captured once when the window started. The window runs no commands: run these flags from a terminal.";
+/// Approver shown for a posted entry whose risk tier needs no human approval.
+pub const NO_APPROVAL_REQUIRED: &str = "no approval required";
+
+/// One journal line in the Ledger pane; amounts are exact `MoneyCents` text, empty when zero.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LedgerLine {
+    pub account_code: String,
+    pub description: String,
+    pub debit: String,
+    pub credit: String,
+}
+
+/// The active workspace's staged (unposted) entry in the Ledger pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LedgerStagedEntry {
+    pub proposal_id: String,
+    pub risk_tier_label: &'static str,
+    /// Same status the sidebar shows (In review, Ready to post, ...).
+    pub status: &'static str,
+    pub lines: Vec<LedgerLine>,
+    /// `"overflow"` when the sum does not fit in `MoneyCents`.
+    pub total_debit: String,
+    pub total_credit: String,
+    pub balanced: bool,
+}
+
+/// An entry whose post the transport confirmed in this session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LedgerPostedEntry {
+    pub proposal_id: String,
+    pub risk_tier_label: &'static str,
+    /// The recorded approver, or [`NO_APPROVAL_REQUIRED`].
+    pub approved_by: String,
+    pub request_id: u64,
+    pub total_debit: String,
+    pub total_credit: String,
+}
+
+/// The Ledger pane of the active workspace (one RUC in one period) only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LedgerPaneView {
+    pub entity_ruc: String,
+    pub fiscal_period: String,
+    pub staged: Option<LedgerStagedEntry>,
+    /// Oldest first.
+    pub posted: Vec<LedgerPostedEntry>,
+    /// Set when there is nothing to list; names the RUC and period.
+    pub empty_message: Option<String>,
+    pub limits: &'static str,
+}
+
+impl LedgerPaneView {
+    /// Builds the pane for the active workspace. `status` labels the staged entry the way the
+    /// sidebar does. A staged review whose RUC or period no longer matches the active workspace
+    /// is not listed, so the pane never shows another company's entry.
+    pub fn build(
+        controller: &DrenyraHostController,
+        status: fn(&EntryDiffReview) -> &'static str,
+    ) -> Self {
+        let active = controller.workspaces().active();
+        let key = active.key();
+        let staged = controller
+            .active_review()
+            .filter(|review| {
+                let proposal = review.proposal();
+                WorkspaceKey::new(&proposal.entity_ruc, &proposal.fiscal_period) == key
+            })
+            .map(|review| {
+                let proposal = review.proposal();
+                LedgerStagedEntry {
+                    proposal_id: proposal.id.clone(),
+                    risk_tier_label: risk_tier_label(proposal.risk_tier),
+                    status: status(review),
+                    lines: proposal
+                        .lines
+                        .iter()
+                        .map(|line| LedgerLine {
+                            account_code: line.account_code.clone(),
+                            description: line.description.clone(),
+                            debit: amount_text(line.debit),
+                            credit: amount_text(line.credit),
+                        })
+                        .collect(),
+                    total_debit: total_text(proposal.lines.iter().map(|l| l.debit)),
+                    total_credit: total_text(proposal.lines.iter().map(|l| l.credit)),
+                    balanced: proposal.is_balanced(),
+                }
+            });
+        let posted: Vec<LedgerPostedEntry> = controller
+            .posted(&key)
+            .iter()
+            .map(|entry| LedgerPostedEntry {
+                proposal_id: entry.proposal.id.clone(),
+                risk_tier_label: risk_tier_label(entry.proposal.risk_tier),
+                approved_by: entry
+                    .approved_by
+                    .clone()
+                    .unwrap_or_else(|| NO_APPROVAL_REQUIRED.to_owned()),
+                request_id: entry.request_id,
+                total_debit: total_text(entry.proposal.lines.iter().map(|l| l.debit)),
+                total_credit: total_text(entry.proposal.lines.iter().map(|l| l.credit)),
+            })
+            .collect();
+        let empty_message = (staged.is_none() && posted.is_empty()).then(|| {
+            format!(
+                "No entries staged or posted for RUC {} · {} in this session.",
+                active.entity_ruc, active.fiscal_period
+            )
+        });
+        Self {
+            entity_ruc: active.entity_ruc.clone(),
+            fiscal_period: active.fiscal_period.clone(),
+            staged,
+            posted,
+            empty_message,
+            limits: LEDGER_LIMITS,
+        }
+    }
+}
+
+/// The Evidence pane: the active workspace's session evidence log, newest first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvidencePaneView {
+    pub entity_ruc: String,
+    pub fiscal_period: String,
+    /// `#<seq>  <sentence>`, newest first.
+    pub entries: Vec<String>,
+    /// Set when nothing was recorded; names the RUC and period.
+    pub empty_message: Option<String>,
+    pub limits: &'static str,
+}
+
+impl EvidencePaneView {
+    /// Builds the pane from the active workspace's log only.
+    pub fn build(controller: &DrenyraHostController) -> Self {
+        let active = controller.workspaces().active();
+        let entries: Vec<String> = controller
+            .evidence(&active.key())
+            .iter()
+            .rev()
+            .map(|event| format!("#{}  {}", event.seq, evidence_sentence(&event.kind)))
+            .collect();
+        let empty_message = entries.is_empty().then(|| {
+            format!(
+                "No evidence recorded for RUC {} · {} in this session.",
+                active.entity_ruc, active.fiscal_period
+            )
+        });
+        Self {
+            entity_ruc: active.entity_ruc.clone(),
+            fiscal_period: active.fiscal_period.clone(),
+            entries,
+            empty_message,
+            limits: EVIDENCE_LIMITS,
+        }
+    }
+}
+
+/// One-line English sentence for an evidence event.
+pub fn evidence_sentence(kind: &EvidenceKind) -> String {
+    match kind {
+        EvidenceKind::Staged {
+            proposal_id,
+            risk_tier,
+        } => format!("Staged {proposal_id} ({})", risk_tier_label(*risk_tier)),
+        EvidenceKind::Approved {
+            proposal_id,
+            approver,
+        } => format!("Approved {proposal_id} by {approver}"),
+        EvidenceKind::ApprovalReplaced {
+            proposal_id,
+            previous,
+            approver,
+        } => format!("Approval of {proposal_id} by {previous} replaced by {approver}"),
+        EvidenceKind::ApprovalCleared {
+            proposal_id,
+            previous,
+        } => format!("Approval of {proposal_id} by {previous} cleared by a line change"),
+        EvidenceKind::PostRequested {
+            proposal_id,
+            request_id,
+        } => format!("Post requested for {proposal_id} (request {request_id})"),
+        EvidenceKind::Posted {
+            proposal_id,
+            request_id,
+        } => format!("Posted {proposal_id} (request {request_id})"),
+    }
+}
+
+/// One field of the environment check, named as `--check-env` prints it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliField {
+    pub name: &'static str,
+    pub value: String,
+}
+
+/// One flag of the binary and what it does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliFlag {
+    pub usage: &'static str,
+    pub description: &'static str,
+}
+
+/// The Fiscal CLI pane: the environment check captured at start-up and the flag reference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliPaneView {
+    /// Empty when no check was captured.
+    pub environment: Vec<CliField>,
+    pub flags: Vec<CliFlag>,
+    pub limits: &'static str,
+}
+
+impl CliPaneView {
+    /// Builds the pane from an already captured check; it never probes the system itself.
+    pub fn build(environment: Option<&EnvironmentCheck>) -> Self {
+        Self {
+            environment: environment
+                .map(|check| {
+                    check
+                        .fields()
+                        .into_iter()
+                        .map(|(name, value)| CliField {
+                            name,
+                            value: value.to_string(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            flags: CLI_FLAGS
+                .iter()
+                .map(|&(usage, description)| CliFlag { usage, description })
+                .collect(),
+            limits: CLI_LIMITS,
+        }
+    }
 }
 
 /// Transcript entries rendered per frame (the pane keeps more; the oldest scroll out first).
@@ -272,6 +556,12 @@ pub struct ShellViewModel {
     pub palette: Option<PaletteView>,
     /// The sidebar, when open.
     pub sidebar: Option<SidebarView>,
+    /// The active workspace's Ledger pane.
+    pub ledger: Option<LedgerPaneView>,
+    /// The active workspace's Evidence pane.
+    pub evidence: Option<EvidencePaneView>,
+    /// The Fiscal CLI pane (the same for every workspace).
+    pub cli: Option<CliPaneView>,
 }
 
 impl ShellViewModel {
@@ -331,6 +621,9 @@ impl ShellViewModel {
             approval: None,
             palette: None,
             sidebar: None,
+            ledger: None,
+            evidence: None,
+            cli: None,
         }
     }
 
@@ -724,5 +1017,37 @@ mod tests {
                 height: 0
             }
         );
+    }
+
+    fn dialog(current_approver: Option<&str>) -> ApprovalDialogView {
+        ApprovalDialogView {
+            proposal_id: "je-1".into(),
+            risk_tier_label: "R2 Material",
+            total_debit: "118.00".into(),
+            total_credit: "118.00".into(),
+            required: true,
+            approver: String::new(),
+            current_approver: current_approver.map(str::to_owned),
+            ready: true,
+            blocker: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn approval_dialog_says_replace_when_an_approval_is_already_recorded() {
+        let record = dialog(None);
+        assert_eq!(record.title(), "Record human approval");
+        assert_eq!(
+            record.footer_hint(),
+            "Type the approver's ID · Enter record approval · Esc cancel"
+        );
+        let replace = dialog(Some("CPA-1"));
+        assert_eq!(replace.title(), "Replace approval");
+        assert_eq!(
+            replace.footer_hint(),
+            "Type the new approver's ID · Enter replace approval · Esc cancel"
+        );
+        assert!(!replace.title().contains("Record") && !replace.footer_hint().contains("record"));
     }
 }
