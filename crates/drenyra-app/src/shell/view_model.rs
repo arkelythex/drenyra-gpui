@@ -509,7 +509,8 @@ mod tests {
         ));
         controller
             .workspaces_mut()
-            .add_workspace(FiscalWorkspace::new("20987654321", "Sierra SRL", "2026-11"));
+            .add_workspace(FiscalWorkspace::new("20987654321", "Sierra SRL", "2026-11"))
+            .expect("distinct workspace");
         controller
     }
 

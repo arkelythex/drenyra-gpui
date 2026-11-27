@@ -160,6 +160,49 @@ impl Default for SessionGuardrails {
     }
 }
 
+/// Identity of a fiscal workspace: one company (RUC) in one fiscal period.
+///
+/// State that belongs to a company, such as its agent conversation, is keyed by this value, never
+/// by the workspace's position in the switcher. Both parts are trimmed.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WorkspaceKey {
+    entity_ruc: String,
+    fiscal_period: String,
+}
+
+impl WorkspaceKey {
+    pub fn new(entity_ruc: &str, fiscal_period: &str) -> Self {
+        Self {
+            entity_ruc: entity_ruc.trim().to_owned(),
+            fiscal_period: fiscal_period.trim().to_owned(),
+        }
+    }
+
+    pub fn entity_ruc(&self) -> &str {
+        &self.entity_ruc
+    }
+
+    pub fn fiscal_period(&self) -> &str {
+        &self.fiscal_period
+    }
+}
+
+/// A workspace for the same RUC and period is already open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuplicateWorkspace(pub WorkspaceKey);
+
+impl std::fmt::Display for DuplicateWorkspace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "a workspace for RUC {} and period {} is already open",
+            self.0.entity_ruc, self.0.fiscal_period
+        )
+    }
+}
+
+impl std::error::Error for DuplicateWorkspace {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FiscalWorkspace {
     pub entity_ruc: String,
@@ -197,6 +240,11 @@ impl FiscalWorkspace {
             next_pane_id: 2,
             closed_history: Vec::new(),
         }
+    }
+
+    /// This workspace's identity (RUC + fiscal period).
+    pub fn key(&self) -> WorkspaceKey {
+        WorkspaceKey::new(&self.entity_ruc, &self.fiscal_period)
     }
 
     pub fn layout(&self) -> &PaneNode {
@@ -282,9 +330,28 @@ impl WorkspaceManager {
         }
     }
 
-    pub fn add_workspace(&mut self, workspace: FiscalWorkspace) -> usize {
+    /// Adds `workspace` and returns its index, or refuses it when a workspace for the same RUC and
+    /// period is already open (two would share one identity and its agent conversation).
+    pub fn add_workspace(
+        &mut self,
+        workspace: FiscalWorkspace,
+    ) -> Result<usize, DuplicateWorkspace> {
+        let key = workspace.key();
+        if self.index_of(&key).is_some() {
+            return Err(DuplicateWorkspace(key));
+        }
         self.workspaces.push(workspace);
-        self.workspaces.len() - 1
+        Ok(self.workspaces.len() - 1)
+    }
+
+    /// Index of the workspace identified by `key`, if open.
+    pub fn index_of(&self, key: &WorkspaceKey) -> Option<usize> {
+        self.workspaces.iter().position(|ws| &ws.key() == key)
+    }
+
+    /// Identity of the active workspace.
+    pub fn active_key(&self) -> WorkspaceKey {
+        self.active().key()
     }
 
     pub fn switch_to(&mut self, index: usize) -> bool {
@@ -413,8 +480,8 @@ mod tests {
         ws3.activity = WorkspaceActivity::AwaitingApproval;
 
         let mut mgr = WorkspaceManager::new(ws1);
-        let idx2 = mgr.add_workspace(ws2);
-        let idx3 = mgr.add_workspace(ws3);
+        let idx2 = mgr.add_workspace(ws2).expect("distinct workspace");
+        let idx3 = mgr.add_workspace(ws3).expect("distinct workspace");
 
         // Active is ws1; ws3 awaits approval so background alert is AwaitingApproval.
         assert_eq!(mgr.background_alert(), WorkspaceActivity::AwaitingApproval);
@@ -431,13 +498,50 @@ mod tests {
     }
 
     #[test]
+    fn workspaces_are_identified_by_ruc_and_period_and_duplicates_are_refused() {
+        let mut mgr =
+            WorkspaceManager::new(FiscalWorkspace::new("20123456789", "Andino SAC", "2026-10"));
+        // Same RUC, another period: a different workspace.
+        let next_period = mgr
+            .add_workspace(FiscalWorkspace::new("20123456789", "Andino SAC", "2026-11"))
+            .expect("another period is another workspace");
+        assert_eq!(next_period, 1);
+
+        // Same RUC and period (surrounding spaces ignored): refused, manager unchanged.
+        let err = mgr
+            .add_workspace(FiscalWorkspace::new(
+                " 20123456789 ",
+                "Otra SAC",
+                "2026-10 ",
+            ))
+            .expect_err("duplicate RUC + period");
+        assert_eq!(
+            err.to_string(),
+            "a workspace for RUC 20123456789 and period 2026-10 is already open"
+        );
+        assert_eq!(mgr.workspaces().len(), 2);
+
+        let key = mgr.workspaces()[1].key();
+        assert_eq!(key, WorkspaceKey::new("20123456789", "2026-11"));
+        assert_eq!(mgr.index_of(&key), Some(1));
+        assert_eq!(
+            mgr.active_key(),
+            WorkspaceKey::new("20123456789", "2026-10")
+        );
+        assert_eq!(
+            mgr.index_of(&WorkspaceKey::new("20987654321", "2026-10")),
+            None
+        );
+    }
+
+    #[test]
     fn background_alert_ignores_active_workspace_activity() {
         let mut active_ws = FiscalWorkspace::new("20123456789", "Andino SAC", "2026-10");
         active_ws.activity = WorkspaceActivity::AwaitingApproval;
         let idle_ws = FiscalWorkspace::new("20987654321", "Sierra SRL", "2026-10");
 
         let mut mgr = WorkspaceManager::new(active_ws);
-        let idx2 = mgr.add_workspace(idle_ws);
+        let idx2 = mgr.add_workspace(idle_ws).expect("distinct workspace");
 
         // Active workspace is AwaitingApproval, other is Idle -> background_alert must be Idle.
         assert_eq!(mgr.background_alert(), WorkspaceActivity::Idle);

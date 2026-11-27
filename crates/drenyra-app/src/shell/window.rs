@@ -29,7 +29,7 @@ use super::view_model::{
     WorkspaceChip, FOOTER_HEIGHT, REVIEW_PANEL_WIDTH, SIDEBAR_WIDTH, TOP_BAR_HEIGHT,
 };
 use crate::ui::DesktopShellConfig;
-use drenyra_workspace::{PaneKind, WorkspaceActivity};
+use drenyra_workspace::{PaneKind, WorkspaceActivity, WorkspaceKey};
 
 actions!(
     drenyra,
@@ -188,8 +188,8 @@ struct ShellWindow {
     settings_path: Option<PathBuf>,
     /// Last failure to save settings, shown in the footer until a save succeeds.
     save_error: Option<String>,
-    /// Running agent processes by workspace index. Dropping one closes the agent gracefully.
-    sessions: BTreeMap<usize, AgentSession>,
+    /// Running agent processes by company and period. Dropping one closes the agent gracefully.
+    sessions: BTreeMap<WorkspaceKey, AgentSession>,
 }
 
 impl ShellWindow {
@@ -206,8 +206,8 @@ impl ShellWindow {
     /// whatever every agent wrote since the last poll.
     fn poll_agents(&mut self, cx: &mut Context<Self>) {
         let mut changed = self.ensure_active_agent();
-        for (&index, session) in &self.sessions {
-            let pane = self.state.agent_pane_mut(index);
+        for (key, session) in &self.sessions {
+            let pane = self.state.agent_pane_mut(key);
             for frame in pane.take_outbox() {
                 if let Err(err) = session.send(&frame) {
                     changed |= pane.apply(AgentUpdate::Failed(err.to_string()));
@@ -224,16 +224,16 @@ impl ShellWindow {
     }
 
     fn ensure_active_agent(&mut self) -> bool {
-        let index = self.state.active_workspace();
-        if self.state.agent_pane(index).status() != &AgentStatus::NotStarted {
+        let key = self.state.active_workspace_key();
+        if self.state.agent_pane(&key).status() != &AgentStatus::NotStarted {
             return false;
         }
-        let pane = self.state.agent_pane_mut(index);
+        let pane = self.state.agent_pane_mut(&key);
         match agent_launch(crate::find_in_path) {
             Ok(config) => match AgentSession::spawn(&config) {
                 Ok(session) => {
                     pane.mark_started();
-                    self.sessions.insert(index, session);
+                    self.sessions.insert(key, session);
                 }
                 Err(err) => pane.mark_unavailable(format!("Could not start the agent: {err}")),
             },
