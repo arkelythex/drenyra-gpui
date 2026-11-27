@@ -104,6 +104,14 @@ pub fn run_demo_session_json() -> Result<String, ControllerError> {
     ))
 }
 
+/// Error printed for arguments no flag accepts (text kept stable for existing scripts).
+pub fn unrecognized_arguments_message(args: &[String]) -> String {
+    format!(
+        "drenyra-gpui: unrecognized arguments: {} (try --help, --check-env, --demo-session, or --probe-rpc)",
+        args.join(" ")
+    )
+}
+
 /// Message printed by `--window` in a headless build.
 pub const fn window_unavailable_message() -> &'static str {
     "drenyra-gpui: --window requires a native build; rebuild with `cargo run -p drenyra-app --features gpui -- --window`"
@@ -189,10 +197,7 @@ pub fn run_cli(args: &[String]) -> ExitCode {
             }
         },
         _ => {
-            eprintln!(
-                "drenyra-gpui: unrecognized arguments: {} (try --help, --check-env, --demo-session, --window, or --probe-rpc)",
-                args.join(" ")
-            );
+            eprintln!("{}", unrecognized_arguments_message(args));
             ExitCode::FAILURE
         }
     }
@@ -374,6 +379,15 @@ mod tests {
         assert_eq!(
             run_cli(&["--window".into(), "--extra".into()]),
             ExitCode::FAILURE
+        );
+    }
+
+    #[test]
+    fn unrecognized_arguments_message_keeps_its_existing_text() {
+        assert_eq!(run_cli(&["--bogus".into()]), ExitCode::FAILURE);
+        assert_eq!(
+            unrecognized_arguments_message(&["--bogus".into(), "x".into()]),
+            "drenyra-gpui: unrecognized arguments: --bogus x (try --help, --check-env, --demo-session, or --probe-rpc)"
         );
     }
 }
