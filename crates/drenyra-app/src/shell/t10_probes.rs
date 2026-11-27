@@ -2,8 +2,11 @@
 //! the independent verifier's findings (its scratch files were lost) and its advisories A1/A2.
 //!
 //! 1. Every refused operation leaves the controller's `Debug` snapshot identical and appends no
-//!    evidence. The controllers use a fixed clock, whose next reading is part of that snapshot,
-//!    so a refused operation that read the clock would show up too.
+//!    evidence. These probes build their controllers with a fixed clock, whose next reading is
+//!    part of that snapshot, so a refused operation that read the clock would show up too. Only
+//!    fixed-clock controllers catch such a stray read: `Clock::System` keeps no reading in its
+//!    state, so the snapshot of a system-clock controller (such as `demo_controller()`, used by
+//!    the A1/A2 probes below) does not change when one happens.
 //! 2. Evidence `seq` is strictly increasing 1..=n across workspaces and every event lands under
 //!    the key of the workspace that owns its proposal, even when another workspace is active.
 //!    Each event reads the clock exactly once: its time is `start + (seq - 1) * step`.

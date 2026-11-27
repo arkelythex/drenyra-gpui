@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use gpui::{
     actions, div, prelude::*, px, rgb, size, AnyElement, App, Application, Bounds, ClickEvent,
-    Context, ElementId, FocusHandle, KeyBinding, KeyDownEvent, Rgba, ScrollHandle, SharedString,
-    Window, WindowBounds, WindowOptions,
+    Context, ElementId, FocusHandle, KeyBinding, KeyDownEvent, Rgba, ScrollHandle,
+    ScrollWheelEvent, SharedString, Window, WindowBounds, WindowOptions,
 };
 
 use drenyra_rpc::agent::{AgentSession, AgentUpdate};
@@ -21,7 +21,7 @@ use drenyra_rpc::agent::{AgentSession, AgentUpdate};
 use super::agent_pane::{agent_launch, AgentStatus, EntryRole};
 
 use super::commands::{typed_text, ShellCommand, ShellState, ENTRY_READY_TO_POST, KEY_BINDINGS};
-use super::scroll::{is_at_bottom, should_follow, ScrollSlots};
+use super::scroll::ScrollSlots;
 use super::settings::save_if_changed;
 use super::theme::{ThemeId, ThemeTokens};
 use super::view_model::{
@@ -192,61 +192,33 @@ struct ShellWindow {
     save_error: Option<String>,
     /// Running agent processes by company and period. Dropping one closes the agent gracefully.
     sessions: BTreeMap<WorkspaceKey, AgentSession>,
-    /// Scroll position of every pane body by company and pane kind, kept across switches.
+    /// Scroll slot of every pane tile by company and pane id, kept across switches and closes.
+    /// Agent transcript slots also carry the follow intent, applied in `render`.
     scrolls: ScrollSlots<ScrollHandle>,
 }
 
-/// Whether this company's agent transcript was showing its end at the last layout. A transcript
-/// never rendered counts as at the bottom, so it opens on its newest entry.
-fn transcript_at_bottom(scrolls: &ScrollSlots<ScrollHandle>, key: &WorkspaceKey) -> bool {
-    scrolls
-        .get(key, PaneKind::FiscalAgent)
-        .is_none_or(|handle| {
-            is_at_bottom(
-                f32::from(handle.offset().y),
-                f32::from(handle.max_offset().height),
-            )
-        })
-}
-
-/// Pins this company's transcript to its end on the next layout when [`should_follow`] says so.
-fn follow_transcript(
-    scrolls: &mut ScrollSlots<ScrollHandle>,
-    key: &WorkspaceKey,
-    was_at_bottom: bool,
-    changed: bool,
-) {
-    if should_follow(was_at_bottom, changed) {
-        scrolls
-            .handle(key, PaneKind::FiscalAgent)
-            .scroll_to_bottom();
-    }
-}
+/// Wheel listener attached to an agent transcript's scroll container.
+type WheelListener = Box<dyn Fn(&ScrollWheelEvent, &mut Window, &mut App)>;
 
 impl ShellWindow {
     fn dispatch(&mut self, command: ShellCommand, window: &mut Window, cx: &mut Context<Self>) {
         let area = self.pane_area(window);
         let before = self.state.settings();
-        let key = self.state.active_workspace_key();
-        let was_at_bottom = transcript_at_bottom(&self.scrolls, &key);
         if self.state.apply(command, area) {
-            // A sent prompt adds the operator's entry to the transcript.
-            follow_transcript(&mut self.scrolls, &key, was_at_bottom, true);
+            // No scroll bookkeeping here. A transcript that follows is pinned to its end by the
+            // next render whatever caused it (a sent prompt's entry, a resize); one the operator
+            // scrolled up is never moved by a command.
             self.persist_if_changed(before);
             cx.notify();
         }
     }
 
     /// Starts the active workspace's agent on first view, sends queued commands, and applies
-    /// whatever every agent wrote since the last poll. Each transcript follows its new output only
-    /// if it was showing its end before this poll.
+    /// whatever every agent wrote since the last poll. New output only asks for a render; the
+    /// render pins each following transcript to its end.
     fn poll_agents(&mut self, cx: &mut Context<Self>) {
-        let active = self.state.active_workspace_key();
-        let active_was_at_bottom = transcript_at_bottom(&self.scrolls, &active);
         let mut changed = self.ensure_active_agent();
-        follow_transcript(&mut self.scrolls, &active, active_was_at_bottom, changed);
         for (key, session) in &self.sessions {
-            let was_at_bottom = transcript_at_bottom(&self.scrolls, key);
             let pane = self.state.agent_pane_mut(key);
             let mut pane_changed = false;
             for frame in pane.take_outbox() {
@@ -258,7 +230,6 @@ impl ShellWindow {
             for update in session.drain() {
                 pane_changed |= pane.apply(update);
             }
-            follow_transcript(&mut self.scrolls, key, was_at_bottom, pane_changed);
             changed |= pane_changed;
         }
         if changed {
@@ -420,9 +391,29 @@ impl Render for ShellWindow {
             .panes
             .iter()
             .map(|tile| {
+                let slot = scrolls.slot(&active_key, tile.id);
+                let on_wheel = (tile.kind == PaneKind::FiscalAgent).then(|| {
+                    // Resolve the operator's last scroll, then pin while following: this frame's
+                    // layout uses the new content and size, so output and resizes stay pinned.
+                    let offset_y = f32::from(slot.handle.offset().y);
+                    let max_scroll_y = f32::from(slot.handle.max_offset().height);
+                    if slot.follow.frame(offset_y, max_scroll_y) {
+                        slot.handle.scroll_to_bottom();
+                    }
+                    let (key, pane_id) = (active_key.clone(), tile.id);
+                    let listener = cx.listener(move |this, _: &ScrollWheelEvent, _, cx| {
+                        this.scrolls
+                            .slot(&key, pane_id)
+                            .follow
+                            .note_operator_scroll();
+                        cx.notify();
+                    });
+                    Box::new(listener) as WheelListener
+                });
                 let scroll = PaneScroll {
                     id: ("pane-body", tile.id).into(),
-                    handle: scrolls.handle(&active_key, tile.kind),
+                    handle: slot.handle.clone(),
+                    on_wheel,
                 };
                 let body = match tile.kind {
                     PaneKind::FiscalAgent => vm.agent.as_ref().map(|agent| {
@@ -812,17 +803,19 @@ fn placeholder_body(t: &ThemeTokens) -> impl IntoElement {
         .child("Nothing to show in this pane.")
 }
 
-/// Where a pane body scrolls: a stable element id for the tile and the company's handle for this
-/// pane kind (two tiles of one kind in one company share it and scroll together).
+/// Where a pane body scrolls: a stable element id and this tile's own handle (each tile scrolls on
+/// its own), plus, for an agent transcript, the listener that tells its follow intent the operator
+/// scrolled.
 struct PaneScroll {
     id: ElementId,
     handle: ScrollHandle,
+    on_wheel: Option<WheelListener>,
 }
 
 /// Vertical scroll container for a pane's content; whatever sits outside it (header, footnote,
 /// composer) stays fixed.
 fn scroll_area(scroll: PaneScroll) -> gpui::Stateful<gpui::Div> {
-    div()
+    let area = div()
         .id(scroll.id)
         .flex_1()
         .min_h_0()
@@ -830,7 +823,15 @@ fn scroll_area(scroll: PaneScroll) -> gpui::Stateful<gpui::Div> {
         .track_scroll(&scroll.handle)
         .flex()
         .flex_col()
-        .p_3()
+        .p_3();
+    match scroll.on_wheel {
+        // Runs after GPUI's own wheel handler, but the position is read at the next render
+        // anyway, so the order does not matter.
+        Some(listener) => {
+            area.on_scroll_wheel(move |event, window, cx| listener(event, window, cx))
+        }
+        None => area,
+    }
 }
 
 /// Column shared by the Ledger, Evidence and CLI bodies: the content (filled by the caller)

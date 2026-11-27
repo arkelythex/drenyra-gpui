@@ -1292,6 +1292,10 @@ mod tests {
 
     #[test]
     fn new_stamps_events_with_the_system_clock() {
+        // The wall clock may step backwards (NTP, a manual change) between readings, so the
+        // stamp is only required to be non-zero and near the readings taken around it. Ten
+        // minutes tolerates any realistic step while still rejecting a fixed or zero clock.
+        const SLACK_MS: u128 = 10 * 60 * 1_000;
         let system_ms = || {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1307,9 +1311,11 @@ mod tests {
             .expect("stage");
         let after = system_ms();
         let recorded = u128::from(controller.evidence(&key)[0].recorded_at_ms);
+        assert_ne!(recorded, 0, "stamped with a zero clock");
+        let window = before.min(after).saturating_sub(SLACK_MS)..=before.max(after) + SLACK_MS;
         assert!(
-            (before..=after).contains(&recorded),
-            "{recorded} outside {before}..={after}"
+            window.contains(&recorded),
+            "{recorded} outside {window:?} (readings {before} and {after})"
         );
     }
 
