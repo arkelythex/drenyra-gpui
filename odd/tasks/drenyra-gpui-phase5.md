@@ -1,6 +1,6 @@
 # Drenyra GPUI — Phase 5: Native GPUI Window (Fiscal Workspaces, Dwindle Panes, Entry Review)
 
-Feature: `drenyra-gpui-phase5` | Branch: `feat/drenyra-gpui-phase5` stacked on `fix/gpui-rpc-response-id` (PR #398) | Delivery: `ask-on-risk` | Runner: `cargo test --workspace --all-features` | Status: in_progress
+Feature: `drenyra-gpui-phase5` | Branch: `feat/drenyra-gpui-phase5` stacked on `fix/gpui-rpc-response-id` (PR #398) | Delivery: `ask-on-risk` | Runner: `cargo test --workspace --all-features` | Status: ready (PR #399)
 
 ## Specs
 
@@ -20,7 +20,7 @@ Assumptions (marked, not user-stated): key bindings use Ctrl on Linux in place o
 | T1 | Pure view model + pane rectangles | S2 | inline | done | `29c47f29` |
 | T2 | Pure commands incl. dwindle split from real rectangle | S3 | inline | done | `29c47f29` |
 | T3 | GPUI window, key bindings, `--window` flag, help, feature wiring | S1, S4 | inline | done | `ba272154`, `d9cbe554`, `76223609` |
-| T4 | Checks, visual check, verifier (Risk item 5), RDD, PR | S5 | verify | in_progress | - |
+| T4 | Checks, visual check, verifier (Risk item 5), RDD, PR | S5 | verify | done | `1c8665f3`, `de445825`, PR #399 |
 
 Route evidence: one behavior chain (T2 depends on T1, T3 on both) → no parallel units, no writer trigger; inline.
 
@@ -41,3 +41,4 @@ Route evidence: one behavior chain (T2 depends on T1, T3 on both) → no paralle
   - Advisories: `Cargo.lock` gitignored (user decision); metadata files note added to `PATCHED.md` (`7455d094`); `EntryDiffReview` keeps `approved_by` after a later accept/reject (pre-existing in `drenyra-ui`, unreachable from the window today; must be fixed before approval is wired into the UI); `confirm_posted` resets the tier to R0 rather than restoring a prior tier (correct while nothing else writes it).
 - **L5 — 2026-11-27 verifier recheck (B1 only).** PASS: `--bogus` and `--window --extra` identical to baseline (stdout, stderr, exit 1); 90 tests pass. Verifier scratch removed.
 - **L6 — 2026-11-27 native review.** `review-73f3a413f15ce6f7` (base `fix/gpui-rpc-response-id` → `15b50a6d`, lenses risk/reliability, consent granted by user): approved, acknowledged. Advisories: `--window` exited 0 when the window failed to open (R1-002 / R3) → fixed in `de445825` (no headless RED possible: needs GPUI to fail opening a window; live check: open → Ctrl+Q → exit 0, no orphan process); unpinned GPUI tree because `Cargo.lock` is gitignored (user decision).
+- **L7 — 2026-11-27 delivery.** Pushed `feat/drenyra-gpui-phase5`; PR #399 (base `fix/gpui-rpc-response-id`, chain #394 → … → #398 → #399). Assess after review: `de445825` medium/under_budget (21 lines). Open items: narrow-window visual check; `Cargo.lock` policy (user decision); `drenyra-ui` approval-survives-edit follow-up before wiring approval into the window.
