@@ -1,6 +1,6 @@
 # Drenyra GPUI — Phase 4: Bulletproof RPC Session Lifecycle & Unified Host Controller
 
-Feature: `drenyra-gpui-phase4` | Repo: `arkelythex/drenyra-gpui` | Stacked on: `feat/drenyra-gpui-phase3` (PR #396) | Status: checking
+Feature: `drenyra-gpui-phase4` | Repo: `arkelythex/drenyra-gpui` | Stacked on: `feat/drenyra-gpui-phase3` (PR #396) | Status: ready (PR #397)
 
 ## Specs
 
@@ -28,7 +28,7 @@ Feature: `drenyra-gpui-phase4` | Repo: `arkelythex/drenyra-gpui` | Stacked on: `
 | T3 | Run full workspace checks, rustfmt, tenant-scope fix (RED→GREEN), commit slices | S1, S2 | inline | done | `11789ba9`, `6de1f2c9` |
 | T3b | Verifier correction batch: B1 post-time scope re-check; configurable Drop shutdown grace (flake fix) | S1, S2 | inline | done | `1a008378`, `284008c8` |
 | T4a | Native review 1 (risk/resilience/reliability) + advisory fixes R4-001, R3-001, R3-002 | S2, S3 | inline | done | `b8d47d25`, `44ee28cd` |
-| T4 | Independent verification, native review, and stacked PR | S3 | verify | in_progress | - |
+| T4 | Independent verification, native review, and stacked PR | S3 | verify | done | PR #397 |
 
 ## Log
 
@@ -54,3 +54,4 @@ Feature: `drenyra-gpui-phase4` | Repo: `arkelythex/drenyra-gpui` | Stacked on: `
   - Checks: 53 tests pass (app 23, workspace 5, rpc 15, protocol 6, ui 4); clippy `-D warnings` clean with and without features; fmt clean; `--features gpui` builds; `cargo doc` clean; rpc binary 48 parallel runs, 0 failures; `--demo-session` exit 0.
   - Count correction: earlier totals 51 (L3) and 55 (L4) were arithmetic slips; actual were 48 and 51.
   - Follow-ups (out of scope): RpcSession response-id matching; `ledger_post` server idempotency on `proposal_id`; bind `pending_posts` to `proposal_id` if a discard/remove API is ever added; `MoneyCents` lines in the frame are a product decision.
+- **L7 — 2026-11-27 delivery.** Pushed `feat/drenyra-gpui-phase4`; opened PR #397 (base `feat/drenyra-gpui-phase3`, chain #394 → #395 → #396 → #397). Single PR per phase, following the existing chain convention (~1,120 Rust lines, about half tests). CI `review` job pending at creation. Merge remains a human decision.
