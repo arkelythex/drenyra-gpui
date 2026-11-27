@@ -124,6 +124,11 @@ impl DrenyraHostController {
         self.reviews.get(&self.workspaces.active_index())
     }
 
+    /// Staged review of the workspace at `index`, read-only (for overviews such as the sidebar).
+    pub fn review(&self, index: usize) -> Option<&EntryDiffReview> {
+        self.reviews.get(&index)
+    }
+
     pub fn active_review_mut(&mut self) -> Option<&mut EntryDiffReview> {
         self.reviews.get_mut(&self.workspaces.active_index())
     }

@@ -22,7 +22,7 @@ Assumptions (marked): keys keep Ctrl on Linux; the selected theme persists acros
 | T3 | Live agent session protocol + pane (prompt input, streamed output, failure states) | S1 | inline | done (a: `4150a5b8`; b: see L6) | — |
 | T4 | Approval command/dialog | S4 | inline | done (see L7) | — |
 | T5 | Command palette | S4 | inline | done (see L8) | — |
-| T6 | Sidebar | S4 | inline | pending | — |
+| T6 | Sidebar | S4 | inline | done (see L9) | — |
 | T7 | Checks, visual check both themes, verifier, RDD, PRs | S5 | verify | pending | — |
 
 ## Log
@@ -68,3 +68,10 @@ Assumptions (marked): keys keep Ctrl on Linux; the selected theme persists acros
   - Checks: 145 tests headless / 144 with features; clippy `-D warnings` both ways; fmt.
   - Not verified live (desktop automation stopped, see L7): `Ctrl+Shift+P`, the ⌘ Commands click, arrow keys in the palette.
   - Risk: none of items 1-6 (new command and overlay; existing commands unchanged).
+- **L9 — 2026-11-27 T6 sidebar.**
+  - RED → GREEN: 18 compile errors → 3 tests (sidebar listing and statuses, toggle, `switch_workspace`, `pane_area_with`). The palette's workspace entries now reuse `switch_workspace` (one path that also leaves the composer and resets the cursor).
+  - Data shown is real only: companies, staged entries and their status; documents and ledgers show a note (no source yet). New read-only `DrenyraHostController::review(index)`; mutations still go only through the active workspace.
+  - Checks: 148 tests headless / 147 with features; clippy `-D warnings` both ways; fmt.
+  - Not verified live (desktop automation stopped, see L7): sidebar rendering, `Ctrl+B`, company clicks.
+  - Risk: none of items 1-6 (adds a read-only accessor; layout gains a column).
+  - Remaining from S4: additional pane kinds (Ledger, Evidence, CLI bodies) — pending, not started.

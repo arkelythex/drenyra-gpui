@@ -9,11 +9,11 @@ use super::demo;
 use super::settings::Settings;
 use super::theme::ThemeId;
 use super::view_model::{
-    AgentPaneView, ApprovalDialogView, PaletteEntry, PaletteView, Rect, SettingsPanel,
-    ShellViewModel, ThemeOption,
+    risk_tier_label, AgentPaneView, ApprovalDialogView, PaletteEntry, PaletteView, Rect,
+    SettingsPanel, ShellViewModel, SidebarCompany, SidebarEntry, SidebarView, ThemeOption,
 };
 use crate::controller::DrenyraHostController;
-use drenyra_ui::LineDecision;
+use drenyra_ui::{EntryDiffReview, LineDecision};
 
 /// Comment recorded when a line is rejected from the keyboard (no free-text input yet).
 pub const REJECT_COMMENT: &str = "Rejected by operator in Entry Diff Review";
@@ -30,6 +30,39 @@ pub const APPROVAL_NEEDS_APPROVER: &str = "Enter the approver's ID.";
 struct ApprovalDraft {
     approver: String,
     error: Option<&'static str>,
+}
+
+/// Sidebar status of a staged entry with pending lines.
+pub const ENTRY_IN_REVIEW: &str = "In review";
+/// Sidebar status of a staged entry with a rejected line.
+pub const ENTRY_CHANGES_REQUESTED: &str = "Changes requested";
+/// Sidebar status of a staged entry whose lines are all accepted but which still needs approval.
+pub const ENTRY_AWAITING_APPROVAL: &str = "Awaiting approval";
+/// Sidebar status of a staged entry that can be posted.
+pub const ENTRY_READY_TO_POST: &str = "Ready to post";
+/// Sidebar status of a staged entry that does not balance.
+pub const ENTRY_NOT_BALANCED: &str = "Not balanced";
+
+/// Sidebar status of a staged review.
+fn entry_status(review: &EntryDiffReview) -> &'static str {
+    let decisions = review.decisions();
+    if !review.proposal().is_balanced() {
+        ENTRY_NOT_BALANCED
+    } else if review.can_post() {
+        ENTRY_READY_TO_POST
+    } else if decisions
+        .iter()
+        .any(|d| matches!(d, LineDecision::Rejected { .. }))
+    {
+        ENTRY_CHANGES_REQUESTED
+    } else if decisions
+        .iter()
+        .all(|d| matches!(d, LineDecision::Accepted))
+    {
+        ENTRY_AWAITING_APPROVAL
+    } else {
+        ENTRY_IN_REVIEW
+    }
 }
 
 /// What a command palette entry does.
@@ -63,6 +96,7 @@ const fn command_label(command: ShellCommand) -> Option<&'static str> {
         ShellCommand::FocusComposer => "Ask the Fiscal Agent",
         ShellCommand::StopAgent => "Stop the running agent",
         ShellCommand::OpenApproval => "Record human approval…",
+        ShellCommand::ToggleSidebar => "Toggle sidebar",
         ShellCommand::CloseOverlay | ShellCommand::Confirm | ShellCommand::OpenPalette => {
             return None
         }
@@ -128,6 +162,8 @@ pub enum ShellCommand {
     OpenApproval,
     /// Open the command palette.
     OpenPalette,
+    /// Show or hide the sidebar.
+    ToggleSidebar,
 }
 
 /// Every command, for exhaustiveness checks.
@@ -148,6 +184,7 @@ pub const ALL_COMMANDS: &[ShellCommand] = &[
     ShellCommand::StopAgent,
     ShellCommand::OpenApproval,
     ShellCommand::OpenPalette,
+    ShellCommand::ToggleSidebar,
 ];
 
 /// Single source of truth for window key bindings (GPUI keystroke syntax).
@@ -170,6 +207,7 @@ pub const KEY_BINDINGS: &[(&str, ShellCommand)] = &[
     ("ctrl-c", ShellCommand::StopAgent),
     ("ctrl-p", ShellCommand::OpenApproval),
     ("ctrl-shift-p", ShellCommand::OpenPalette),
+    ("ctrl-b", ShellCommand::ToggleSidebar),
 ];
 
 /// Window-independent shell state: the host controller plus presentation cursors.
@@ -189,6 +227,7 @@ pub struct ShellState {
     approval: Option<ApprovalDraft>,
     /// The command palette, when open.
     palette: Option<PaletteDraft>,
+    sidebar_open: bool,
 }
 
 impl ShellState {
@@ -203,7 +242,25 @@ impl ShellState {
             composer_active: false,
             approval: None,
             palette: None,
+            sidebar_open: true,
         }
+    }
+
+    /// True while the sidebar is shown (it takes width from the panes).
+    pub fn sidebar_open(&self) -> bool {
+        self.sidebar_open
+    }
+
+    /// Makes workspace `index` active (sidebar click). Leaves the composer, which belongs to the
+    /// previous company, and resets the review cursor. Returns `false` when nothing changed.
+    pub fn switch_workspace(&mut self, index: usize) -> bool {
+        let manager = self.controller.workspaces_mut();
+        if index == manager.active_index() || index >= manager.workspaces().len() {
+            return false;
+        }
+        self.composer_active = false;
+        self.review_cursor = 0;
+        manager.switch_to(index)
     }
 
     /// The Fiscal Agent pane of workspace `index` (empty until the window starts its agent).
@@ -367,6 +424,29 @@ impl ShellState {
         let index = self.active_workspace();
         let pane = self.agents.get(&index).cloned().unwrap_or_default();
         view.agent = Some(AgentPaneView::from_pane(&pane, self.composer_active));
+        view.sidebar = self.sidebar_open.then(|| SidebarView {
+            companies: self
+                .controller
+                .workspaces()
+                .workspaces()
+                .iter()
+                .enumerate()
+                .map(|(index, ws)| SidebarCompany {
+                    index,
+                    legal_name: ws.legal_name.clone(),
+                    entity_ruc: ws.entity_ruc.clone(),
+                    fiscal_period: ws.fiscal_period.clone(),
+                    activity: ws.activity,
+                    active: index == self.active_workspace(),
+                    unposted_entries: ws.guardrails.unposted_entries,
+                    staged: self.controller.review(index).map(|review| SidebarEntry {
+                        proposal_id: review.proposal().id.clone(),
+                        risk_tier_label: risk_tier_label(review.proposal().risk_tier),
+                        status: entry_status(review),
+                    }),
+                })
+                .collect(),
+        });
         view.palette = self.palette.as_ref().map(|draft| PaletteView {
             query: draft.query.clone(),
             entries: self
@@ -438,6 +518,10 @@ impl ShellState {
         match command {
             ShellCommand::OpenPalette => {
                 self.palette = Some(PaletteDraft::default());
+                true
+            }
+            ShellCommand::ToggleSidebar => {
+                self.sidebar_open = !self.sidebar_open;
                 true
             }
             ShellCommand::OpenApproval => {
@@ -532,8 +616,7 @@ impl ShellState {
                         self.apply(command, pane_area);
                     }
                     PaletteAction::SwitchWorkspace(index) => {
-                        self.review_cursor = 0;
-                        self.controller.workspaces_mut().switch_to(index);
+                        self.switch_workspace(index);
                     }
                     PaletteAction::ApplyTheme(theme) => {
                         self.select_theme(theme);
@@ -1198,6 +1281,61 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_lists_every_company_with_its_staged_entry_and_toggles() {
+        let mut s = state();
+        let sidebar = s.view(WIDE).sidebar.expect("open by default");
+        assert_eq!(sidebar.companies.len(), 2);
+        let andino = &sidebar.companies[0];
+        assert_eq!(andino.legal_name, "Andino SAC");
+        assert!(andino.active);
+        assert_eq!(andino.unposted_entries, 1);
+        let entry = andino.staged.as_ref().expect("staged entry");
+        assert_eq!(entry.proposal_id, "je-demo-2026-10-001");
+        assert_eq!(entry.risk_tier_label, "R2 Material");
+        assert_eq!(entry.status, ENTRY_IN_REVIEW);
+        let sierra = &sidebar.companies[1];
+        assert!(!sierra.active);
+        assert!(sierra.staged.is_none());
+        assert_eq!(sierra.unposted_entries, 0);
+
+        for _ in 0..3 {
+            s.apply(ShellCommand::AcceptLine, WIDE);
+            s.apply(ShellCommand::ReviewCursorDown, WIDE);
+        }
+        let status = |s: &ShellState| {
+            s.view(WIDE).sidebar.expect("open").companies[0]
+                .staged
+                .as_ref()
+                .expect("staged")
+                .status
+        };
+        assert_eq!(status(&s), ENTRY_AWAITING_APPROVAL);
+        s.apply(ShellCommand::RejectLine, WIDE);
+        assert_eq!(status(&s), ENTRY_CHANGES_REQUESTED);
+
+        assert!(s.sidebar_open());
+        assert!(s.apply(ShellCommand::ToggleSidebar, WIDE));
+        assert!(!s.sidebar_open());
+        assert!(s.view(WIDE).sidebar.is_none());
+        assert!(s.apply(ShellCommand::ToggleSidebar, WIDE));
+        assert!(s.view(WIDE).sidebar.is_some());
+    }
+
+    #[test]
+    fn switch_workspace_from_the_sidebar_resets_cursor_and_leaves_the_composer() {
+        let mut s = state();
+        s.apply(ShellCommand::ReviewCursorDown, WIDE);
+        s.apply(ShellCommand::FocusComposer, WIDE);
+        assert!(s.switch_workspace(1));
+        assert_eq!(s.active_workspace(), 1);
+        assert!(!s.text_input_active(), "the composer belonged to Andino");
+        assert!(!s.switch_workspace(1), "already active");
+        assert!(!s.switch_workspace(9), "no such workspace");
+        assert!(s.switch_workspace(0));
+        assert!(s.view(WIDE).review.expect("review").rows[0].cursor);
+    }
+
+    #[test]
     fn key_bindings_cover_every_command_without_duplicate_keys() {
         for command in ALL_COMMANDS {
             assert!(
@@ -1219,5 +1357,6 @@ mod tests {
         assert!(KEY_BINDINGS.contains(&("ctrl-c", ShellCommand::StopAgent)));
         assert!(KEY_BINDINGS.contains(&("ctrl-p", ShellCommand::OpenApproval)));
         assert!(KEY_BINDINGS.contains(&("ctrl-shift-p", ShellCommand::OpenPalette)));
+        assert!(KEY_BINDINGS.contains(&("ctrl-b", ShellCommand::ToggleSidebar)));
     }
 }
