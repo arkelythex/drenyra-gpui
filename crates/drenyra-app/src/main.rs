@@ -227,7 +227,7 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
-fn find_in_path(binary: &str) -> Option<PathBuf> {
+pub(crate) fn find_in_path(binary: &str) -> Option<PathBuf> {
     let path_var = env::var_os("PATH")?;
     for dir in env::split_paths(&path_var) {
         let candidate = dir.join(binary);

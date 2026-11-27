@@ -4,6 +4,7 @@ use drenyra_protocol::{MoneyCents, RiskTier};
 use drenyra_ui::{EntryDiffReview, LineDecision};
 use drenyra_workspace::{PaneKind, PaneNode, SplitAxis, WorkspaceActivity};
 
+use super::agent_pane::{AgentPane, AgentStatus, TranscriptEntry};
 use super::theme::ThemeId;
 use crate::controller::DrenyraHostController;
 
@@ -102,6 +103,59 @@ pub struct ReviewPanel {
     pub approved_by: Option<String>,
 }
 
+/// Transcript entries rendered per frame (the pane keeps more; the oldest scroll out first).
+pub const VISIBLE_TRANSCRIPT: usize = 200;
+
+/// How the agent status chip is colored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusTone {
+    Muted,
+    Busy,
+    Ok,
+    Warning,
+    Error,
+}
+
+/// The Fiscal Agent pane of the active workspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentPaneView {
+    pub status_label: String,
+    pub status_tone: StatusTone,
+    pub model: Option<String>,
+    pub transcript: Vec<TranscriptEntry>,
+    pub streaming_text: String,
+    pub composer: String,
+    pub composer_active: bool,
+    pub can_send: bool,
+}
+
+impl AgentPaneView {
+    pub fn from_pane(pane: &AgentPane, composer_active: bool) -> Self {
+        let (status_label, status_tone) = match pane.status() {
+            AgentStatus::NotStarted => ("Not started".to_owned(), StatusTone::Muted),
+            AgentStatus::Starting => ("Starting agent".to_owned(), StatusTone::Busy),
+            AgentStatus::Ready => ("Ready".to_owned(), StatusTone::Ok),
+            AgentStatus::Running => ("Working".to_owned(), StatusTone::Busy),
+            AgentStatus::Stopped(reason) => (format!("Stopped: {reason}"), StatusTone::Warning),
+            AgentStatus::Unavailable(reason) => {
+                (format!("Unavailable: {reason}"), StatusTone::Error)
+            }
+        };
+        let transcript = pane.transcript();
+        let start = transcript.len().saturating_sub(VISIBLE_TRANSCRIPT);
+        Self {
+            status_label,
+            status_tone,
+            model: pane.model().map(str::to_owned),
+            transcript: transcript[start..].to_vec(),
+            streaming_text: pane.streaming_text().to_owned(),
+            composer: pane.composer().to_owned(),
+            composer_active,
+            can_send: pane.accepts_prompts(),
+        }
+    }
+}
+
 /// One theme choice in Settings › Themes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ThemeOption {
@@ -134,6 +188,8 @@ pub struct ShellViewModel {
     pub theme: ThemeId,
     /// The Settings overlay, when open.
     pub settings: Option<SettingsPanel>,
+    /// The active workspace's Fiscal Agent pane.
+    pub agent: Option<AgentPaneView>,
 }
 
 impl ShellViewModel {
@@ -189,6 +245,7 @@ impl ShellViewModel {
             demo,
             theme: ThemeId::default(),
             settings: None,
+            agent: None,
         }
     }
 

@@ -19,7 +19,7 @@ Assumptions (marked): keys keep Ctrl on Linux; the selected theme persists acros
 | T0 | Map theme palettes and agent RPC protocol | S1, S2 | delegated (2 read-only explorers, mapping trigger: two unfamiliar external sources) | done | L3 |
 | T1 | Theme tokens (light/dark) + window uses tokens only | S2, S3 | inline | done | see L4 |
 | T2 | Settings section with Themes selector | S2 | inline | done | see L4 |
-| T3 | Live agent session protocol + pane (prompt input, streamed output, failure states) | S1 | inline | pending | — |
+| T3 | Live agent session protocol + pane (prompt input, streamed output, failure states) | S1 | inline | done (a: `4150a5b8`; b: see L6) | — |
 | T4 | Approval command/dialog | S4 | inline | pending | — |
 | T5 | Command palette | S4 | inline | pending | — |
 | T6 | Sidebar | S4 | inline | pending | — |
@@ -49,3 +49,10 @@ Assumptions (marked): keys keep Ctrl on Linux; the selected theme persists acros
   - Policy: extension dialogs are answered `cancelled: true` (never grants) and forwarded so the pane shows them, until the window renders dialogs.
   - Architecture doc corrected: the agent protocol is not JSON-RPC 2.0; `drenyra-shell` is a pi package.
   - Risk: items 4 (threads sharing the agent's stdin) and 5 (new dependency) → independent verifier.
+- **L6 — 2026-11-27 T3b live agent pane.**
+  - RED → GREEN: composer/agent integration (25 compile errors → 3 tests); `AgentPane` and `agent_launch` tests were written with the implementation (no RED observed).
+  - One `AgentPane` and one `pi --mode rpc` process per workspace index (tenant isolation, tested: a prompt in Andino never reaches Sierra's pane or outbox). The window polls every 40 ms, starts the active workspace's agent lazily, sends queued commands, applies updates.
+  - Keyboard: unmodified keys are bound only in the `DrenyraShell` key context; while composing the root switches to `DrenyraComposer`, so letters reach `on_key_down` and the composer.
+  - Live (pi 1.6.0, real extensions): pane showed `openai/gpt-6.1-sol` + Ready and the extensions' notify messages; typing "saldo de caja jk ar" went to the composer without moving the review cursor or accepting lines; Ctrl+Q exited 0 and both child processes were gone (no orphans). No prompt was sent (it would call a paid model): sending, streaming and stop are covered by fake-agent and pane tests only.
+  - Checks: 131 tests headless / 130 with features; clippy `-D warnings` both ways; fmt.
+  - Risk: item 4 (window polls sessions owned by the UI thread; per-unit verifier already running on T3a covers the shared-stdin client). This unit touches no shared contract.
