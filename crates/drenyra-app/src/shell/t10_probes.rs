@@ -2,16 +2,18 @@
 //! the independent verifier's findings (its scratch files were lost) and its advisories A1/A2.
 //!
 //! 1. Every refused operation leaves the controller's `Debug` snapshot identical and appends no
-//!    evidence.
+//!    evidence. The controllers use a fixed clock, whose next reading is part of that snapshot,
+//!    so a refused operation that read the clock would show up too.
 //! 2. Evidence `seq` is strictly increasing 1..=n across workspaces and every event lands under
 //!    the key of the workspace that owns its proposal, even when another workspace is active.
+//!    Each event reads the clock exactly once: its time is `start + (seq - 1) * step`.
 //! 3. A1: the posted record is what the `ledger_post` frame carried. A2: an open overlay blocks
 //!    workspace switches, and the approval dialog compares against the approver it showed.
 
 use super::commands::{ShellCommand, ShellState, APPROVAL_CLEARED_MESSAGE};
 use super::demo::{demo_controller, demo_proposal, demo_workspace};
 use super::view_model::Rect;
-use crate::controller::{DrenyraHostController, EvidenceKind};
+use crate::controller::{Clock, DrenyraHostController, EvidenceKind};
 use drenyra_protocol::JournalEntryProposal;
 use drenyra_ui::{ReplaceApprovalError, MAX_APPROVER_ID_CHARS};
 use drenyra_workspace::{FiscalWorkspace, WorkspaceKey};
@@ -25,6 +27,10 @@ const WIDE: Rect = Rect {
 const DEMO_ID: &str = "je-demo-2026-10-001";
 const SIERRA: (&str, &str, &str) = ("20987654321", "Sierra SRL", "2026-11");
 
+/// Fixed clock of the probe controllers: 2026-11-27T00:00:00Z, one second per reading.
+const CLOCK_START_MS: u64 = 1_795_737_600_000;
+const CLOCK_STEP_MS: u64 = 1_000;
+
 fn andino_key() -> WorkspaceKey {
     demo_workspace().key()
 }
@@ -35,7 +41,8 @@ fn sierra_key() -> WorkspaceKey {
 
 /// Andino (active, index 0) and Sierra (index 1), nothing staged.
 fn two_empty_workspaces() -> DrenyraHostController {
-    let mut controller = DrenyraHostController::new(demo_workspace());
+    let clock = Clock::fixed(CLOCK_START_MS, CLOCK_STEP_MS);
+    let mut controller = DrenyraHostController::with_clock(demo_workspace(), clock);
     controller
         .workspaces_mut()
         .add_workspace(FiscalWorkspace::new(SIERRA.0, SIERRA.1, SIERRA.2))
@@ -264,6 +271,13 @@ fn evidence_seq_is_one_to_n_across_workspaces_and_each_event_lands_under_its_own
                 proposal_id(&event.kind),
                 owned_id,
                 "{event:?} under {key:?}"
+            );
+        }
+        for event in events {
+            assert_eq!(
+                event.recorded_at_ms,
+                CLOCK_START_MS + (event.seq - 1) * CLOCK_STEP_MS,
+                "one clock reading per event: {event:?}"
             );
         }
         all.extend(events.iter().map(|event| event.seq));

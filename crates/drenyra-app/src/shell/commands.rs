@@ -1887,7 +1887,9 @@ mod tests {
 
     #[test]
     fn evidence_lists_the_active_workspace_s_events_newest_first() {
-        let mut s = state();
+        // 2026-11-27T23:59:55Z, one second per event: the log crosses midnight UTC.
+        let clock = crate::controller::Clock::fixed(1_795_823_995_000, 1_000);
+        let mut s = ShellState::new(demo::demo_controller_with_clock(clock), true);
         accept_every_line(&mut s);
         approve_from_dialog(&mut s, "CPA-1");
         approve_from_dialog(&mut s, "CPA-2");
@@ -1903,13 +1905,13 @@ mod tests {
         assert_eq!(
             evidence.entries,
             vec![
-                "#7  Posted je-demo-2026-10-001 (request 1)",
-                "#6  Post requested for je-demo-2026-10-001 (request 1)",
-                "#5  Approved je-demo-2026-10-001 by CPA-PERU-001",
-                "#4  Approval of je-demo-2026-10-001 by CPA-2 cleared by a line change",
-                "#3  Approval of je-demo-2026-10-001 by CPA-1 replaced by CPA-2",
-                "#2  Approved je-demo-2026-10-001 by CPA-1",
-                "#1  Staged je-demo-2026-10-001 (R2 Material)",
+                "#7  00:00:01Z  Posted je-demo-2026-10-001 (request 1)",
+                "#6  00:00:00Z  Post requested for je-demo-2026-10-001 (request 1)",
+                "#5  23:59:59Z  Approved je-demo-2026-10-001 by CPA-PERU-001",
+                "#4  23:59:58Z  Approval of je-demo-2026-10-001 by CPA-2 cleared by a line change",
+                "#3  23:59:57Z  Approval of je-demo-2026-10-001 by CPA-1 replaced by CPA-2",
+                "#2  23:59:56Z  Approved je-demo-2026-10-001 by CPA-1",
+                "#1  23:59:55Z  Staged je-demo-2026-10-001 (R2 Material)",
             ]
         );
         assert_eq!(evidence.empty_message, None);

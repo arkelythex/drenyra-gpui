@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use drenyra_protocol::{
     escape_json_str, JournalEntryProposal, JsonRpcRequest, ProtocolError, RiskTier,
@@ -49,10 +50,51 @@ pub enum EvidenceKind {
 ///
 /// `seq` is global to the controller (shared by every workspace), starts at 1 and increases by
 /// one per event, so events from different workspaces can be ordered against each other.
+/// `recorded_at_ms` is when the event was recorded, in Unix milliseconds (UTC), read once from
+/// the controller's [`Clock`]. Order events by `seq`: the system wall clock can step backwards.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvidenceEvent {
     pub seq: u64,
+    pub recorded_at_ms: u64,
     pub kind: EvidenceKind,
+}
+
+/// Where the controller reads the time it stamps on evidence events (Unix milliseconds, UTC).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Clock {
+    /// The operating system's wall clock (not monotonic). A time before 1970 reads as 0 and one
+    /// beyond `u64::MAX` milliseconds as `u64::MAX`.
+    #[default]
+    System,
+    /// Deterministic clock: the first reading is `next_ms`, each reading then advances it by
+    /// `step_ms`, saturating at `u64::MAX`. Build it with [`Clock::fixed`].
+    Fixed { next_ms: u64, step_ms: u64 },
+}
+
+impl Clock {
+    /// A deterministic clock that reads `start_ms` first and then advances by `step_ms` per read.
+    pub const fn fixed(start_ms: u64, step_ms: u64) -> Self {
+        Self::Fixed {
+            next_ms: start_ms,
+            step_ms,
+        }
+    }
+
+    /// Current time in Unix milliseconds (UTC); a fixed clock advances by its step.
+    pub fn now_ms(&mut self) -> u64 {
+        match self {
+            Self::System => SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| {
+                    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+                }),
+            Self::Fixed { next_ms, step_ms } => {
+                let now = *next_ms;
+                *next_ms = now.saturating_add(*step_ms);
+                now
+            }
+        }
+    }
 }
 
 /// A journal entry whose `ledger_post` the transport confirmed in this session, exactly as the
@@ -135,7 +177,8 @@ impl From<ProtocolError> for ControllerError {
 ///
 /// Every review mutation that matters for audit (staging, approving, replacing or clearing an
 /// approval, building and confirming a post) goes through this controller and appends to an
-/// append-only evidence log keyed by the owning workspace's RUC and period. The log and the
+/// append-only evidence log keyed by the owning workspace's RUC and period; each event carries
+/// a sequence number and the UTC time read from the controller's [`Clock`]. The log and the
 /// posted-entry list are **in memory and session-only**: nothing is persisted, signed or sent
 /// anywhere, so they are an operator aid, not a fiscal receipt (signed receipts belong to
 /// `drenyra-ai`).
@@ -151,12 +194,21 @@ pub struct DrenyraHostController {
     /// Session evidence log per workspace identity (append-only, unsigned, not persisted).
     evidence: BTreeMap<WorkspaceKey, Vec<EvidenceEvent>>,
     next_evidence_seq: u64,
+    /// Time source for evidence events; read only when an event is appended.
+    clock: Clock,
     /// Entries posted in this session per workspace identity (not persisted).
     posted: BTreeMap<WorkspaceKey, Vec<PostedEntry>>,
 }
 
 impl DrenyraHostController {
+    /// Controller whose evidence events are stamped by the system clock.
     pub fn new(initial_workspace: FiscalWorkspace) -> Self {
+        Self::with_clock(initial_workspace, Clock::System)
+    }
+
+    /// Controller whose evidence events are stamped by `clock` (for example [`Clock::fixed`] in
+    /// tests). The clock is set once, before any event, and never changes afterwards.
+    pub fn with_clock(initial_workspace: FiscalWorkspace, clock: Clock) -> Self {
         Self {
             workspaces: WorkspaceManager::new(initial_workspace),
             reviews: BTreeMap::new(),
@@ -165,6 +217,7 @@ impl DrenyraHostController {
             next_request_id: 1,
             evidence: BTreeMap::new(),
             next_evidence_seq: 1,
+            clock,
             posted: BTreeMap::new(),
         }
     }
@@ -190,10 +243,12 @@ impl DrenyraHostController {
     fn log(&mut self, owner: WorkspaceKey, kind: EvidenceKind) {
         let seq = self.next_evidence_seq;
         self.next_evidence_seq = seq.saturating_add(1);
-        self.evidence
-            .entry(owner)
-            .or_default()
-            .push(EvidenceEvent { seq, kind });
+        let recorded_at_ms = self.clock.now_ms();
+        self.evidence.entry(owner).or_default().push(EvidenceEvent {
+            seq,
+            recorded_at_ms,
+            kind,
+        });
     }
 
     /// Records the first human approval of the active workspace's staged review and logs it.
@@ -1159,6 +1214,103 @@ mod tests {
         );
         assert!(controller.evidence(&key_b).is_empty());
         assert!(controller.posted(&key_a).is_empty());
+    }
+
+    #[test]
+    fn fixed_clock_returns_start_then_advances_by_step_and_saturates() {
+        let mut clock = Clock::fixed(1_000, 250);
+        assert_eq!(
+            [clock.now_ms(), clock.now_ms(), clock.now_ms()],
+            [1_000, 1_250, 1_500]
+        );
+        let mut frozen = Clock::fixed(42, 0);
+        assert_eq!([frozen.now_ms(), frozen.now_ms()], [42, 42]);
+        let mut edge = Clock::fixed(u64::MAX - 1, 5);
+        assert_eq!([edge.now_ms(), edge.now_ms()], [u64::MAX - 1, u64::MAX]);
+        assert_eq!(edge.now_ms(), u64::MAX, "saturates instead of wrapping");
+        assert_eq!(Clock::default(), Clock::System);
+    }
+
+    #[test]
+    fn evidence_events_carry_the_clock_time_and_refusals_never_read_the_clock() {
+        let ws = FiscalWorkspace::new("20123456789", "Andino SAC", "2026-10");
+        let key = ws.key();
+        let mut controller = DrenyraHostController::with_clock(ws, Clock::fixed(1_000, 250));
+        controller
+            .stage_proposal(sample_proposal("je-001", RiskTier::R2Material, true))
+            .expect("stage");
+        // Refused (blank ID, unknown line): no clock reading. Accepting lines clears no
+        // approval, so it logs nothing either.
+        assert!(!controller.approve_active("   "));
+        assert!(!controller.accept_active_line(99));
+        for line in 0..3 {
+            assert!(controller.accept_active_line(line));
+        }
+        assert!(controller.approve_active("CPA-1"));
+        controller.build_post_request().expect("frame");
+        assert_eq!(controller.confirm_posted(1), Ok(()));
+
+        let id = || "je-001".to_owned();
+        assert_eq!(
+            controller.evidence(&key),
+            &[
+                EvidenceEvent {
+                    seq: 1,
+                    recorded_at_ms: 1_000,
+                    kind: EvidenceKind::Staged {
+                        proposal_id: id(),
+                        risk_tier: RiskTier::R2Material
+                    }
+                },
+                EvidenceEvent {
+                    seq: 2,
+                    recorded_at_ms: 1_250,
+                    kind: EvidenceKind::Approved {
+                        proposal_id: id(),
+                        approver: "CPA-1".into()
+                    }
+                },
+                EvidenceEvent {
+                    seq: 3,
+                    recorded_at_ms: 1_500,
+                    kind: EvidenceKind::PostRequested {
+                        proposal_id: id(),
+                        request_id: 1
+                    }
+                },
+                EvidenceEvent {
+                    seq: 4,
+                    recorded_at_ms: 1_750,
+                    kind: EvidenceKind::Posted {
+                        proposal_id: id(),
+                        request_id: 1
+                    }
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn new_stamps_events_with_the_system_clock() {
+        let system_ms = || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_millis())
+                .expect("system clock after 1970")
+        };
+        let ws = FiscalWorkspace::new("20123456789", "Andino SAC", "2026-10");
+        let key = ws.key();
+        let mut controller = DrenyraHostController::new(ws);
+        let before = system_ms();
+        controller
+            .stage_proposal(sample_proposal("je-001", RiskTier::R2Material, true))
+            .expect("stage");
+        let after = system_ms();
+        let recorded = u128::from(controller.evidence(&key)[0].recorded_at_ms);
+        assert!(
+            (before..=after).contains(&recorded),
+            "{recorded} outside {before}..={after}"
+        );
     }
 
     #[test]
