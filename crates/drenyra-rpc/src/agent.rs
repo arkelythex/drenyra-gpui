@@ -9,14 +9,15 @@
 //!
 //! Dialog requests from extensions (`select`, `confirm`, `input`, `editor`) block the agent until
 //! answered. Until the window can render them, [`AgentSession`] answers each one with
-//! `cancelled: true` and still forwards it, so the operator sees what was asked. Cancelling
-//! never grants anything: an extension that asks for confirmation gets a refusal.
+//! `cancelled: true` and still forwards it, so the operator sees what was asked. The window
+//! never answers on the operator's behalf; what an extension does after a cancelled dialog is
+//! up to that extension.
 
 use std::fmt;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -369,8 +370,11 @@ impl AgentSession {
                                 id, dialog: true, ..
                             } = &event
                             {
-                                // Best effort: if stdin is gone the agent is exiting anyway.
-                                let _ = write_line(&reply_writer, &cancel_dialog_response(id));
+                                // A dialog without an id cannot be answered. Best effort: if
+                                // stdin is gone the agent is exiting anyway.
+                                if !id.is_empty() {
+                                    let _ = write_line(&reply_writer, &cancel_dialog_response(id));
+                                }
                             }
                             AgentUpdate::Event(event)
                         }
@@ -424,25 +428,47 @@ impl AgentSession {
 
 impl Drop for AgentSession {
     /// Closes stdin (the agent's shutdown signal), waits up to the grace period, then kills.
+    ///
+    /// The reader thread may hold the writer while a dialog answer is blocked on a full pipe
+    /// (an agent that stopped reading stdin). Drop never waits on that lock past the grace
+    /// period: it kills the agent, which fails the blocked write and frees the lock.
     fn drop(&mut self) {
-        drop(
-            self.writer
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take(),
-        );
         let deadline = Instant::now() + self.shutdown_grace;
-        let exited = loop {
-            match self.child.try_wait() {
-                Ok(Some(_)) => break true,
-                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
-                Ok(None) | Err(_) => break false,
+        let mut killed = false;
+        loop {
+            match self.writer.try_lock() {
+                Ok(mut guard) => {
+                    guard.take();
+                    break;
+                }
+                Err(TryLockError::Poisoned(poisoned)) => {
+                    poisoned.into_inner().take();
+                    break;
+                }
+                Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(TryLockError::WouldBlock) => {
+                    let _ = self.child.kill();
+                    killed = true;
+                    break;
+                }
             }
-        };
+        }
+        let exited = killed
+            || loop {
+                match self.child.try_wait() {
+                    Ok(Some(_)) => break true,
+                    Ok(None) if Instant::now() < deadline => {
+                        thread::sleep(Duration::from_millis(10))
+                    }
+                    Ok(None) | Err(_) => break false,
+                }
+            };
         if !exited {
             let _ = self.child.kill();
-            let _ = self.child.wait();
         }
+        let _ = self.child.wait();
         let join_deadline = Instant::now() + Duration::from_millis(100);
         for handle in self.threads.drain(..) {
             while !handle.is_finished() && Instant::now() < join_deadline {
@@ -797,5 +823,169 @@ done
             )),
             Err(RpcError::Io(_))
         ));
+    }
+
+    // Regression tests adopted from the independent verifier (T3a).
+
+    #[test]
+    fn drop_kills_an_agent_that_ignores_stdin_eof_after_the_grace() {
+        let session = fake_agent("trap '' TERM; exec sleep 30");
+        let started = Instant::now();
+        drop(session);
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(450),
+            "waited the grace: {took:?}"
+        );
+        assert!(
+            took < Duration::from_secs(2),
+            "killed after grace: {took:?}"
+        );
+    }
+
+    #[test]
+    fn drop_finishes_while_a_dialog_answer_write_is_blocked() {
+        // The agent never reads stdin: the caller fills the pipe, then a dialog makes the reader
+        // thread block in write while holding the writer lock. Drop must still finish.
+        let session = fake_agent("sleep 0.3; echo '{\"type\":\"extension_ui_request\",\"id\":\"d\",\"method\":\"confirm\",\"title\":\"t\"}'; trap '' TERM; exec sleep 30");
+        session.send(&"x".repeat(65_530)).expect("fits in the pipe");
+        thread::sleep(Duration::from_millis(800));
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let started = Instant::now();
+            drop(session);
+            let _ = tx.send(started.elapsed());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "Drop hung while the dialog answer write was blocked"
+        );
+    }
+
+    #[test]
+    fn concurrent_sends_while_the_reader_answers_many_dialogs_do_not_deadlock() {
+        let script = r#"
+i=0
+while [ $i -lt 200 ]; do echo "{\"type\":\"extension_ui_request\",\"id\":\"d-$i\",\"method\":\"select\",\"title\":\"t\"}"; i=$((i+1)); done
+n=0
+while read line; do n=$((n+1)); if [ $n -ge 400 ]; then echo "{\"type\":\"agent_settled\",\"aborted\":false}"; fi; done
+"#;
+        let session = fake_agent(script);
+        for i in 0..200 {
+            session
+                .send(&get_state_command(&format!("s-{i}")))
+                .expect("send");
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut dialogs = 0;
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "deadlock: only {dialogs} dialogs"
+            );
+            match session.recv_timeout(Duration::from_secs(5)) {
+                Some(AgentUpdate::Event(AgentEvent::UiRequest { .. })) => dialogs += 1,
+                Some(AgentUpdate::Event(AgentEvent::Settled { .. })) => break,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(dialogs, 200);
+    }
+
+    #[test]
+    fn crlf_and_blank_lines_are_tolerated_and_id_less_dialogs_get_no_answer() {
+        // The first stdin line the agent reads must be the answer to dialog "d", which proves
+        // the id-less dialog before it was not answered.
+        let script = r#"
+printf '{"type":"agent_start"}\r\n'
+printf '\n\r\n   \n'
+printf '{"type":"extension_ui_request","method":"confirm","title":"no id"}\n'
+printf '{"type":"extension_ui_request","id":"d","method":"confirm","title":"with id"}\n'
+read answer
+case "$answer" in *'"id":"d"'*) echo '{"type":"response","command":"first-answer-is-d","success":true}';; *) echo '{"type":"response","command":"unexpected-answer","success":false}';; esac
+"#;
+        let session = fake_agent(script);
+        assert_eq!(next(&session), AgentUpdate::Event(AgentEvent::RunStarted));
+        assert!(matches!(
+            next(&session),
+            AgentUpdate::Event(AgentEvent::UiRequest { id, .. }) if id.is_empty()
+        ));
+        assert!(matches!(
+            next(&session),
+            AgentUpdate::Event(AgentEvent::UiRequest { id, .. }) if id == "d"
+        ));
+        assert!(matches!(
+            next(&session),
+            AgentUpdate::Event(AgentEvent::Response { command, success: true, .. })
+                if command == "first-answer-is-d"
+        ));
+        assert_eq!(next(&session), AgentUpdate::Exited);
+    }
+
+    #[test]
+    fn oversized_and_non_utf8_records_stop_the_session() {
+        let mut config = AgentSessionConfig::new(
+            "sh",
+            vec![
+                "-c".into(),
+                "printf '{\"type\":\"agent_start\"}\\n'; head -c 2000 /dev/zero | tr '\\0' a; printf '\\n{\"type\":\"agent_start\"}\\n'; sleep 3".into(),
+            ],
+        );
+        config.max_record_bytes = 1000;
+        config.shutdown_grace = Duration::from_millis(200);
+        let session = AgentSession::spawn(&config).expect("spawn");
+        assert_eq!(next(&session), AgentUpdate::Event(AgentEvent::RunStarted));
+        let update = next(&session);
+        assert!(
+            matches!(&update, AgentUpdate::Failed(m) if m.contains("1000")),
+            "{update:?}"
+        );
+        assert_eq!(session.recv_timeout(Duration::from_millis(300)), None);
+        assert!(session.drain().is_empty());
+
+        let bad = fake_agent("printf '{\"type\":\"agent_\\377\"}\\n'; sleep 3");
+        assert!(matches!(next(&bad), AgentUpdate::Failed(_)));
+    }
+
+    #[test]
+    fn exit_mid_run_ends_updates_and_later_sends_error() {
+        let session = fake_agent("echo '{\"type\":\"agent_start\"}'; echo '{\"type\":\"message_update\",\"assistantMessageEvent\":{\"type\":\"text_delta\",\"delta\":\"x\"}}'; exit 3");
+        assert_eq!(next(&session), AgentUpdate::Event(AgentEvent::RunStarted));
+        assert_eq!(
+            next(&session),
+            AgentUpdate::Event(AgentEvent::TextDelta("x".into()))
+        );
+        assert_eq!(next(&session), AgentUpdate::Exited);
+        thread::sleep(Duration::from_millis(100));
+        assert!(session.drain().is_empty());
+        assert_eq!(session.recv_timeout(Duration::from_millis(50)), None);
+        let mut err = None;
+        for _ in 0..50 {
+            if let Err(e) = session.send(&get_state_command("x")) {
+                err = Some(e);
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(err.is_some(), "send to an exited agent eventually errors");
+    }
+
+    #[test]
+    fn long_records_under_the_cap_parse() {
+        let big = "a".repeat(200_000);
+        let session = fake_agent("printf '{\"type\":\"message_update\",\"assistantMessageEvent\":{\"type\":\"text_delta\",\"delta\":\"'; head -c 200000 /dev/zero | tr '\\0' a; printf '\"}}\\n'");
+        assert_eq!(
+            next(&session),
+            AgentUpdate::Event(AgentEvent::TextDelta(big))
+        );
+    }
+
+    #[test]
+    fn unicode_line_separators_are_not_record_boundaries() {
+        let session = fake_agent("printf '{\"type\":\"message_update\",\"assistantMessageEvent\":{\"type\":\"text_delta\",\"delta\":\"a\\342\\200\\250b\"}}\\n'");
+        assert_eq!(
+            next(&session),
+            AgentUpdate::Event(AgentEvent::TextDelta("a\u{2028}b".into()))
+        );
     }
 }
