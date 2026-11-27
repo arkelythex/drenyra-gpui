@@ -6,8 +6,64 @@ use std::fmt;
 use drenyra_protocol::{
     escape_json_str, JournalEntryProposal, JsonRpcRequest, ProtocolError, RiskTier,
 };
-use drenyra_ui::{EntryDiffReview, ReconciliationTable};
-use drenyra_workspace::{FiscalWorkspace, WorkspaceActivity, WorkspaceManager};
+use drenyra_ui::{EntryDiffReview, ReconciliationTable, ReplaceApprovalError};
+use drenyra_workspace::{FiscalWorkspace, WorkspaceActivity, WorkspaceKey, WorkspaceManager};
+
+/// What happened to a staged journal entry, as recorded in the session evidence log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EvidenceKind {
+    /// The proposal was staged for human review.
+    Staged {
+        proposal_id: String,
+        risk_tier: RiskTier,
+    },
+    /// A human approval was recorded where none existed.
+    Approved {
+        proposal_id: String,
+        approver: String,
+    },
+    /// An existing approval was explicitly replaced by a different approver.
+    ApprovalReplaced {
+        proposal_id: String,
+        previous: String,
+        approver: String,
+    },
+    /// A line decision changed, which cleared the recorded approval.
+    ApprovalCleared {
+        proposal_id: String,
+        previous: String,
+    },
+    /// A `ledger_post` frame was built (one event per frame, retries included).
+    PostRequested {
+        proposal_id: String,
+        request_id: u64,
+    },
+    /// The transport confirmed the `ledger_post` request.
+    Posted {
+        proposal_id: String,
+        request_id: u64,
+    },
+}
+
+/// One entry of the session evidence log.
+///
+/// `seq` is global to the controller (shared by every workspace), starts at 1 and increases by
+/// one per event, so events from different workspaces can be ordered against each other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvidenceEvent {
+    pub seq: u64,
+    pub kind: EvidenceKind,
+}
+
+/// A journal entry whose `ledger_post` the transport confirmed in this session, captured just
+/// before its review is removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostedEntry {
+    pub proposal: JournalEntryProposal,
+    /// `None` for tiers that need no human approval.
+    pub approved_by: Option<String>,
+    pub request_id: u64,
+}
 
 /// Errors produced by [`DrenyraHostController`] when gating or framing host operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +123,13 @@ impl From<ProtocolError> for ControllerError {
 ///
 /// Reviews are tenant-scoped: each workspace (entity RUC + fiscal period) owns at most one
 /// staged review, which is only visible and postable while that workspace is active.
+///
+/// Every review mutation that matters for audit (staging, approving, replacing or clearing an
+/// approval, building and confirming a post) goes through this controller and appends to an
+/// append-only evidence log keyed by the owning workspace's RUC and period. The log and the
+/// posted-entry list are **in memory and session-only**: nothing is persisted, signed or sent
+/// anywhere, so they are an operator aid, not a fiscal receipt (signed receipts belong to
+/// `drenyra-ai`).
 #[derive(Debug, Clone)]
 pub struct DrenyraHostController {
     workspaces: WorkspaceManager,
@@ -75,6 +138,11 @@ pub struct DrenyraHostController {
     pending_posts: BTreeMap<usize, u64>,
     reconciliation: ReconciliationTable,
     next_request_id: u64,
+    /// Session evidence log per workspace identity (append-only, unsigned, not persisted).
+    evidence: BTreeMap<WorkspaceKey, Vec<EvidenceEvent>>,
+    next_evidence_seq: u64,
+    /// Entries posted in this session per workspace identity (not persisted).
+    posted: BTreeMap<WorkspaceKey, Vec<PostedEntry>>,
 }
 
 impl DrenyraHostController {
@@ -85,7 +153,110 @@ impl DrenyraHostController {
             pending_posts: BTreeMap::new(),
             reconciliation: ReconciliationTable::default(),
             next_request_id: 1,
+            evidence: BTreeMap::new(),
+            next_evidence_seq: 1,
+            posted: BTreeMap::new(),
         }
+    }
+
+    /// Session evidence log of the workspace `key`, oldest first; empty when nothing happened.
+    /// In memory only: it is neither persisted nor signed.
+    pub fn evidence(&self, key: &WorkspaceKey) -> &[EvidenceEvent] {
+        self.evidence.get(key).map_or(&[], Vec::as_slice)
+    }
+
+    /// Entries of the workspace `key` whose post was confirmed in this session, oldest first.
+    /// In memory only: it is neither persisted nor signed.
+    pub fn posted(&self, key: &WorkspaceKey) -> &[PostedEntry] {
+        self.posted.get(key).map_or(&[], Vec::as_slice)
+    }
+
+    /// Identity of the workspace that owns `proposal`: its RUC and period, which matched the
+    /// active workspace when it was staged.
+    fn owner_key(proposal: &JournalEntryProposal) -> WorkspaceKey {
+        WorkspaceKey::new(&proposal.entity_ruc, &proposal.fiscal_period)
+    }
+
+    fn log(&mut self, owner: WorkspaceKey, kind: EvidenceKind) {
+        let seq = self.next_evidence_seq;
+        self.next_evidence_seq = seq.saturating_add(1);
+        self.evidence
+            .entry(owner)
+            .or_default()
+            .push(EvidenceEvent { seq, kind });
+    }
+
+    /// Records the first human approval of the active workspace's staged review and logs it.
+    /// Returns `false` and logs nothing when there is no staged review, the ID is invalid, or an
+    /// approval already exists (replacing one needs [`Self::replace_active_approval`]).
+    pub fn approve_active(&mut self, approver: &str) -> bool {
+        let Some(review) = self.active_review_mut_inner() else {
+            return false;
+        };
+        if !review.record_human_approval(approver) {
+            return false;
+        }
+        let owner = Self::owner_key(review.proposal());
+        let kind = EvidenceKind::Approved {
+            proposal_id: review.proposal().id.clone(),
+            approver: review.approved_by().unwrap_or_default().to_owned(),
+        };
+        self.log(owner, kind);
+        true
+    }
+
+    /// Replaces the active review's approver (see [`EntryDiffReview::replace_human_approval`])
+    /// and logs both IDs. Without a staged review it fails with
+    /// [`ReplaceApprovalError::NothingToReplace`]. On error nothing changes and nothing is logged.
+    pub fn replace_active_approval(
+        &mut self,
+        expected_previous: &str,
+        approver: &str,
+    ) -> Result<(), ReplaceApprovalError> {
+        let review = self
+            .active_review_mut_inner()
+            .ok_or(ReplaceApprovalError::NothingToReplace)?;
+        review.replace_human_approval(expected_previous, approver)?;
+        let owner = Self::owner_key(review.proposal());
+        let kind = EvidenceKind::ApprovalReplaced {
+            proposal_id: review.proposal().id.clone(),
+            previous: expected_previous.to_owned(),
+            approver: review.approved_by().unwrap_or_default().to_owned(),
+        };
+        self.log(owner, kind);
+        Ok(())
+    }
+
+    /// Accepts line `idx` of the active review; logs [`EvidenceKind::ApprovalCleared`] when the
+    /// change cleared an approval. Returns `false` without a staged review or for an unknown line.
+    pub fn accept_active_line(&mut self, idx: usize) -> bool {
+        self.decide_active_line(|review| review.accept_line(idx))
+    }
+
+    /// Rejects line `idx` of the active review with `comment`; logs
+    /// [`EvidenceKind::ApprovalCleared`] when the change cleared an approval. Returns `false`
+    /// without a staged review, for an unknown line or for a blank comment.
+    pub fn reject_active_line(&mut self, idx: usize, comment: &str) -> bool {
+        self.decide_active_line(|review| review.reject_line(idx, comment))
+    }
+
+    fn decide_active_line(&mut self, decide: impl FnOnce(&mut EntryDiffReview) -> bool) -> bool {
+        let Some(review) = self.active_review_mut_inner() else {
+            return false;
+        };
+        let previous = review.approved_by().map(str::to_owned);
+        if !decide(review) {
+            return false;
+        }
+        if let (Some(previous), None) = (previous, review.approved_by()) {
+            let owner = Self::owner_key(review.proposal());
+            let kind = EvidenceKind::ApprovalCleared {
+                proposal_id: review.proposal().id.clone(),
+                previous,
+            };
+            self.log(owner, kind);
+        }
+        true
     }
 
     pub fn workspaces(&self) -> &WorkspaceManager {
@@ -111,6 +282,11 @@ impl DrenyraHostController {
         }
 
         let risk_tier = proposal.risk_tier;
+        let staged = EvidenceKind::Staged {
+            proposal_id: proposal.id.clone(),
+            risk_tier,
+        };
+        self.log(Self::owner_key(&proposal), staged);
         self.reviews.insert(index, EntryDiffReview::new(proposal));
         let active = self.workspaces.active_mut();
         active.activity = WorkspaceActivity::AwaitingApproval;
@@ -129,7 +305,14 @@ impl DrenyraHostController {
         self.reviews.get(&index)
     }
 
+    /// Direct mutable access for tests only: production code mutates reviews through the
+    /// controller methods above so every audit-relevant change reaches the evidence log.
+    #[cfg(test)]
     pub fn active_review_mut(&mut self) -> Option<&mut EntryDiffReview> {
+        self.active_review_mut_inner()
+    }
+
+    fn active_review_mut_inner(&mut self) -> Option<&mut EntryDiffReview> {
         self.reviews.get_mut(&self.workspaces.active_index())
     }
 
@@ -198,10 +381,16 @@ impl DrenyraHostController {
             params_json,
         };
         let frame = request.to_ndjson()?;
+        let owner = Self::owner_key(proposal);
+        let requested = EvidenceKind::PostRequested {
+            proposal_id: proposal.id.clone(),
+            request_id: request.id,
+        };
 
         self.pending_posts
             .insert(self.workspaces.active_index(), request.id);
         self.next_request_id = self.next_request_id.saturating_add(1);
+        self.log(owner, requested);
         Ok(frame)
     }
 
@@ -226,7 +415,19 @@ impl DrenyraHostController {
             .ok_or(ControllerError::UnknownPostRequest)?;
 
         self.pending_posts.remove(&index);
-        self.reviews.remove(&index);
+        if let Some(review) = self.reviews.remove(&index) {
+            let owner = Self::owner_key(review.proposal());
+            let posted = EvidenceKind::Posted {
+                proposal_id: review.proposal().id.clone(),
+                request_id,
+            };
+            self.log(owner.clone(), posted);
+            self.posted.entry(owner).or_default().push(PostedEntry {
+                approved_by: review.approved_by().map(str::to_owned),
+                proposal: review.proposal().clone(),
+                request_id,
+            });
+        }
         if let Some(owner) = self.workspaces.get_mut(index) {
             owner.guardrails.unposted_entries = 0;
             owner.guardrails.active_risk_tier = RiskTier::R0Read;
@@ -715,6 +916,229 @@ mod tests {
             controller.reconciliation().total_unmatched_delta(),
             Some(MoneyCents::from_cents(3_000))
         );
+    }
+
+    fn two_workspaces() -> (DrenyraHostController, WorkspaceKey, WorkspaceKey, usize) {
+        let ws_a = FiscalWorkspace::new("20123456789", "Andino SAC", "2026-10");
+        let ws_b = FiscalWorkspace::new("20987654321", "Sierra SRL", "2026-11");
+        let (key_a, key_b) = (ws_a.key(), ws_b.key());
+        let mut controller = DrenyraHostController::new(ws_a);
+        let idx_b = controller
+            .workspaces_mut()
+            .add_workspace(ws_b)
+            .expect("distinct workspace");
+        (controller, key_a, key_b, idx_b)
+    }
+
+    fn kinds(controller: &DrenyraHostController, key: &WorkspaceKey) -> Vec<EvidenceKind> {
+        controller
+            .evidence(key)
+            .iter()
+            .map(|event| event.kind.clone())
+            .collect()
+    }
+
+    #[test]
+    fn evidence_log_records_the_approval_lifecycle_on_the_owning_workspace() {
+        let (mut controller, key_a, key_b, idx_b) = two_workspaces();
+        assert!(controller.evidence(&key_a).is_empty());
+        let proposal = sample_proposal("je-001", RiskTier::R2Material, true);
+        controller.stage_proposal(proposal.clone()).expect("stage");
+        for line in 0..3 {
+            assert!(controller.accept_active_line(line));
+        }
+        assert!(controller.approve_active("  CPA-1 "));
+        assert_eq!(controller.replace_active_approval("CPA-1", "CPA-2"), Ok(()));
+        assert_eq!(
+            controller
+                .active_review()
+                .and_then(EntryDiffReview::approved_by),
+            Some("CPA-2")
+        );
+        assert!(controller.reject_active_line(0, "wrong account"));
+        assert!(controller.accept_active_line(0));
+        assert!(controller.approve_active("CPA-3"));
+        controller.build_post_request().expect("frame");
+        assert!(controller.workspaces_mut().switch_to(idx_b));
+        assert_eq!(controller.confirm_posted(1), Ok(()));
+
+        let id = || "je-001".to_owned();
+        assert_eq!(
+            kinds(&controller, &key_a),
+            vec![
+                EvidenceKind::Staged {
+                    proposal_id: id(),
+                    risk_tier: RiskTier::R2Material
+                },
+                EvidenceKind::Approved {
+                    proposal_id: id(),
+                    approver: "CPA-1".into()
+                },
+                EvidenceKind::ApprovalReplaced {
+                    proposal_id: id(),
+                    previous: "CPA-1".into(),
+                    approver: "CPA-2".into()
+                },
+                EvidenceKind::ApprovalCleared {
+                    proposal_id: id(),
+                    previous: "CPA-2".into()
+                },
+                EvidenceKind::Approved {
+                    proposal_id: id(),
+                    approver: "CPA-3".into()
+                },
+                EvidenceKind::PostRequested {
+                    proposal_id: id(),
+                    request_id: 1
+                },
+                EvidenceKind::Posted {
+                    proposal_id: id(),
+                    request_id: 1
+                },
+            ]
+        );
+        let seqs: Vec<u64> = controller.evidence(&key_a).iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![1, 2, 3, 4, 5, 6, 7]);
+        assert!(
+            controller.evidence(&key_b).is_empty(),
+            "the active workspace at confirm time gets nothing"
+        );
+        assert_eq!(
+            controller.posted(&key_a),
+            &[PostedEntry {
+                proposal,
+                approved_by: Some("CPA-3".into()),
+                request_id: 1,
+            }]
+        );
+        assert!(controller.posted(&key_b).is_empty());
+    }
+
+    #[test]
+    fn sequence_numbers_are_global_and_strictly_increasing_across_workspaces() {
+        let (mut controller, key_a, key_b, idx_b) = two_workspaces();
+        controller
+            .stage_proposal(sample_proposal("je-a", RiskTier::R1Draft, true))
+            .expect("stage A");
+        assert!(controller.workspaces_mut().switch_to(idx_b));
+        let mut sierra = sample_proposal("je-b", RiskTier::R1Draft, true);
+        (sierra.entity_ruc, sierra.fiscal_period) = ("20987654321".into(), "2026-11".into());
+        controller.stage_proposal(sierra).expect("stage B");
+        for line in 0..3 {
+            assert!(controller.accept_active_line(line));
+        }
+        controller.build_post_request().expect("first frame");
+        controller.build_post_request().expect("retry frame");
+        assert_eq!(controller.confirm_posted(2), Ok(()));
+
+        let seq_a: Vec<u64> = controller.evidence(&key_a).iter().map(|e| e.seq).collect();
+        let seq_b: Vec<u64> = controller.evidence(&key_b).iter().map(|e| e.seq).collect();
+        assert_eq!(seq_a, vec![1]);
+        assert_eq!(seq_b, vec![2, 3, 4, 5]);
+        assert_eq!(
+            kinds(&controller, &key_b)[1..],
+            [
+                EvidenceKind::PostRequested {
+                    proposal_id: "je-b".into(),
+                    request_id: 1
+                },
+                EvidenceKind::PostRequested {
+                    proposal_id: "je-b".into(),
+                    request_id: 2
+                },
+                EvidenceKind::Posted {
+                    proposal_id: "je-b".into(),
+                    request_id: 2
+                },
+            ]
+        );
+        assert_eq!(
+            controller.posted(&key_b)[0].approved_by,
+            None,
+            "R1 drafts post without an approver"
+        );
+        assert_eq!(controller.posted(&key_b)[0].request_id, 2);
+    }
+
+    #[test]
+    fn refused_operations_append_no_evidence() {
+        let (mut controller, key_a, key_b, _) = two_workspaces();
+        // No staged review.
+        assert!(!controller.approve_active("CPA-1"));
+        assert_eq!(
+            controller.replace_active_approval("CPA-1", "CPA-2"),
+            Err(ReplaceApprovalError::NothingToReplace)
+        );
+        assert!(!controller.accept_active_line(0));
+        assert!(!controller.reject_active_line(0, "x"));
+        assert!(controller.build_post_request().is_err());
+        assert!(controller.confirm_posted(1).is_err());
+        let mut foreign = sample_proposal("je-x", RiskTier::R2Material, true);
+        foreign.entity_ruc = "20987654321".into();
+        assert!(controller.stage_proposal(foreign).is_err());
+        assert!(controller.evidence(&key_a).is_empty());
+
+        controller
+            .stage_proposal(sample_proposal("je-001", RiskTier::R2Material, true))
+            .expect("stage");
+        assert!(controller
+            .stage_proposal(sample_proposal("je-002", RiskTier::R2Material, true))
+            .is_err());
+        assert!(controller.build_post_request().is_err(), "lines pending");
+        for line in 0..3 {
+            assert!(controller.accept_active_line(line));
+        }
+        assert!(!controller.approve_active("\u{200B}"));
+        assert!(!controller.approve_active("   "));
+        assert_eq!(
+            controller.replace_active_approval("CPA-1", "CPA-2"),
+            Err(ReplaceApprovalError::NothingToReplace)
+        );
+        assert!(controller.approve_active("CPA-1"));
+        assert!(
+            !controller.approve_active("CPA-2"),
+            "a second approval needs an explicit replace"
+        );
+        assert_eq!(
+            controller.replace_active_approval("CPA-9", "CPA-2"),
+            Err(ReplaceApprovalError::StaleApproval {
+                current: "CPA-1".into()
+            })
+        );
+        assert_eq!(
+            controller.replace_active_approval("CPA-1", " CPA-1 "),
+            Err(ReplaceApprovalError::SameApprover)
+        );
+        assert_eq!(
+            controller.replace_active_approval("CPA-1", "CPA\u{2066}2"),
+            Err(ReplaceApprovalError::InvalidApprover)
+        );
+        assert!(controller.accept_active_line(0), "same decision");
+        assert!(!controller.reject_active_line(0, "  "));
+        assert!(!controller.accept_active_line(99));
+        assert!(controller.confirm_posted(7).is_err());
+
+        assert_eq!(
+            kinds(&controller, &key_a),
+            vec![
+                EvidenceKind::Staged {
+                    proposal_id: "je-001".into(),
+                    risk_tier: RiskTier::R2Material
+                },
+                EvidenceKind::Approved {
+                    proposal_id: "je-001".into(),
+                    approver: "CPA-1".into()
+                },
+            ]
+        );
+        assert_eq!(
+            controller
+                .active_review()
+                .and_then(EntryDiffReview::approved_by),
+            Some("CPA-1")
+        );
+        assert!(controller.evidence(&key_b).is_empty());
+        assert!(controller.posted(&key_a).is_empty());
     }
 
     #[test]
