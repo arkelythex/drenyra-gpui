@@ -153,6 +153,10 @@ impl DrenyraHostController {
     /// after the transport succeeds, so a failed send can be retried without a new approval.
     /// Each call (including a retry) uses a fresh request id that replaces the pending one.
     ///
+    /// A retry re-sends the same `proposal_id`, so the `ledger_post` server must treat
+    /// `proposal_id` as its idempotency key: a send whose confirmation was lost must not post
+    /// the entry twice.
+    ///
     /// Fails with [`ControllerError::ProposalScopeMismatch`] if the active workspace's RUC or
     /// fiscal period changed since staging. On error, all state is left untouched.
     pub fn build_post_request(&mut self) -> Result<String, ControllerError> {
