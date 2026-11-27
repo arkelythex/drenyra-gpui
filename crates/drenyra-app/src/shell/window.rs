@@ -5,20 +5,28 @@
 //! color comes from the active theme's [`ThemeTokens`]; this module defines none of its own.
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::Duration;
 
 use gpui::{
-    actions, div, prelude::*, px, rgb, size, App, Application, Bounds, ClickEvent, Context,
-    FocusHandle, KeyBinding, Rgba, SharedString, Window, WindowBounds, WindowOptions,
+    actions, div, prelude::*, px, rgb, size, AnyElement, App, Application, Bounds, ClickEvent,
+    Context, FocusHandle, KeyBinding, KeyDownEvent, Rgba, SharedString, Window, WindowBounds,
+    WindowOptions,
 };
+
+use drenyra_rpc::agent::{AgentSession, AgentUpdate};
+
+use super::agent_pane::{agent_launch, AgentStatus, EntryRole};
 
 use super::commands::{ShellCommand, ShellState, KEY_BINDINGS};
 use super::settings::save_if_changed;
 use super::theme::{ThemeId, ThemeTokens};
 use super::view_model::{
-    pane_area, GuardrailChips, PaneTile, ReviewPanel, RowDecision, SettingsPanel, ShellViewModel,
-    ThemeOption, WorkspaceChip, FOOTER_HEIGHT, REVIEW_PANEL_WIDTH, TOP_BAR_HEIGHT,
+    pane_area, AgentPaneView, GuardrailChips, PaneTile, ReviewPanel, RowDecision, SettingsPanel,
+    ShellViewModel, StatusTone, ThemeOption, WorkspaceChip, FOOTER_HEIGHT, REVIEW_PANEL_WIDTH,
+    TOP_BAR_HEIGHT,
 };
 use crate::ui::DesktopShellConfig;
 use drenyra_workspace::{PaneKind, WorkspaceActivity};
@@ -38,6 +46,8 @@ actions!(
         OpenSettings,
         CloseOverlay,
         Confirm,
+        FocusComposer,
+        StopAgent,
         Quit
     ]
 );
@@ -46,7 +56,16 @@ actions!(
 const MONO_FONT: &str = "JetBrainsMono Nerd Font";
 
 /// Keys shown in the footer, in display order.
-const FOOTER_HINT: &str = "Ctrl+D split · Ctrl+W close · Ctrl+Shift+T undo · Ctrl+Tab next pane · Ctrl+K next workspace · J/K line · A accept · R reject · Ctrl+, settings · Ctrl+Q quit";
+const FOOTER_HINT: &str = "I ask the agent · Ctrl+D split · Ctrl+W close · Ctrl+Shift+T undo · Ctrl+Tab next pane · Ctrl+K next workspace · J/K line · A accept · R reject · Ctrl+, settings · Ctrl+Q quit";
+/// Footer keys while typing a prompt.
+const COMPOSER_HINT: &str =
+    "Type your question · Enter send · Esc stop typing · Ctrl+C stop the agent";
+/// How often the window drains agent output.
+const AGENT_POLL_INTERVAL: Duration = Duration::from_millis(40);
+/// Key context for single-key bindings; absent while typing so letters reach the composer.
+const SHELL_CONTEXT: &str = "DrenyraShell";
+const COMPOSER_CONTEXT: &str = "DrenyraComposer";
+
 /// Footer keys while the Settings overlay is open.
 const SETTINGS_HINT: &str =
     "J/K choose theme · Enter apply · Esc close · click a theme to apply it";
@@ -92,11 +111,22 @@ pub fn run(
             cx.new(|cx| {
                 let focus_handle = cx.focus_handle();
                 focus_handle.focus(window);
+                cx.spawn(async move |this, cx| loop {
+                    cx.background_executor().timer(AGENT_POLL_INTERVAL).await;
+                    if this
+                        .update(cx, |shell: &mut ShellWindow, cx| shell.poll_agents(cx))
+                        .is_err()
+                    {
+                        break;
+                    }
+                })
+                .detach();
                 ShellWindow {
                     state,
                     focus_handle,
                     settings_path,
                     save_error: None,
+                    sessions: BTreeMap::new(),
                 }
             })
         });
@@ -112,23 +142,30 @@ pub fn run(
 }
 
 /// GPUI key bindings derived from [`KEY_BINDINGS`]; the match is exhaustive, so every command
-/// has exactly one action type.
+/// has exactly one action type. Keys without a modifier only apply in [`SHELL_CONTEXT`], so they
+/// type into the composer instead of firing commands while a prompt is being written.
 fn key_bindings() -> Vec<KeyBinding> {
     KEY_BINDINGS
         .iter()
-        .map(|&(key, command)| match command {
-            ShellCommand::SplitFocused => KeyBinding::new(key, SplitFocused, None),
-            ShellCommand::CloseFocused => KeyBinding::new(key, CloseFocused, None),
-            ShellCommand::UndoClose => KeyBinding::new(key, UndoClose, None),
-            ShellCommand::FocusNextPane => KeyBinding::new(key, FocusNextPane, None),
-            ShellCommand::NextWorkspace => KeyBinding::new(key, NextWorkspace, None),
-            ShellCommand::ReviewCursorDown => KeyBinding::new(key, ReviewCursorDown, None),
-            ShellCommand::ReviewCursorUp => KeyBinding::new(key, ReviewCursorUp, None),
-            ShellCommand::AcceptLine => KeyBinding::new(key, AcceptLine, None),
-            ShellCommand::RejectLine => KeyBinding::new(key, RejectLine, None),
-            ShellCommand::OpenSettings => KeyBinding::new(key, OpenSettings, None),
-            ShellCommand::CloseOverlay => KeyBinding::new(key, CloseOverlay, None),
-            ShellCommand::Confirm => KeyBinding::new(key, Confirm, None),
+        .map(|&(key, command)| {
+            let context = (!key.contains('-')).then_some(SHELL_CONTEXT);
+            (key, command, context)
+        })
+        .map(|(key, command, context)| match command {
+            ShellCommand::SplitFocused => KeyBinding::new(key, SplitFocused, context),
+            ShellCommand::CloseFocused => KeyBinding::new(key, CloseFocused, context),
+            ShellCommand::UndoClose => KeyBinding::new(key, UndoClose, context),
+            ShellCommand::FocusNextPane => KeyBinding::new(key, FocusNextPane, context),
+            ShellCommand::NextWorkspace => KeyBinding::new(key, NextWorkspace, context),
+            ShellCommand::ReviewCursorDown => KeyBinding::new(key, ReviewCursorDown, context),
+            ShellCommand::ReviewCursorUp => KeyBinding::new(key, ReviewCursorUp, context),
+            ShellCommand::AcceptLine => KeyBinding::new(key, AcceptLine, context),
+            ShellCommand::RejectLine => KeyBinding::new(key, RejectLine, context),
+            ShellCommand::OpenSettings => KeyBinding::new(key, OpenSettings, context),
+            ShellCommand::CloseOverlay => KeyBinding::new(key, CloseOverlay, context),
+            ShellCommand::Confirm => KeyBinding::new(key, Confirm, context),
+            ShellCommand::FocusComposer => KeyBinding::new(key, FocusComposer, context),
+            ShellCommand::StopAgent => KeyBinding::new(key, StopAgent, context),
         })
         .collect()
 }
@@ -139,6 +176,8 @@ struct ShellWindow {
     settings_path: Option<PathBuf>,
     /// Last failure to save settings, shown in the footer until a save succeeds.
     save_error: Option<String>,
+    /// Running agent processes by workspace index. Dropping one closes the agent gracefully.
+    sessions: BTreeMap<usize, AgentSession>,
 }
 
 impl ShellWindow {
@@ -147,6 +186,76 @@ impl ShellWindow {
         let before = self.state.settings();
         if self.state.apply(command, area) {
             self.persist_if_changed(before);
+            cx.notify();
+        }
+    }
+
+    /// Starts the active workspace's agent on first view, sends queued commands, and applies
+    /// whatever every agent wrote since the last poll.
+    fn poll_agents(&mut self, cx: &mut Context<Self>) {
+        let mut changed = self.ensure_active_agent();
+        for (&index, session) in &self.sessions {
+            let pane = self.state.agent_pane_mut(index);
+            for frame in pane.take_outbox() {
+                if let Err(err) = session.send(&frame) {
+                    changed |= pane.apply(AgentUpdate::Failed(err.to_string()));
+                    break;
+                }
+            }
+            for update in session.drain() {
+                changed |= pane.apply(update);
+            }
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
+    fn ensure_active_agent(&mut self) -> bool {
+        let index = self.state.active_workspace();
+        if self.state.agent_pane(index).status() != &AgentStatus::NotStarted {
+            return false;
+        }
+        let pane = self.state.agent_pane_mut(index);
+        match agent_launch(crate::find_in_path) {
+            Ok(config) => match AgentSession::spawn(&config) {
+                Ok(session) => {
+                    pane.mark_started();
+                    self.sessions.insert(index, session);
+                }
+                Err(err) => pane.mark_unavailable(format!("Could not start the agent: {err}")),
+            },
+            Err(message) => pane.mark_unavailable(message),
+        }
+        true
+    }
+
+    /// Routes typing to the composer while it is active.
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.state.composer_active() {
+            return;
+        }
+        let keystroke = &event.keystroke;
+        let mods = keystroke.modifiers;
+        let changed = match keystroke.key.as_str() {
+            "enter" if mods.shift => self.state.composer_insert("\n"),
+            "enter" => {
+                self.dispatch(ShellCommand::Confirm, window, cx);
+                false
+            }
+            "escape" => {
+                self.dispatch(ShellCommand::CloseOverlay, window, cx);
+                false
+            }
+            "backspace" => self.state.composer_backspace(),
+            _ if mods.control || mods.alt || mods.platform || mods.function => return,
+            _ => match keystroke.key_char.as_deref() {
+                Some(text) => self.state.composer_insert(text),
+                None => return,
+            },
+        };
+        cx.stop_propagation();
+        if changed {
             cx.notify();
         }
     }
@@ -207,8 +316,47 @@ impl Render for ShellWindow {
             settings_overlay(panel, options.collect(), close, &t)
         });
 
+        let panes: Vec<AnyElement> = vm
+            .panes
+            .iter()
+            .map(|tile| {
+                let body = match (tile.kind, vm.agent.as_ref()) {
+                    (PaneKind::FiscalAgent, Some(agent)) => {
+                        let composer = div()
+                            .id(("composer", tile.id))
+                            .cursor_text()
+                            .on_click(cx.listener(|this, _: &ClickEvent, w, cx| {
+                                this.dispatch(ShellCommand::FocusComposer, w, cx)
+                            }))
+                            .child(composer_box(agent, tile.focused, &t));
+                        agent_body(agent, composer, &t).into_any_element()
+                    }
+                    _ => placeholder_body(&t).into_any_element(),
+                };
+                pane_tile(
+                    tile,
+                    agent_header(tile.kind, vm.agent.as_ref(), &t),
+                    body,
+                    &t,
+                )
+                .into_any_element()
+            })
+            .collect();
+
         div()
+            .key_context(if vm.agent.as_ref().is_some_and(|a| a.composer_active) {
+                COMPOSER_CONTEXT
+            } else {
+                SHELL_CONTEXT
+            })
             .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(Self::on_key_down))
+            .on_action(cx.listener(|this, _: &FocusComposer, w, cx| {
+                this.dispatch(ShellCommand::FocusComposer, w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &StopAgent, w, cx| {
+                this.dispatch(ShellCommand::StopAgent, w, cx)
+            }))
             .on_action(cx.listener(|this, _: &SplitFocused, w, cx| {
                 this.dispatch(ShellCommand::SplitFocused, w, cx)
             }))
@@ -261,11 +409,12 @@ impl Render for ShellWindow {
                     .flex_row()
                     .min_h_0()
                     .overflow_hidden()
-                    .child(pane_layer(&vm.panes, &t))
+                    .child(div().flex_1().relative().min_w_0().children(panes))
                     .children(vm.review.as_ref().map(|panel| review_panel(panel, &t))),
             )
             .child(footer(
                 vm.settings.is_some(),
+                vm.agent.as_ref().is_some_and(|a| a.composer_active),
                 self.save_error.as_deref(),
                 &t,
             ))
@@ -385,14 +534,6 @@ fn guardrail_chips(g: &GuardrailChips, demo: bool, t: &ThemeTokens) -> impl Into
         )
 }
 
-fn pane_layer(panes: &[PaneTile], t: &ThemeTokens) -> impl IntoElement {
-    div()
-        .flex_1()
-        .relative()
-        .min_w_0()
-        .children(panes.iter().map(|tile| pane_tile(tile, t)))
-}
-
 /// One-line role description shown under each pane title.
 fn pane_caption(kind: PaneKind) -> &'static str {
     match kind {
@@ -403,7 +544,52 @@ fn pane_caption(kind: PaneKind) -> &'static str {
     }
 }
 
-fn pane_tile(tile: &PaneTile, t: &ThemeTokens) -> impl IntoElement {
+fn tone_color(tone: StatusTone, t: &ThemeTokens) -> u32 {
+    match tone {
+        StatusTone::Muted => t.text_subtle,
+        StatusTone::Busy => t.info,
+        StatusTone::Ok => t.success,
+        StatusTone::Warning => t.warning,
+        StatusTone::Error => t.error,
+    }
+}
+
+/// Right side of a pane header: the agent status (and model) for agent panes.
+fn agent_header(
+    kind: PaneKind,
+    agent: Option<&AgentPaneView>,
+    t: &ThemeTokens,
+) -> Option<gpui::Div> {
+    let agent = agent.filter(|_| kind == PaneKind::FiscalAgent)?;
+    Some(
+        div()
+            .flex()
+            .flex_row()
+            .gap_2()
+            .items_center()
+            .min_w_0()
+            .children(agent.model.as_ref().map(|model| {
+                div()
+                    .text_xs()
+                    .font_family(MONO_FONT)
+                    .text_color(rgb(t.text_subtle))
+                    .truncate()
+                    .child(model.clone())
+            }))
+            .child(chip(
+                agent.status_label.clone(),
+                tone_color(agent.status_tone, t),
+                t,
+            )),
+    )
+}
+
+fn pane_tile(
+    tile: &PaneTile,
+    header_extra: Option<gpui::Div>,
+    body: AnyElement,
+    t: &ThemeTokens,
+) -> impl IntoElement {
     let border = if tile.focused { t.focus } else { t.divider };
     div()
         .absolute()
@@ -424,6 +610,7 @@ fn pane_tile(tile: &PaneTile, t: &ThemeTokens) -> impl IntoElement {
                 .border_color(rgb(border))
                 .child(
                     div()
+                        .flex_none()
                         .flex()
                         .flex_row()
                         .items_center()
@@ -453,17 +640,109 @@ fn pane_tile(tile: &PaneTile, t: &ThemeTokens) -> impl IntoElement {
                                         .child(pane_caption(tile.kind)),
                                 ),
                         )
-                        .children(tile.focused.then(|| chip("focused", t.accent, t))),
+                        .children(header_extra),
                 )
-                .child(
-                    div()
-                        .flex_1()
-                        .p_3()
-                        .text_xs()
-                        .text_color(rgb(t.text_muted))
-                        .child("Not connected yet: showing demo data."),
-                ),
+                .child(body),
         )
+}
+
+fn placeholder_body(t: &ThemeTokens) -> impl IntoElement {
+    div()
+        .flex_1()
+        .p_3()
+        .text_xs()
+        .text_color(rgb(t.text_muted))
+        .child("Not connected yet: this pane kind arrives in a later phase.")
+}
+
+/// Transcript (newest at the bottom; older entries are clipped at the top) and the composer.
+fn agent_body(
+    agent: &AgentPaneView,
+    composer: impl IntoElement,
+    t: &ThemeTokens,
+) -> impl IntoElement {
+    let empty = agent.transcript.is_empty() && agent.streaming_text.is_empty();
+    div()
+        .flex_1()
+        .min_h_0()
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .flex_1()
+                .min_h_0()
+                .overflow_hidden()
+                .flex()
+                .flex_col()
+                .justify_end()
+                .gap_2()
+                .p_3()
+                .children(empty.then(|| {
+                    div()
+                        .text_color(rgb(t.text_subtle))
+                        .child("Ask the Fiscal Agent about this company. Press I or click below to start typing.")
+                }))
+                .children(agent.transcript.iter().map(|entry| transcript_entry(entry.role, &entry.text, t)))
+                .children((!agent.streaming_text.is_empty()).then(|| {
+                    transcript_entry(EntryRole::Agent, &format!("{}▍", agent.streaming_text), t)
+                })),
+        )
+        .child(composer)
+}
+
+fn transcript_entry(role: EntryRole, text: &str, t: &ThemeTokens) -> impl IntoElement {
+    let (label, label_color, body_color) = match role {
+        EntryRole::Operator => ("You", t.accent, t.text),
+        EntryRole::Agent => ("Agent", t.success, t.text),
+        EntryRole::Tool => ("Tool", t.info, t.text_muted),
+        EntryRole::Notice => ("Note", t.text_subtle, t.text_muted),
+        EntryRole::Error => ("Error", t.error, t.error),
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap_0p5()
+        .child(
+            div()
+                .text_xs()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(rgb(label_color))
+                .child(label),
+        )
+        .child(div().text_color(rgb(body_color)).child(text.to_owned()))
+}
+
+fn composer_box(agent: &AgentPaneView, pane_focused: bool, t: &ThemeTokens) -> impl IntoElement {
+    let (text, color) = if agent.composer_active {
+        (format!("{}▏", agent.composer), t.text)
+    } else if !agent.composer.is_empty() {
+        (agent.composer.clone(), t.text_muted)
+    } else if !agent.can_send {
+        ("The agent is not available.".to_owned(), t.text_subtle)
+    } else if pane_focused {
+        ("Press I to ask the Fiscal Agent…".to_owned(), t.text_subtle)
+    } else {
+        (
+            "Focus this pane (Ctrl+Tab) to ask the Fiscal Agent…".to_owned(),
+            t.text_subtle,
+        )
+    };
+    let border = if agent.composer_active {
+        t.focus
+    } else {
+        t.border_ui
+    };
+    div()
+        .flex_none()
+        .m_2()
+        .px_3()
+        .py_2()
+        .rounded_md()
+        .bg(rgb(t.surface_raised))
+        .border_1()
+        .border_color(rgb(border))
+        .text_color(rgb(color))
+        .child(text)
 }
 
 fn review_panel(panel: &ReviewPanel, t: &ThemeTokens) -> impl IntoElement {
@@ -588,10 +867,16 @@ fn review_row(row: &super::view_model::ReviewRow, t: &ThemeTokens) -> impl IntoE
     }
 }
 
-fn footer(settings_open: bool, save_error: Option<&str>, t: &ThemeTokens) -> impl IntoElement {
+fn footer(
+    settings_open: bool,
+    composing: bool,
+    save_error: Option<&str>,
+    t: &ThemeTokens,
+) -> impl IntoElement {
     let (text, color) = match save_error {
         Some(err) => (err.to_owned(), t.error),
         None if settings_open => (SETTINGS_HINT.to_owned(), t.text_subtle),
+        None if composing => (COMPOSER_HINT.to_owned(), t.text_subtle),
         None => (FOOTER_HINT.to_owned(), t.text_subtle),
     };
     div()

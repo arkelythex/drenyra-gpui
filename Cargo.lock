@@ -1392,6 +1392,7 @@ dependencies = [
  "drenyra-ui",
  "drenyra-workspace",
  "gpui",
+ "serde_json",
 ]
 
 [[package]]

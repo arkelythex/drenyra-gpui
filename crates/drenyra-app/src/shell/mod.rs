@@ -3,6 +3,7 @@
 //! `view_model` and `commands` are GPUI-free and fully unit-tested; the feature-gated `window`
 //! module only maps the view model to GPUI elements and key bindings to commands.
 
+pub mod agent_pane;
 pub mod commands;
 pub mod demo;
 pub mod settings;

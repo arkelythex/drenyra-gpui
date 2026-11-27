@@ -2,10 +2,13 @@
 
 use drenyra_workspace::PaneKind;
 
+use std::collections::BTreeMap;
+
+use super::agent_pane::AgentPane;
 use super::demo;
 use super::settings::Settings;
 use super::theme::ThemeId;
-use super::view_model::{Rect, SettingsPanel, ShellViewModel, ThemeOption};
+use super::view_model::{AgentPaneView, Rect, SettingsPanel, ShellViewModel, ThemeOption};
 use crate::controller::DrenyraHostController;
 
 /// Comment recorded when a line is rejected from the keyboard (no free-text input yet).
@@ -28,8 +31,12 @@ pub enum ShellCommand {
     OpenSettings,
     /// Close the open overlay.
     CloseOverlay,
-    /// Apply the option under the cursor in the open overlay.
+    /// Apply the option under the cursor in the open overlay, or send the composer text.
     Confirm,
+    /// Start typing a prompt in the focused Fiscal Agent pane.
+    FocusComposer,
+    /// Stop the active workspace's running agent.
+    StopAgent,
 }
 
 /// Every command, for exhaustiveness checks.
@@ -46,6 +53,8 @@ pub const ALL_COMMANDS: &[ShellCommand] = &[
     ShellCommand::OpenSettings,
     ShellCommand::CloseOverlay,
     ShellCommand::Confirm,
+    ShellCommand::FocusComposer,
+    ShellCommand::StopAgent,
 ];
 
 /// Single source of truth for window key bindings (GPUI keystroke syntax).
@@ -64,6 +73,8 @@ pub const KEY_BINDINGS: &[(&str, ShellCommand)] = &[
     ("ctrl-,", ShellCommand::OpenSettings),
     ("escape", ShellCommand::CloseOverlay),
     ("enter", ShellCommand::Confirm),
+    ("i", ShellCommand::FocusComposer),
+    ("ctrl-c", ShellCommand::StopAgent),
 ];
 
 /// Window-independent shell state: the host controller plus presentation cursors.
@@ -75,6 +86,10 @@ pub struct ShellState {
     settings: Settings,
     /// Cursor into [`ThemeId::ALL`] while the Settings overlay is open; `None` when closed.
     settings_cursor: Option<usize>,
+    /// One Fiscal Agent pane per workspace index, so conversations never cross companies.
+    agents: BTreeMap<usize, AgentPane>,
+    /// True while keystrokes go to the active workspace's composer.
+    composer_active: bool,
 }
 
 impl ShellState {
@@ -85,7 +100,47 @@ impl ShellState {
             demo,
             settings: Settings::default(),
             settings_cursor: None,
+            agents: BTreeMap::new(),
+            composer_active: false,
         }
+    }
+
+    /// The Fiscal Agent pane of workspace `index` (empty until the window starts its agent).
+    pub fn agent_pane(&self, index: usize) -> AgentPane {
+        self.agents.get(&index).cloned().unwrap_or_default()
+    }
+
+    pub fn agent_pane_mut(&mut self, index: usize) -> &mut AgentPane {
+        self.agents.entry(index).or_default()
+    }
+
+    /// Index of the active workspace, which owns the visible agent pane.
+    pub fn active_workspace(&self) -> usize {
+        self.controller.workspaces().active_index()
+    }
+
+    /// True while keystrokes go to the composer instead of key bindings.
+    pub fn composer_active(&self) -> bool {
+        self.composer_active
+    }
+
+    /// Types into the active composer; returns `false` when the composer is not active.
+    pub fn composer_insert(&mut self, text: &str) -> bool {
+        if !self.composer_active || text.is_empty() {
+            return false;
+        }
+        let index = self.active_workspace();
+        self.agent_pane_mut(index).composer_insert(text);
+        true
+    }
+
+    /// Deletes the last composer character; returns `false` when nothing changed.
+    pub fn composer_backspace(&mut self) -> bool {
+        if !self.composer_active {
+            return false;
+        }
+        let index = self.active_workspace();
+        self.agent_pane_mut(index).composer_backspace()
     }
 
     /// Replaces the operator settings (for example, the ones loaded from disk).
@@ -120,6 +175,9 @@ impl ShellState {
         let mut view =
             ShellViewModel::build(&self.controller, pane_area, self.review_cursor, self.demo);
         view.theme = self.settings.theme;
+        let index = self.active_workspace();
+        let pane = self.agents.get(&index).cloned().unwrap_or_default();
+        view.agent = Some(AgentPaneView::from_pane(&pane, self.composer_active));
         view.settings = self.settings_cursor.map(|cursor| SettingsPanel {
             sections: vec!["Themes"],
             active_section: 0,
@@ -145,7 +203,23 @@ impl ShellState {
         if let Some(cursor) = self.settings_cursor {
             return self.apply_in_settings(command, cursor);
         }
+        if self.composer_active {
+            return self.apply_in_composer(command);
+        }
         match command {
+            ShellCommand::FocusComposer => {
+                let focused_is_agent = self
+                    .view(pane_area)
+                    .panes
+                    .iter()
+                    .any(|p| p.focused && p.kind == PaneKind::FiscalAgent);
+                self.composer_active = focused_is_agent;
+                focused_is_agent
+            }
+            ShellCommand::StopAgent => {
+                let index = self.active_workspace();
+                self.agent_pane_mut(index).stop()
+            }
             ShellCommand::OpenSettings => {
                 let current = ThemeId::ALL
                     .iter()
@@ -186,6 +260,19 @@ impl ShellState {
                     .active_review_mut()
                     .is_some_and(|review| review.reject_line(cursor, REJECT_COMMENT))
             }
+        }
+    }
+
+    fn apply_in_composer(&mut self, command: ShellCommand) -> bool {
+        let index = self.active_workspace();
+        match command {
+            ShellCommand::Confirm => self.agent_pane_mut(index).submit(),
+            ShellCommand::StopAgent => self.agent_pane_mut(index).stop(),
+            ShellCommand::CloseOverlay => {
+                self.composer_active = false;
+                true
+            }
+            _ => false,
         }
     }
 
@@ -546,6 +633,81 @@ mod tests {
     }
 
     #[test]
+    fn composer_opens_only_on_a_focused_agent_pane_and_captures_text() {
+        let mut s = state();
+        assert!(!s.composer_insert("x"), "typing needs the composer");
+        assert!(!s.composer_active());
+        assert!(s.apply(ShellCommand::FocusComposer, WIDE));
+        assert!(s.composer_active());
+        assert!(s.view(WIDE).agent.expect("agent pane").composer_active);
+        assert!(s.composer_insert("hola"));
+        assert!(s.composer_backspace());
+        assert_eq!(s.view(WIDE).agent.expect("agent").composer, "hol");
+
+        // Focus a non-agent pane: the composer cannot open there.
+        assert!(s.apply(ShellCommand::CloseOverlay, WIDE));
+        assert!(s.apply(ShellCommand::SplitFocused, WIDE));
+        assert_eq!(pane_kinds(&s)[1], PaneKind::LedgerViewer);
+        assert!(!s.apply(ShellCommand::FocusComposer, WIDE));
+    }
+
+    #[test]
+    fn composer_mode_is_modal_and_enter_submits_to_the_active_workspace_only() {
+        let mut s = state();
+        s.agent_pane_mut(0).mark_started();
+        s.agent_pane_mut(0).take_outbox();
+        s.agent_pane_mut(0)
+            .apply(drenyra_rpc::agent::AgentUpdate::Event(
+                drenyra_rpc::agent::AgentEvent::State {
+                    model: None,
+                    streaming: false,
+                },
+            ));
+        s.apply(ShellCommand::FocusComposer, WIDE);
+        s.composer_insert("¿saldo de caja?");
+        for cmd in [
+            ShellCommand::SplitFocused,
+            ShellCommand::NextWorkspace,
+            ShellCommand::AcceptLine,
+            ShellCommand::OpenSettings,
+        ] {
+            assert!(
+                !s.apply(cmd, WIDE),
+                "{cmd:?} must be blocked while composing"
+            );
+        }
+        assert!(s.apply(ShellCommand::Confirm, WIDE));
+        assert_eq!(s.agent_pane_mut(0).take_outbox().len(), 1);
+        assert!(
+            s.agent_pane_mut(1).take_outbox().is_empty(),
+            "other company untouched"
+        );
+        assert!(s.agent_pane(1).transcript().is_empty());
+
+        assert!(s.apply(ShellCommand::CloseOverlay, WIDE));
+        assert!(!s.view(WIDE).agent.expect("agent").composer_active);
+        assert!(s.apply(ShellCommand::NextWorkspace, WIDE));
+        assert!(
+            s.view(WIDE).agent.expect("agent").transcript.is_empty(),
+            "Sierra has its own pane"
+        );
+    }
+
+    #[test]
+    fn stop_agent_only_acts_on_a_running_agent() {
+        let mut s = state();
+        assert!(!s.apply(ShellCommand::StopAgent, WIDE));
+        s.agent_pane_mut(0).mark_started();
+        s.agent_pane_mut(0).take_outbox();
+        s.agent_pane_mut(0)
+            .apply(drenyra_rpc::agent::AgentUpdate::Event(
+                drenyra_rpc::agent::AgentEvent::RunStarted,
+            ));
+        assert!(s.apply(ShellCommand::StopAgent, WIDE));
+        assert_eq!(s.agent_pane_mut(0).take_outbox().len(), 2);
+    }
+
+    #[test]
     fn key_bindings_cover_every_command_without_duplicate_keys() {
         for command in ALL_COMMANDS {
             assert!(
@@ -563,5 +725,7 @@ mod tests {
         assert!(KEY_BINDINGS.contains(&("ctrl-,", ShellCommand::OpenSettings)));
         assert!(KEY_BINDINGS.contains(&("escape", ShellCommand::CloseOverlay)));
         assert!(KEY_BINDINGS.contains(&("enter", ShellCommand::Confirm)));
+        assert!(KEY_BINDINGS.contains(&("i", ShellCommand::FocusComposer)));
+        assert!(KEY_BINDINGS.contains(&("ctrl-c", ShellCommand::StopAgent)));
     }
 }
