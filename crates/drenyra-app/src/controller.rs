@@ -699,4 +699,44 @@ mod tests {
             Some(MoneyCents::from_cents(3_000))
         );
     }
+
+    #[test]
+    fn edit_after_built_frame_blocks_rebuild_until_reapproved() {
+        let ws = FiscalWorkspace::new("20123456789", "Andino SAC", "2026-10");
+        let mut controller = DrenyraHostController::new(ws);
+        controller
+            .stage_proposal(sample_proposal("je-001", RiskTier::R3Irreversible, true))
+            .expect("stage");
+        {
+            let review = controller.active_review_mut().expect("staged");
+            review.accept_all();
+            assert!(review.record_human_approval("CPA-1"));
+        }
+        let first = controller.build_post_request().expect("approved frame");
+        assert!(first.contains(r#""id":1"#));
+        {
+            let review = controller.active_review_mut().expect("staged");
+            assert!(review.reject_line(0, "wrong"));
+            assert!(review.accept_line(0));
+        }
+        assert!(matches!(
+            controller.build_post_request(),
+            Err(ControllerError::ReviewNotReadyToPost)
+        ));
+        // Failed rebuild leaves the in-flight request untouched.
+        assert_eq!(controller.pending_post_request(), Some(1));
+        {
+            let review = controller.active_review_mut().expect("staged");
+            assert!(review.record_human_approval("CPA-2"));
+        }
+        let retry = controller.build_post_request().expect("re-approved frame");
+        assert!(retry.contains(r#""approved_by":"CPA-2""#));
+        assert!(retry.contains(r#""id":2"#));
+        assert!(matches!(
+            controller.confirm_posted(1),
+            Err(ControllerError::UnknownPostRequest)
+        ));
+        controller.confirm_posted(2).expect("confirm retry");
+        assert!(controller.active_review().is_none());
+    }
 }

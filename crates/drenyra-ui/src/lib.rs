@@ -38,34 +38,48 @@ impl EntryDiffReview {
     }
 
     /// Marks the line at `idx` as [`LineDecision::Accepted`]. Returns `false` if out of bounds.
+    /// Changing a decision clears any recorded human approval (see [`Self::approved_by`]).
     pub fn accept_line(&mut self, idx: usize) -> bool {
-        let Some(slot) = self.decisions.get_mut(idx) else {
-            return false;
-        };
-        *slot = LineDecision::Accepted;
-        true
+        self.set_decision(idx, LineDecision::Accepted)
     }
 
     /// Marks the line at `idx` as [`LineDecision::Rejected`] with a trimmed non-empty comment.
     /// Returns `false` if `idx` is out of bounds or `comment` is empty/whitespace-only.
+    /// Changing a decision clears any recorded human approval (see [`Self::approved_by`]).
     pub fn reject_line(&mut self, idx: usize, comment: impl Into<String>) -> bool {
         let raw = comment.into();
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             return false;
         }
-        let Some(slot) = self.decisions.get_mut(idx) else {
-            return false;
-        };
-        *slot = LineDecision::Rejected {
-            comment: trimmed.to_string(),
-        };
-        true
+        self.set_decision(
+            idx,
+            LineDecision::Rejected {
+                comment: trimmed.to_string(),
+            },
+        )
     }
 
     /// Marks every line in the proposal as [`LineDecision::Accepted`].
+    /// Clears any recorded human approval if at least one line changed.
     pub fn accept_all(&mut self) {
-        self.decisions.fill(LineDecision::Accepted);
+        for idx in 0..self.decisions.len() {
+            self.set_decision(idx, LineDecision::Accepted);
+        }
+    }
+
+    /// Single write path for line decisions. A human approval covers the exact set of
+    /// decisions it was given for, so any real change invalidates it; repeating the
+    /// current decision is a no-op and keeps the approval.
+    fn set_decision(&mut self, idx: usize, decision: LineDecision) -> bool {
+        let Some(slot) = self.decisions.get_mut(idx) else {
+            return false;
+        };
+        if *slot != decision {
+            *slot = decision;
+            self.approved_by = None;
+        }
+        true
     }
 
     /// Returns the number of lines that are no longer [`LineDecision::Pending`].
@@ -94,6 +108,8 @@ impl EntryDiffReview {
         true
     }
 
+    /// The recorded human approver, if any. It is cleared whenever a line decision changes,
+    /// so it always refers to the decisions currently on screen.
     pub fn approved_by(&self) -> Option<&str> {
         self.approved_by.as_deref()
     }
@@ -261,6 +277,119 @@ mod tests {
             assert_eq!(review.approved_by(), Some("CPA-123"));
             assert!(review.can_post());
         }
+    }
+
+    #[test]
+    fn changing_a_decision_after_approval_clears_the_approval() {
+        let mut review = EntryDiffReview::new(sample_proposal(RiskTier::R2Material, true));
+        review.accept_all();
+        assert!(review.record_human_approval("CPA-123"));
+        assert!(review.can_post());
+
+        assert!(review.reject_line(1, "Wrong revenue account"));
+        assert_eq!(review.approved_by(), None);
+        assert!(review.accept_line(1));
+        assert_eq!(review.approved_by(), None);
+        assert!(
+            !review.can_post(),
+            "re-accepting must not revive a stale approval"
+        );
+
+        // Approval given before every line was decided does not survive the later decisions.
+        let mut early = EntryDiffReview::new(sample_proposal(RiskTier::R3Irreversible, true));
+        assert!(early.record_human_approval("CPA-123"));
+        early.accept_all();
+        assert_eq!(early.approved_by(), None);
+        assert!(!early.can_post());
+    }
+
+    #[test]
+    fn repeating_the_same_decision_keeps_the_approval() {
+        let mut review = EntryDiffReview::new(sample_proposal(RiskTier::R2Material, true));
+        review.accept_all();
+        assert!(review.record_human_approval("CPA-123"));
+
+        assert!(review.accept_line(0));
+        review.accept_all();
+        assert!(!review.accept_line(99));
+        assert!(!review.reject_line(0, "   "));
+        assert_eq!(review.approved_by(), Some("CPA-123"));
+        assert!(review.can_post());
+    }
+
+    #[test]
+    fn early_approval_does_not_survive_line_by_line_accepts() {
+        let mut r = EntryDiffReview::new(sample_proposal(RiskTier::R2Material, true));
+        assert!(r.accept_line(0));
+        assert!(r.record_human_approval("CPA-1"));
+        assert!(r.accept_line(1));
+        assert!(r.accept_line(2));
+        assert_eq!(r.approved_by(), None);
+        assert!(!r.can_post());
+    }
+
+    #[test]
+    fn accept_all_over_a_rejected_line_clears_approval() {
+        let mut r = EntryDiffReview::new(sample_proposal(RiskTier::R3Irreversible, true));
+        r.accept_all();
+        assert!(r.reject_line(0, "x"));
+        assert!(r.record_human_approval("CPA-1"));
+        r.accept_all();
+        assert_eq!(r.approved_by(), None);
+        assert!(!r.can_post());
+    }
+
+    #[test]
+    fn rejecting_again_with_a_different_comment_clears_approval() {
+        let mut r = EntryDiffReview::new(sample_proposal(RiskTier::R2Material, true));
+        r.accept_all();
+        assert!(r.reject_line(1, "first"));
+        assert!(r.record_human_approval("CPA-1"));
+        assert!(r.reject_line(1, "second"));
+        assert_eq!(r.approved_by(), None);
+        assert_eq!(
+            r.decisions()[1],
+            LineDecision::Rejected {
+                comment: "second".into()
+            }
+        );
+    }
+
+    #[test]
+    fn same_rejection_after_trim_keeps_approval() {
+        let mut r = EntryDiffReview::new(sample_proposal(RiskTier::R2Material, true));
+        r.accept_all();
+        assert!(r.reject_line(1, "dup"));
+        assert!(r.record_human_approval("CPA-1"));
+        assert!(r.reject_line(1, "  dup \n"));
+        assert_eq!(r.approved_by(), Some("CPA-1"));
+    }
+
+    #[test]
+    fn no_op_calls_leave_review_byte_identical() {
+        let mut r = EntryDiffReview::new(sample_proposal(RiskTier::R3Irreversible, true));
+        r.accept_all();
+        assert!(r.record_human_approval("CPA-1"));
+        let before = r.clone();
+        assert!(r.accept_line(1));
+        r.accept_all();
+        assert!(!r.accept_line(usize::MAX));
+        assert!(!r.reject_line(3, "oob"));
+        assert!(!r.reject_line(0, " \t\n"));
+        assert_eq!(r, before);
+        assert!(r.can_post());
+    }
+
+    #[test]
+    fn reapproval_after_an_edit_allows_posting_again() {
+        let mut r = EntryDiffReview::new(sample_proposal(RiskTier::R2Material, true));
+        r.accept_all();
+        assert!(r.record_human_approval("CPA-1"));
+        assert!(r.reject_line(0, "x"));
+        assert!(r.accept_line(0));
+        assert!(!r.can_post());
+        assert!(r.record_human_approval("CPA-2"));
+        assert!(r.can_post());
     }
 
     #[test]
