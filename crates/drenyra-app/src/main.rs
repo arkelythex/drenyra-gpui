@@ -3,6 +3,8 @@
 #[cfg_attr(not(test), allow(dead_code))]
 pub mod controller;
 #[cfg_attr(not(test), allow(dead_code))]
+mod shell;
+#[cfg_attr(not(test), allow(dead_code))]
 mod ui;
 
 use std::env;
@@ -11,12 +13,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use controller::{ControllerError, DrenyraHostController};
-use drenyra_protocol::{
-    escape_json_str, validate_json_container, JournalEntryProposal, JournalLine, JsonRpcRequest,
-    MoneyCents, RiskTier,
-};
+use drenyra_protocol::{escape_json_str, validate_json_container, JsonRpcRequest, MoneyCents};
 use drenyra_rpc::{RpcSession, RpcTransportConfig};
-use drenyra_workspace::{FiscalWorkspace, PaneKind, SessionGuardrails};
+use drenyra_workspace::{PaneKind, SessionGuardrails};
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -56,41 +55,14 @@ pub fn probe_rpc(command: &str, args: &[String]) -> Result<String, String> {
 }
 
 pub fn run_demo_session_json() -> Result<String, ControllerError> {
-    let workspace = FiscalWorkspace::new("20123456789", "Andino SAC", "2026-10");
-    let mut controller = DrenyraHostController::new(workspace);
+    let mut controller = DrenyraHostController::new(shell::demo::demo_workspace());
     controller
         .workspaces_mut()
         .active_mut()
         .split_focused(PaneKind::LedgerViewer, 1440, 900);
     let pane_count = controller.workspaces().active().pane_count();
 
-    let proposal = JournalEntryProposal {
-        id: "je-demo-2026-10-001".into(),
-        entity_ruc: "20123456789".into(),
-        fiscal_period: "2026-10".into(),
-        risk_tier: RiskTier::R2Material,
-        lines: vec![
-            JournalLine {
-                account_code: "1212".into(),
-                debit: MoneyCents::from_cents(11_800),
-                credit: MoneyCents::ZERO,
-                description: "Accounts receivable".into(),
-            },
-            JournalLine {
-                account_code: "7011".into(),
-                debit: MoneyCents::ZERO,
-                credit: MoneyCents::from_cents(10_000),
-                description: "Sales revenue".into(),
-            },
-            JournalLine {
-                account_code: "40111".into(),
-                debit: MoneyCents::ZERO,
-                credit: MoneyCents::from_cents(1_800),
-                description: "IGV 18%".into(),
-            },
-        ],
-    };
-    controller.stage_proposal(proposal)?;
+    controller.stage_proposal(shell::demo::demo_proposal())?;
 
     let blocked_before_approval = matches!(
         controller.build_post_request(),

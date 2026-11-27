@@ -301,6 +301,11 @@ impl WorkspaceManager {
         self.active_index
     }
 
+    /// All workspaces in switcher order.
+    pub fn workspaces(&self) -> &[FiscalWorkspace] {
+        &self.workspaces
+    }
+
     /// Mutable access to the workspace at `index` without changing focus.
     pub fn get_mut(&mut self, index: usize) -> Option<&mut FiscalWorkspace> {
         self.workspaces.get_mut(index)
