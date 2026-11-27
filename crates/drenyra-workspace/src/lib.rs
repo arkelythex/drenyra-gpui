@@ -296,6 +296,11 @@ impl WorkspaceManager {
         }
     }
 
+    /// Index of the active workspace; stable for the manager's lifetime because workspaces are never removed.
+    pub fn active_index(&self) -> usize {
+        self.active_index
+    }
+
     pub fn active(&self) -> &FiscalWorkspace {
         &self.workspaces[self.active_index]
     }

@@ -90,16 +90,19 @@ pub fn run_demo_session_json() -> Result<String, ControllerError> {
             },
         ],
     };
-    controller.stage_proposal(proposal);
+    controller.stage_proposal(proposal)?;
 
     let blocked_before_approval = matches!(
         controller.build_post_request(),
         Err(ControllerError::ReviewNotReadyToPost)
     );
 
-    if let Some(review) = controller.active_review_mut() {
-        review.accept_all();
-        review.record_human_approval("CPA-PERU-001");
+    let review = controller
+        .active_review_mut()
+        .ok_or(ControllerError::NoStagedReview)?;
+    review.accept_all();
+    if !review.record_human_approval("CPA-PERU-001") {
+        return Err(ControllerError::ReviewNotReadyToPost);
     }
 
     let frame = controller.build_post_request()?;
@@ -124,7 +127,12 @@ pub fn run_demo_session_json() -> Result<String, ControllerError> {
 
 pub fn run_cli(args: &[String]) -> ExitCode {
     match args {
-        [] | [_] if matches!(args.first().map(String::as_str), None | Some("--help" | "-h")) => {
+        [] | [_]
+            if matches!(
+                args.first().map(String::as_str),
+                None | Some("--help" | "-h")
+            ) =>
+        {
             println!("drenyra-gpui {}", env!("CARGO_PKG_VERSION"));
             println!("Native Rust + GPUI accounting desktop host for Drenyra Shell & Drenyra AI.");
             println!();
@@ -258,7 +266,12 @@ mod tests {
         );
         #[cfg(unix)]
         assert_eq!(
-            run_cli(&["--probe-rpc".into(), "sh".into(), "-c".into(), "exit 0".into()]),
+            run_cli(&[
+                "--probe-rpc".into(),
+                "sh".into(),
+                "-c".into(),
+                "exit 0".into()
+            ]),
             ExitCode::FAILURE
         );
     }
@@ -266,8 +279,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn probe_rpc_failure_includes_non_empty_stderr_snapshot() {
-        let err = probe_rpc("sh", &["-c".into(), "echo 'boom on stderr' >&2; exit 1".into()])
-            .expect_err("expected probe_rpc failure");
+        let err = probe_rpc(
+            "sh",
+            &["-c".into(), "echo 'boom on stderr' >&2; exit 1".into()],
+        )
+        .expect_err("expected probe_rpc failure");
         let msg = err.to_string();
         assert!(
             msg.contains("boom on stderr"),
