@@ -4,6 +4,7 @@ use drenyra_protocol::{MoneyCents, RiskTier};
 use drenyra_ui::{EntryDiffReview, LineDecision};
 use drenyra_workspace::{PaneKind, PaneNode, SplitAxis, WorkspaceActivity};
 
+use super::theme::ThemeId;
 use crate::controller::DrenyraHostController;
 
 /// Height of the workspace and guardrail chip bar, in pixels.
@@ -101,6 +102,25 @@ pub struct ReviewPanel {
     pub approved_by: Option<String>,
 }
 
+/// One theme choice in Settings › Themes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThemeOption {
+    pub id: ThemeId,
+    pub label: &'static str,
+    /// The theme currently in use.
+    pub applied: bool,
+    /// The option under the keyboard cursor.
+    pub cursor: bool,
+}
+
+/// The Settings overlay. `sections` lists the navigation entries; Themes is the only one today.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingsPanel {
+    pub sections: Vec<&'static str>,
+    pub active_section: usize,
+    pub themes: Vec<ThemeOption>,
+}
+
 /// Everything the native window renders for one frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShellViewModel {
@@ -110,6 +130,10 @@ pub struct ShellViewModel {
     pub review: Option<ReviewPanel>,
     /// True when the window runs on deterministic demo data instead of a live shell.
     pub demo: bool,
+    /// Theme the window draws with.
+    pub theme: ThemeId,
+    /// The Settings overlay, when open.
+    pub settings: Option<SettingsPanel>,
 }
 
 impl ShellViewModel {
@@ -163,6 +187,8 @@ impl ShellViewModel {
                 .active_review()
                 .map(|review| review_panel(review, review_cursor)),
             demo,
+            theme: ThemeId::default(),
+            settings: None,
         }
     }
 

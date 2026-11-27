@@ -67,9 +67,10 @@ impl WindowBootstrapPlan {
 pub fn mount_native_window(
     config: DesktopShellConfig,
     state: crate::shell::commands::ShellState,
+    settings_path: Option<std::path::PathBuf>,
 ) -> Result<(), String> {
     config.validate()?;
-    crate::shell::window::run(config, state)
+    crate::shell::window::run(config, state, settings_path)
 }
 
 #[cfg(test)]

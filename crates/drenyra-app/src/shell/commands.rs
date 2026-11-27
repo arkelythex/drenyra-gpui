@@ -3,7 +3,9 @@
 use drenyra_workspace::PaneKind;
 
 use super::demo;
-use super::view_model::{Rect, ShellViewModel};
+use super::settings::Settings;
+use super::theme::ThemeId;
+use super::view_model::{Rect, SettingsPanel, ShellViewModel, ThemeOption};
 use crate::controller::DrenyraHostController;
 
 /// Comment recorded when a line is rejected from the keyboard (no free-text input yet).
@@ -22,6 +24,12 @@ pub enum ShellCommand {
     ReviewCursorUp,
     AcceptLine,
     RejectLine,
+    /// Open the Settings overlay.
+    OpenSettings,
+    /// Close the open overlay.
+    CloseOverlay,
+    /// Apply the option under the cursor in the open overlay.
+    Confirm,
 }
 
 /// Every command, for exhaustiveness checks.
@@ -35,6 +43,9 @@ pub const ALL_COMMANDS: &[ShellCommand] = &[
     ShellCommand::ReviewCursorUp,
     ShellCommand::AcceptLine,
     ShellCommand::RejectLine,
+    ShellCommand::OpenSettings,
+    ShellCommand::CloseOverlay,
+    ShellCommand::Confirm,
 ];
 
 /// Single source of truth for window key bindings (GPUI keystroke syntax).
@@ -50,6 +61,9 @@ pub const KEY_BINDINGS: &[(&str, ShellCommand)] = &[
     ("up", ShellCommand::ReviewCursorUp),
     ("a", ShellCommand::AcceptLine),
     ("r", ShellCommand::RejectLine),
+    ("ctrl-,", ShellCommand::OpenSettings),
+    ("escape", ShellCommand::CloseOverlay),
+    ("enter", ShellCommand::Confirm),
 ];
 
 /// Window-independent shell state: the host controller plus presentation cursors.
@@ -58,6 +72,9 @@ pub struct ShellState {
     controller: DrenyraHostController,
     review_cursor: usize,
     demo: bool,
+    settings: Settings,
+    /// Cursor into [`ThemeId::ALL`] while the Settings overlay is open; `None` when closed.
+    settings_cursor: Option<usize>,
 }
 
 impl ShellState {
@@ -66,7 +83,28 @@ impl ShellState {
             controller,
             review_cursor: 0,
             demo,
+            settings: Settings::default(),
+            settings_cursor: None,
         }
+    }
+
+    /// Replaces the operator settings (for example, the ones loaded from disk).
+    pub fn with_settings(mut self, settings: Settings) -> Self {
+        self.settings = settings;
+        self
+    }
+
+    pub fn settings(&self) -> Settings {
+        self.settings
+    }
+
+    /// Applies `theme`; returns `true` when it changed.
+    pub fn select_theme(&mut self, theme: ThemeId) -> bool {
+        if self.settings.theme == theme {
+            return false;
+        }
+        self.settings.theme = theme;
+        true
     }
 
     /// Deterministic demo state: two fiscal workspaces and one staged R2 proposal.
@@ -79,12 +117,44 @@ impl ShellState {
     }
 
     pub fn view(&self, pane_area: Rect) -> ShellViewModel {
-        ShellViewModel::build(&self.controller, pane_area, self.review_cursor, self.demo)
+        let mut view =
+            ShellViewModel::build(&self.controller, pane_area, self.review_cursor, self.demo);
+        view.theme = self.settings.theme;
+        view.settings = self.settings_cursor.map(|cursor| SettingsPanel {
+            sections: vec!["Themes"],
+            active_section: 0,
+            themes: ThemeId::ALL
+                .iter()
+                .enumerate()
+                .map(|(index, &id)| ThemeOption {
+                    id,
+                    label: id.label(),
+                    applied: id == self.settings.theme,
+                    cursor: index == cursor,
+                })
+                .collect(),
+        });
+        view
     }
 
     /// Applies `command`; returns `true` when the state changed and the window should re-render.
+    ///
+    /// While the Settings overlay is open it is modal: J/K move its cursor, Enter applies,
+    /// Escape closes, and workspace or review commands do nothing.
     pub fn apply(&mut self, command: ShellCommand, pane_area: Rect) -> bool {
+        if let Some(cursor) = self.settings_cursor {
+            return self.apply_in_settings(command, cursor);
+        }
         match command {
+            ShellCommand::OpenSettings => {
+                let current = ThemeId::ALL
+                    .iter()
+                    .position(|&id| id == self.settings.theme)
+                    .unwrap_or(0);
+                self.settings_cursor = Some(current);
+                true
+            }
+            ShellCommand::CloseOverlay | ShellCommand::Confirm => false,
             ShellCommand::SplitFocused => self.split_focused(pane_area),
             ShellCommand::CloseFocused => self
                 .controller
@@ -116,6 +186,25 @@ impl ShellState {
                     .active_review_mut()
                     .is_some_and(|review| review.reject_line(cursor, REJECT_COMMENT))
             }
+        }
+    }
+
+    fn apply_in_settings(&mut self, command: ShellCommand, cursor: usize) -> bool {
+        match command {
+            ShellCommand::ReviewCursorDown if cursor + 1 < ThemeId::ALL.len() => {
+                self.settings_cursor = Some(cursor + 1);
+                true
+            }
+            ShellCommand::ReviewCursorUp if cursor > 0 => {
+                self.settings_cursor = Some(cursor - 1);
+                true
+            }
+            ShellCommand::Confirm => self.select_theme(ThemeId::ALL[cursor]),
+            ShellCommand::CloseOverlay => {
+                self.settings_cursor = None;
+                true
+            }
+            _ => false,
         }
     }
 
@@ -198,6 +287,8 @@ const fn next_pane_kind(kind: PaneKind) -> PaneKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shell::settings::Settings;
+    use crate::shell::theme::ThemeId;
     use crate::shell::view_model::{Rect, RowDecision};
     use drenyra_workspace::{PaneKind, SplitAxis, WorkspaceActivity};
 
@@ -366,6 +457,95 @@ mod tests {
     }
 
     #[test]
+    fn settings_overlay_opens_moves_applies_theme_and_closes() {
+        let mut s = state();
+        assert_eq!(s.settings().theme, ThemeId::DreamcoderDark);
+        assert!(s.view(WIDE).settings.is_none());
+
+        assert!(s.apply(ShellCommand::OpenSettings, WIDE));
+        assert!(!s.apply(ShellCommand::OpenSettings, WIDE), "already open");
+        let panel = s.view(WIDE).settings.expect("settings open");
+        assert_eq!(panel.sections, vec!["Themes"]);
+        let labels: Vec<_> = panel.themes.iter().map(|t| t.label).collect();
+        assert_eq!(labels, vec!["Dreamcoder Dark", "Dreamcoder Light"]);
+        assert!(panel.themes[0].applied && panel.themes[0].cursor);
+
+        // J/K move the theme cursor while the overlay is open, not the review cursor.
+        assert!(s.apply(ShellCommand::ReviewCursorDown, WIDE));
+        assert!(
+            !s.apply(ShellCommand::ReviewCursorDown, WIDE),
+            "last option"
+        );
+        assert!(s.view(WIDE).review.expect("review").rows[0].cursor);
+        assert_eq!(
+            s.view(WIDE).theme,
+            ThemeId::DreamcoderDark,
+            "moving is not applying"
+        );
+
+        assert!(s.apply(ShellCommand::Confirm, WIDE));
+        assert_eq!(s.settings().theme, ThemeId::DreamcoderLight);
+        assert_eq!(s.view(WIDE).theme, ThemeId::DreamcoderLight);
+        assert!(!s.apply(ShellCommand::Confirm, WIDE), "same theme again");
+        assert!(s.apply(ShellCommand::ReviewCursorUp, WIDE));
+
+        assert!(s.apply(ShellCommand::CloseOverlay, WIDE));
+        assert!(s.view(WIDE).settings.is_none());
+        assert!(
+            !s.apply(ShellCommand::CloseOverlay, WIDE),
+            "nothing to close"
+        );
+        assert_eq!(
+            s.settings().theme,
+            ThemeId::DreamcoderLight,
+            "kept after close"
+        );
+    }
+
+    #[test]
+    fn settings_overlay_is_modal_for_workspace_and_review_commands() {
+        let mut s = state();
+        s.apply(ShellCommand::OpenSettings, WIDE);
+        let before = s.view(WIDE);
+        for cmd in [
+            ShellCommand::SplitFocused,
+            ShellCommand::CloseFocused,
+            ShellCommand::UndoClose,
+            ShellCommand::FocusNextPane,
+            ShellCommand::NextWorkspace,
+            ShellCommand::AcceptLine,
+            ShellCommand::RejectLine,
+        ] {
+            assert!(
+                !s.apply(cmd, WIDE),
+                "{cmd:?} must be blocked by the overlay"
+            );
+        }
+        let after = s.view(WIDE);
+        assert_eq!(after.panes, before.panes);
+        assert_eq!(after.review, before.review);
+        assert_eq!(after.workspaces, before.workspaces);
+    }
+
+    #[test]
+    fn select_theme_applies_directly_and_confirm_is_a_no_op_outside_settings() {
+        let mut s = ShellState::demo().with_settings(Settings {
+            theme: ThemeId::DreamcoderLight,
+        });
+        assert_eq!(s.view(WIDE).theme, ThemeId::DreamcoderLight);
+        assert!(!s.apply(ShellCommand::Confirm, WIDE));
+        assert!(s.select_theme(ThemeId::DreamcoderDark));
+        assert!(!s.select_theme(ThemeId::DreamcoderDark));
+        assert_eq!(s.settings().theme, ThemeId::DreamcoderDark);
+
+        // Opening the overlay puts the cursor on the applied theme.
+        s.select_theme(ThemeId::DreamcoderLight);
+        s.apply(ShellCommand::OpenSettings, WIDE);
+        let panel = s.view(WIDE).settings.expect("open");
+        assert!(panel.themes[1].cursor && panel.themes[1].applied);
+    }
+
+    #[test]
     fn key_bindings_cover_every_command_without_duplicate_keys() {
         for command in ALL_COMMANDS {
             assert!(
@@ -380,5 +560,8 @@ mod tests {
         assert_eq!(keys.len(), before, "duplicate key binding");
         assert!(KEY_BINDINGS.contains(&("ctrl-d", ShellCommand::SplitFocused)));
         assert!(KEY_BINDINGS.contains(&("a", ShellCommand::AcceptLine)));
+        assert!(KEY_BINDINGS.contains(&("ctrl-,", ShellCommand::OpenSettings)));
+        assert!(KEY_BINDINGS.contains(&("escape", ShellCommand::CloseOverlay)));
+        assert!(KEY_BINDINGS.contains(&("enter", ShellCommand::Confirm)));
     }
 }
