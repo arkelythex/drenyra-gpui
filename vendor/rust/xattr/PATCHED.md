@@ -10,5 +10,8 @@ and older `libc` versions are ruled out by other GPUI dependencies (`nix`, `mio`
 **Change:** a single constant in `src/sys/mod.rs`. On Linux and Android `ENOATTR` is `libc::ENODATA`
 (the value it always aliased); every other platform still uses `libc::ENOATTR`.
 
+Compared with the crates.io copy, only `src/sys/mod.rs` differs, this file is added, and the registry
+metadata files `.cargo-ok` and `.cargo_vcs_info.json` are intentionally not vendored.
+
 **Remove when:** GPUI moves `zed-async-tar` to `xattr >= 1`, or `xattr 0.2.x` ships a fix. Delete
 this directory and the `[patch.crates-io]` entry.
