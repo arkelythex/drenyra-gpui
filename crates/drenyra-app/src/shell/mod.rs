@@ -6,3 +6,5 @@
 pub mod commands;
 pub mod demo;
 pub mod view_model;
+#[cfg(feature = "gpui")]
+pub mod window;

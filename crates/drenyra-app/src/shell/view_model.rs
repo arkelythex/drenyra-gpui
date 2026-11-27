@@ -6,6 +6,24 @@ use drenyra_workspace::{PaneKind, PaneNode, SplitAxis, WorkspaceActivity};
 
 use crate::controller::DrenyraHostController;
 
+/// Height of the workspace and guardrail chip bar, in pixels.
+pub const TOP_BAR_HEIGHT: u32 = 44;
+/// Height of the key-hint footer, in pixels.
+pub const FOOTER_HEIGHT: u32 = 28;
+/// Width of the Entry Diff Review panel when a review is staged, in pixels.
+pub const REVIEW_PANEL_WIDTH: u32 = 440;
+
+/// Region left for the dwindle panes in a `width` x `height` viewport (pane-area coordinates).
+pub const fn pane_area(width: u32, height: u32, has_review: bool) -> Rect {
+    let panel = if has_review { REVIEW_PANEL_WIDTH } else { 0 };
+    Rect {
+        x: 0,
+        y: 0,
+        width: width.saturating_sub(panel),
+        height: height.saturating_sub(TOP_BAR_HEIGHT + FOOTER_HEIGHT),
+    }
+}
+
 /// Integer-pixel rectangle in window coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rect {
@@ -500,5 +518,29 @@ mod tests {
         let panel = vm.review.expect("review panel");
         assert!(panel.rows[2].cursor);
         assert_eq!(panel.rows.iter().filter(|r| r.cursor).count(), 1);
+    }
+
+    #[test]
+    fn pane_area_excludes_top_bar_footer_and_review_panel() {
+        assert_eq!(
+            pane_area(1440, 900, false),
+            Rect {
+                x: 0,
+                y: 0,
+                width: 1440,
+                height: 900 - TOP_BAR_HEIGHT - FOOTER_HEIGHT,
+            }
+        );
+        assert_eq!(pane_area(1440, 900, true).width, 1440 - REVIEW_PANEL_WIDTH);
+        // Tiny windows never underflow.
+        assert_eq!(
+            pane_area(10, 10, true),
+            Rect {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0
+            }
+        );
     }
 }

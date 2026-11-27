@@ -1,5 +1,7 @@
 # Drenyra GPUI — Philosophy & Native Desktop Architecture
 
+> **Last updated:** 2026-11-27 (native GPUI window, shell view model and commands).
+
 > **Your accounting agents shouldn't live in a scrollback — or trapped in a browser tab.**
 >
 > **Drenyra GPUI** gives **Drenyra Shell (`drenyra-pi`)** and **Drenyra AI (`drenyra-ai`)** a native desktop home, built in Rust with [GPUI](https://gpui.rs/), inspired by the philosophy of [gentle-shell-gpui](https://github.com/Gentleman-Programming/gentle-shell-gpui) and adapted from first principles to verifiable accounting and financial engineering.
@@ -45,7 +47,11 @@ drenyra-gpui/
 ├── crates/
 │   ├── drenyra-protocol/       # JSON-RPC 2.0 stdio transport, MoneyCents(i128), Entry Diff & Receipt contracts
 │   ├── drenyra-workspace/      # Fiscal Workspaces, Hyprland dwindle tiling tree, Sidebar, Session Chips & RDA gate
-│   └── drenyra-app/            # Native desktop host binary (GPUI shell mount + --check-env headless diagnostics)
+│   ├── drenyra-rpc/            # Supervised stdio JSON-RPC 2.0 session (timeouts, poisoning, response-id matching)
+│   ├── drenyra-ui/             # Accounting Generative UI state: Entry Diff Review, Reconciliation Table
+│   └── drenyra-app/            # Desktop host binary: tenant-scoped controller, shell view model & commands,
+│                               #   feature-gated GPUI window (--window), --check-env / --demo-session / --probe-rpc
+├── vendor/rust/xattr/          # Temporary one-line patch for a GPUI transitive dependency (see PATCHED.md)
 ├── apps/
 │   ├── api/                    # Elysia/Bun backend API (preserved during migration)
 │   └── web/                    # Legacy TanStack Start web app + DEPRECATED src-tauri shell
@@ -53,10 +59,19 @@ drenyra-gpui/
 └── services/go/                # Go reconciliation worker
 ```
 
+### Running the native window
+
+```bash
+cargo run -p drenyra-app --features gpui -- --window
+```
+
+The window currently runs on deterministic demo data (two fiscal workspaces and one staged R2 proposal, labelled **DEMO DATA**) until panes are wired to live `drenyra-shell` RPC sessions. Keys: `Ctrl+D` split along the focused pane's longest side, `Ctrl+W` close, `Ctrl+Shift+T` undo close, `Ctrl+Tab` next pane, `Ctrl+K` next workspace, `J`/`K` move through review lines, `A` accept, `R` reject, `Ctrl+Q` quit. Linux needs the Wayland or X11 development libraries GPUI links against (`xkbcommon`, `wayland-client` or `xcb`, `fontconfig`, `freetype`, `vulkan`).
+
 ### Design Invariants
 
 - **Strict dependency direction:** `drenyra-app` → `drenyra-workspace` → `drenyra-protocol`. Neither `drenyra-protocol` nor `drenyra-workspace` may depend on UI/windowing crates.
 - **Headless verifiability:** `drenyra-protocol` and `drenyra-workspace` run deterministic unit tests via `cargo test --workspace`; `drenyra-app --check-env` validates local RPC binaries (`drenyra-shell` / `pi`, `drenyra-ai`) and prints a machine-readable JSON health report without opening a display.
+- **GPUI stays at the edge:** only `drenyra-app`'s `shell::window` module (behind the `gpui` Cargo feature) touches GPUI. `shell::view_model` and `shell::commands` derive everything the window renders and every key it handles in pure Rust, so the whole UI behavior is unit-tested without a display; the default build has no GPUI dependency.
 - **No silent float coercion:** `MoneyCents` parses exact integer cents and refuses balanced-entry approval whenever `sum(debits) != sum(credits)` or any line is zero/invalid.
 
 ---

@@ -22,6 +22,16 @@ impl Default for DesktopShellConfig {
     }
 }
 
+impl DesktopShellConfig {
+    /// Rejects configurations the window cannot open with.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.window_width == 0 || self.window_height == 0 {
+            return Err("window dimensions must be non-zero".into());
+        }
+        Ok(())
+    }
+}
+
 /// Initial workspace and shell state passed into the GPUI window mount hook.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowBootstrapPlan {
@@ -50,12 +60,15 @@ impl WindowBootstrapPlan {
     }
 }
 
-/// Mount boundary for native GPUI builds (`cargo build --features gpui`).
+/// Mount boundary for native GPUI builds (`cargo build --features gpui`): validates the
+/// configuration, then blocks in the GPUI event loop until the window closes.
 #[cfg(feature = "gpui")]
-pub fn mount_native_window(plan: &WindowBootstrapPlan) -> Result<(), String> {
-    if plan.config.window_width == 0 || plan.config.window_height == 0 {
-        return Err("window dimensions must be non-zero".into());
-    }
+pub fn mount_native_window(
+    config: DesktopShellConfig,
+    state: crate::shell::commands::ShellState,
+) -> Result<(), String> {
+    config.validate()?;
+    crate::shell::window::run(config, state);
     Ok(())
 }
 
@@ -75,12 +88,17 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "gpui")]
     #[test]
-    fn mount_native_window_validates_dimensions() {
-        let mut plan = WindowBootstrapPlan::default_bootstrap();
-        assert!(mount_native_window(&plan).is_ok());
-        plan.config.window_width = 0;
-        assert!(mount_native_window(&plan).is_err());
+    fn desktop_shell_config_validates_dimensions() {
+        let mut config = DesktopShellConfig::default();
+        assert_eq!(config.validate(), Ok(()));
+        config.window_width = 0;
+        assert_eq!(
+            config.validate(),
+            Err("window dimensions must be non-zero".to_owned())
+        );
+        config.window_width = 1440;
+        config.window_height = 0;
+        assert!(config.validate().is_err());
     }
 }

@@ -24,6 +24,34 @@ pub enum ShellCommand {
     RejectLine,
 }
 
+/// Every command, for exhaustiveness checks.
+pub const ALL_COMMANDS: &[ShellCommand] = &[
+    ShellCommand::SplitFocused,
+    ShellCommand::CloseFocused,
+    ShellCommand::UndoClose,
+    ShellCommand::FocusNextPane,
+    ShellCommand::NextWorkspace,
+    ShellCommand::ReviewCursorDown,
+    ShellCommand::ReviewCursorUp,
+    ShellCommand::AcceptLine,
+    ShellCommand::RejectLine,
+];
+
+/// Single source of truth for window key bindings (GPUI keystroke syntax).
+pub const KEY_BINDINGS: &[(&str, ShellCommand)] = &[
+    ("ctrl-d", ShellCommand::SplitFocused),
+    ("ctrl-w", ShellCommand::CloseFocused),
+    ("ctrl-shift-t", ShellCommand::UndoClose),
+    ("ctrl-tab", ShellCommand::FocusNextPane),
+    ("ctrl-k", ShellCommand::NextWorkspace),
+    ("j", ShellCommand::ReviewCursorDown),
+    ("down", ShellCommand::ReviewCursorDown),
+    ("k", ShellCommand::ReviewCursorUp),
+    ("up", ShellCommand::ReviewCursorUp),
+    ("a", ShellCommand::AcceptLine),
+    ("r", ShellCommand::RejectLine),
+];
+
 /// Window-independent shell state: the host controller plus presentation cursors.
 #[derive(Debug, Clone)]
 pub struct ShellState {
@@ -335,5 +363,22 @@ mod tests {
         ] {
             assert!(!s.apply(cmd, WIDE), "{cmd:?}");
         }
+    }
+
+    #[test]
+    fn key_bindings_cover_every_command_without_duplicate_keys() {
+        for command in ALL_COMMANDS {
+            assert!(
+                KEY_BINDINGS.iter().any(|(_, bound)| bound == command),
+                "{command:?} has no key binding"
+            );
+        }
+        let mut keys: Vec<&str> = KEY_BINDINGS.iter().map(|(key, _)| *key).collect();
+        keys.sort_unstable();
+        let before = keys.len();
+        keys.dedup();
+        assert_eq!(keys.len(), before, "duplicate key binding");
+        assert!(KEY_BINDINGS.contains(&("ctrl-d", ShellCommand::SplitFocused)));
+        assert!(KEY_BINDINGS.contains(&("a", ShellCommand::AcceptLine)));
     }
 }
