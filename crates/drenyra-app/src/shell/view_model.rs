@@ -435,12 +435,14 @@ mod tests {
         assert_eq!(vm.guardrails.unposted_entries, 1);
         assert!(vm.guardrails.rda_enabled);
         assert!(vm.guardrails.guardian_angel_active);
-        assert_eq!(vm.guardrails.risk_tier_label, "R0 Read");
+        // The staged R2 proposal raises the session approval gate.
+        assert_eq!(vm.guardrails.risk_tier_label, "R2 Material");
         assert_eq!(vm.guardrails.background_alert, WorkspaceActivity::Idle);
 
         assert!(c.workspaces_mut().switch_to(1));
         let vm = ShellViewModel::build(&c, AREA, 0, false);
         assert_eq!(vm.guardrails.unposted_entries, 0);
+        assert_eq!(vm.guardrails.risk_tier_label, "R0 Read");
         assert_eq!(
             vm.guardrails.background_alert,
             WorkspaceActivity::AwaitingApproval
