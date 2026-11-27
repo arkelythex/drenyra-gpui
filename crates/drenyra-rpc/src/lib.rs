@@ -39,7 +39,10 @@ impl fmt::Display for RpcError {
             Self::EmptyCommand => f.write_str("RPC transport command must not be empty"),
             Self::Timeout => f.write_str("RPC request timed out waiting for response"),
             Self::ResponseTooLarge { limit } => {
-                write!(f, "RPC response exceeded max_response_bytes limit ({limit})")
+                write!(
+                    f,
+                    "RPC response exceeded max_response_bytes limit ({limit})"
+                )
             }
             Self::SessionPoisoned => f.write_str(
                 "RPC session is poisoned after a timeout or framing violation; spawn a new session",
@@ -369,7 +372,8 @@ impl Drop for RpcSession {
                     stderr_handle = Some(handle);
                 }
             }
-            if (stdout_handle.is_none() && stderr_handle.is_none()) || Instant::now() >= join_deadline
+            if (stdout_handle.is_none() && stderr_handle.is_none())
+                || Instant::now() >= join_deadline
             {
                 break;
             }
@@ -475,7 +479,9 @@ mod tests {
             method: "ping".into(),
             params_json: "{}".into(),
         };
-        let resp = session.request(&req).expect("noisy child should not deadlock");
+        let resp = session
+            .request(&req)
+            .expect("noisy child should not deadlock");
         assert!(resp.contains(r#""result":"ok""#));
 
         let snap = session.stderr_snapshot();

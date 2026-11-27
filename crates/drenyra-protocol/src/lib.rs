@@ -14,7 +14,9 @@ impl fmt::Display for ProtocolError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyParams => f.write_str("params_json must not be empty"),
-            Self::MultilineParams => f.write_str("params_json must be single-line for NDJSON framing"),
+            Self::MultilineParams => {
+                f.write_str("params_json must be single-line for NDJSON framing")
+            }
             Self::InvalidParamsContainer => {
                 f.write_str("params_json must be a JSON object ({...}) or array ([...])")
             }
