@@ -1403,6 +1403,7 @@ name = "drenyra-rpc"
 version = "0.1.0"
 dependencies = [
  "drenyra-protocol",
+ "serde_json",
 ]
 
 [[package]]

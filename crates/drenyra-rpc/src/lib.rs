@@ -1,4 +1,8 @@
 //! Live NDJSON stdio JSON-RPC 2.0 subprocess supervisor for Drenyra GPUI.
+//!
+//! The agent shell (`pi --mode rpc`) speaks its own record protocol instead; see [`agent`].
+
+pub mod agent;
 
 use std::fmt;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
@@ -325,7 +329,7 @@ impl RpcSession {
     }
 }
 
-fn read_bounded_line(
+pub(crate) fn read_bounded_line(
     reader: &mut BufReader<ChildStdout>,
     max_bytes: usize,
 ) -> Result<Option<String>, RpcError> {
