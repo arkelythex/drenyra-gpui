@@ -95,12 +95,7 @@ impl DrenyraHostController {
         proposal: JournalEntryProposal,
     ) -> Result<(), ControllerError> {
         let index = self.workspaces.active_index();
-        let active = self.workspaces.active();
-        if proposal.entity_ruc != active.entity_ruc
-            || proposal.fiscal_period != active.fiscal_period
-        {
-            return Err(ControllerError::ProposalScopeMismatch);
-        }
+        self.ensure_proposal_matches_active_workspace(&proposal)?;
         if self.reviews.contains_key(&index) {
             return Err(ControllerError::ReviewAlreadyStaged);
         }
@@ -129,12 +124,29 @@ impl DrenyraHostController {
         &self.reconciliation
     }
 
+    fn ensure_proposal_matches_active_workspace(
+        &self,
+        proposal: &JournalEntryProposal,
+    ) -> Result<(), ControllerError> {
+        let active = self.workspaces.active();
+        if proposal.entity_ruc == active.entity_ruc
+            && proposal.fiscal_period == active.fiscal_period
+        {
+            Ok(())
+        } else {
+            Err(ControllerError::ProposalScopeMismatch)
+        }
+    }
+
     /// Builds the `ledger_post` NDJSON frame for the active workspace's approved review and
-    /// clears it. On error, the review and workspace state are left untouched.
+    /// clears it. Fails with [`ControllerError::ProposalScopeMismatch`] if the active workspace's
+    /// RUC or fiscal period changed since staging. On error, all state is left untouched.
     pub fn build_post_request(&mut self) -> Result<String, ControllerError> {
         let review = self
             .active_review()
             .ok_or(ControllerError::NoStagedReview)?;
+        // Re-check scope: workspace identity is mutable (e.g. period roll-over) after staging.
+        self.ensure_proposal_matches_active_workspace(review.proposal())?;
         if !review.can_post() {
             return Err(ControllerError::ReviewNotReadyToPost);
         }
@@ -461,6 +473,30 @@ mod tests {
             controller.workspaces().background_alert(),
             WorkspaceActivity::Idle
         );
+    }
+
+    #[test]
+    fn build_post_request_rejects_review_when_active_workspace_scope_changed() {
+        let ws = FiscalWorkspace::new("20123456789", "Andino SAC", "2026-10");
+        let mut controller = DrenyraHostController::new(ws);
+        controller
+            .stage_proposal(sample_proposal("je-001", RiskTier::R2Material, true))
+            .expect("proposal matches workspace");
+        {
+            let review = controller.active_review_mut().expect("staged review");
+            review.accept_all();
+            assert!(review.record_human_approval("CPA-PERU-001"));
+        }
+
+        controller.workspaces_mut().active_mut().fiscal_period = "2026-11".into();
+        assert_eq!(
+            controller.build_post_request(),
+            Err(ControllerError::ProposalScopeMismatch)
+        );
+        assert!(controller.active_review().is_some());
+        let active = controller.workspaces().active();
+        assert_eq!(active.guardrails.unposted_entries, 1);
+        assert_eq!(active.activity, WorkspaceActivity::AwaitingApproval);
     }
 
     #[test]
