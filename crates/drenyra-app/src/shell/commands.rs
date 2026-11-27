@@ -1,6 +1,6 @@
 //! GPUI-free operator commands applied to the shell state.
 
-use drenyra_workspace::PaneKind;
+use drenyra_workspace::{PaneKind, WorkspaceKey};
 
 use std::collections::BTreeMap;
 
@@ -95,6 +95,7 @@ const fn command_label(command: ShellCommand) -> Option<&'static str> {
         ShellCommand::OpenSettings => "Open settings",
         ShellCommand::FocusComposer => "Ask the Fiscal Agent",
         ShellCommand::StopAgent => "Stop the running agent",
+        ShellCommand::RestartAgent => "Restart the agent",
         ShellCommand::OpenApproval => "Record human approval…",
         ShellCommand::ToggleSidebar => "Toggle sidebar",
         ShellCommand::CloseOverlay | ShellCommand::Confirm | ShellCommand::OpenPalette => {
@@ -173,6 +174,8 @@ pub enum ShellCommand {
     FocusComposer,
     /// Stop the active workspace's running agent.
     StopAgent,
+    /// Start a fresh agent for the active workspace after it stopped or could not start.
+    RestartAgent,
     /// Open the human-approval dialog for the staged entry.
     OpenApproval,
     /// Open the command palette.
@@ -197,6 +200,7 @@ pub const ALL_COMMANDS: &[ShellCommand] = &[
     ShellCommand::Confirm,
     ShellCommand::FocusComposer,
     ShellCommand::StopAgent,
+    ShellCommand::RestartAgent,
     ShellCommand::OpenApproval,
     ShellCommand::OpenPalette,
     ShellCommand::ToggleSidebar,
@@ -220,6 +224,7 @@ pub const KEY_BINDINGS: &[(&str, ShellCommand)] = &[
     ("enter", ShellCommand::Confirm),
     ("i", ShellCommand::FocusComposer),
     ("ctrl-c", ShellCommand::StopAgent),
+    ("ctrl-shift-r", ShellCommand::RestartAgent),
     ("ctrl-p", ShellCommand::OpenApproval),
     ("ctrl-shift-p", ShellCommand::OpenPalette),
     ("ctrl-b", ShellCommand::ToggleSidebar),
@@ -234,8 +239,8 @@ pub struct ShellState {
     settings: Settings,
     /// Cursor into [`ThemeId::ALL`] while the Settings overlay is open; `None` when closed.
     settings_cursor: Option<usize>,
-    /// One Fiscal Agent pane per workspace index, so conversations never cross companies.
-    agents: BTreeMap<usize, AgentPane>,
+    /// One Fiscal Agent pane per company and period, so conversations never cross companies.
+    agents: BTreeMap<WorkspaceKey, AgentPane>,
     /// True while keystrokes go to the active workspace's composer.
     composer_active: bool,
     /// The approval dialog, when open.
@@ -278,16 +283,21 @@ impl ShellState {
         manager.switch_to(index)
     }
 
-    /// The Fiscal Agent pane of workspace `index` (empty until the window starts its agent).
-    pub fn agent_pane(&self, index: usize) -> AgentPane {
-        self.agents.get(&index).cloned().unwrap_or_default()
+    /// The Fiscal Agent pane of the workspace `key` (empty until the window starts its agent).
+    pub fn agent_pane(&self, key: &WorkspaceKey) -> AgentPane {
+        self.agents.get(key).cloned().unwrap_or_default()
     }
 
-    pub fn agent_pane_mut(&mut self, index: usize) -> &mut AgentPane {
-        self.agents.entry(index).or_default()
+    pub fn agent_pane_mut(&mut self, key: &WorkspaceKey) -> &mut AgentPane {
+        self.agents.entry(key.clone()).or_default()
     }
 
-    /// Index of the active workspace, which owns the visible agent pane.
+    /// Identity of the active workspace, which owns the visible agent pane.
+    pub fn active_workspace_key(&self) -> WorkspaceKey {
+        self.controller.workspaces().active_key()
+    }
+
+    /// Index of the active workspace in the switcher.
     pub fn active_workspace(&self) -> usize {
         self.controller.workspaces().active_index()
     }
@@ -320,8 +330,8 @@ impl ShellState {
         if !self.composer_active {
             return false;
         }
-        let index = self.active_workspace();
-        self.agent_pane_mut(index).composer_insert(text);
+        let key = self.active_workspace_key();
+        self.agent_pane_mut(&key).composer_insert(text);
         true
     }
 
@@ -337,8 +347,8 @@ impl ShellState {
         if !self.composer_active {
             return false;
         }
-        let index = self.active_workspace();
-        self.agent_pane_mut(index).composer_backspace()
+        let key = self.active_workspace_key();
+        self.agent_pane_mut(&key).composer_backspace()
     }
 
     /// Every palette entry with its action, in display order.
@@ -436,9 +446,15 @@ impl ShellState {
         let mut view =
             ShellViewModel::build(&self.controller, pane_area, self.review_cursor, self.demo);
         view.theme = self.settings.theme;
-        let index = self.active_workspace();
-        let pane = self.agents.get(&index).cloned().unwrap_or_default();
-        view.agent = Some(AgentPaneView::from_pane(&pane, self.composer_active));
+        let pane = self.agent_pane(&self.active_workspace_key());
+        let mut agent = AgentPaneView::from_pane(&pane, self.composer_active);
+        agent.restart_hint = pane.can_restart().then(|| {
+            format!(
+                "Press {} to restart the agent.",
+                key_hint(ShellCommand::RestartAgent)
+            )
+        });
+        view.agent = Some(agent);
         view.sidebar = self.sidebar_open.then(|| SidebarView {
             companies: self
                 .controller
@@ -556,8 +572,12 @@ impl ShellState {
                 focused_is_agent
             }
             ShellCommand::StopAgent => {
-                let index = self.active_workspace();
-                self.agent_pane_mut(index).stop()
+                let key = self.active_workspace_key();
+                self.agent_pane_mut(&key).stop()
+            }
+            ShellCommand::RestartAgent => {
+                let key = self.active_workspace_key();
+                self.agent_pane_mut(&key).restart()
             }
             ShellCommand::OpenSettings => {
                 let current = ThemeId::ALL
@@ -682,10 +702,10 @@ impl ShellState {
     }
 
     fn apply_in_composer(&mut self, command: ShellCommand) -> bool {
-        let index = self.active_workspace();
+        let key = self.active_workspace_key();
         match command {
-            ShellCommand::Confirm => self.agent_pane_mut(index).submit(),
-            ShellCommand::StopAgent => self.agent_pane_mut(index).stop(),
+            ShellCommand::Confirm => self.agent_pane_mut(&key).submit(),
+            ShellCommand::StopAgent => self.agent_pane_mut(&key).stop(),
             ShellCommand::CloseOverlay => {
                 self.composer_active = false;
                 true
@@ -792,10 +812,11 @@ const fn next_pane_kind(kind: PaneKind) -> PaneKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shell::agent_pane::AgentStatus;
     use crate::shell::settings::Settings;
     use crate::shell::theme::ThemeId;
     use crate::shell::view_model::{Rect, RowDecision};
-    use drenyra_workspace::{PaneKind, SplitAxis, WorkspaceActivity};
+    use drenyra_workspace::{PaneKind, SplitAxis, WorkspaceActivity, WorkspaceKey};
 
     const WIDE: Rect = Rect {
         x: 0,
@@ -806,6 +827,61 @@ mod tests {
 
     fn state() -> ShellState {
         ShellState::demo()
+    }
+
+    fn key(state: &ShellState, index: usize) -> WorkspaceKey {
+        state.controller().workspaces().workspaces()[index].key()
+    }
+
+    #[test]
+    fn agent_panes_belong_to_the_company_and_period_not_the_switcher_position() {
+        let mut s = state();
+        let andino = WorkspaceKey::new("20123456789", "2026-10");
+        let sierra = WorkspaceKey::new("20987654321", "2026-11");
+        assert_eq!(s.active_workspace_key(), andino);
+        s.agent_pane_mut(&sierra).mark_unavailable("sierra only");
+
+        assert!(s.agent_pane(&andino).transcript().is_empty());
+        assert_eq!(s.agent_pane(&andino).status(), &AgentStatus::NotStarted);
+        assert!(s.apply(ShellCommand::NextWorkspace, WIDE));
+        assert_eq!(s.active_workspace_key(), sierra);
+        assert_eq!(
+            s.agent_pane(&sierra).status(),
+            &AgentStatus::Unavailable("sierra only".into())
+        );
+    }
+
+    #[test]
+    fn restart_agent_acts_only_on_the_active_workspace_s_stopped_agent() {
+        let mut s = state();
+        let (andino, sierra) = (key(&s, 0), key(&s, 1));
+        assert!(
+            !s.apply(ShellCommand::RestartAgent, WIDE),
+            "nothing to restart"
+        );
+        s.agent_pane_mut(&andino).mark_started();
+        s.agent_pane_mut(&andino)
+            .apply(drenyra_rpc::agent::AgentUpdate::Exited);
+        s.agent_pane_mut(&sierra)
+            .apply(drenyra_rpc::agent::AgentUpdate::Exited);
+
+        assert_eq!(
+            command_label(ShellCommand::RestartAgent),
+            Some("Restart the agent")
+        );
+        assert_eq!(key_hint(ShellCommand::RestartAgent), "Ctrl+Shift+R");
+        assert!(s.apply(ShellCommand::RestartAgent, WIDE));
+        assert_eq!(s.agent_pane(&andino).status(), &AgentStatus::NotStarted);
+        assert!(
+            matches!(s.agent_pane(&sierra).status(), AgentStatus::Stopped(_)),
+            "the other company's agent is untouched"
+        );
+        assert!(s.view(WIDE).agent.expect("agent").restart_hint.is_none());
+        assert!(s.apply(ShellCommand::NextWorkspace, WIDE));
+        assert_eq!(
+            s.view(WIDE).agent.expect("agent").restart_hint.as_deref(),
+            Some("Press Ctrl+Shift+R to restart the agent.")
+        );
     }
 
     fn pane_kinds(state: &ShellState) -> Vec<PaneKind> {
@@ -1072,9 +1148,9 @@ mod tests {
     #[test]
     fn composer_mode_is_modal_and_enter_submits_to_the_active_workspace_only() {
         let mut s = state();
-        s.agent_pane_mut(0).mark_started();
-        s.agent_pane_mut(0).take_outbox();
-        s.agent_pane_mut(0)
+        s.agent_pane_mut(&key(&s, 0)).mark_started();
+        s.agent_pane_mut(&key(&s, 0)).take_outbox();
+        s.agent_pane_mut(&key(&s, 0))
             .apply(drenyra_rpc::agent::AgentUpdate::Event(
                 drenyra_rpc::agent::AgentEvent::State {
                     model: None,
@@ -1095,12 +1171,12 @@ mod tests {
             );
         }
         assert!(s.apply(ShellCommand::Confirm, WIDE));
-        assert_eq!(s.agent_pane_mut(0).take_outbox().len(), 1);
+        assert_eq!(s.agent_pane_mut(&key(&s, 0)).take_outbox().len(), 1);
         assert!(
-            s.agent_pane_mut(1).take_outbox().is_empty(),
+            s.agent_pane_mut(&key(&s, 1)).take_outbox().is_empty(),
             "other company untouched"
         );
-        assert!(s.agent_pane(1).transcript().is_empty());
+        assert!(s.agent_pane(&key(&s, 1)).transcript().is_empty());
 
         assert!(s.apply(ShellCommand::CloseOverlay, WIDE));
         assert!(!s.view(WIDE).agent.expect("agent").composer_active);
@@ -1115,14 +1191,14 @@ mod tests {
     fn stop_agent_only_acts_on_a_running_agent() {
         let mut s = state();
         assert!(!s.apply(ShellCommand::StopAgent, WIDE));
-        s.agent_pane_mut(0).mark_started();
-        s.agent_pane_mut(0).take_outbox();
-        s.agent_pane_mut(0)
+        s.agent_pane_mut(&key(&s, 0)).mark_started();
+        s.agent_pane_mut(&key(&s, 0)).take_outbox();
+        s.agent_pane_mut(&key(&s, 0))
             .apply(drenyra_rpc::agent::AgentUpdate::Event(
                 drenyra_rpc::agent::AgentEvent::RunStarted,
             ));
         assert!(s.apply(ShellCommand::StopAgent, WIDE));
-        assert_eq!(s.agent_pane_mut(0).take_outbox().len(), 2);
+        assert_eq!(s.agent_pane_mut(&key(&s, 0)).take_outbox().len(), 2);
     }
 
     #[test]
@@ -1275,7 +1351,7 @@ mod tests {
             );
         }
         assert!(
-            s.agent_pane(0).composer().is_empty(),
+            s.agent_pane(&key(&s, 0)).composer().is_empty(),
             "typing went to the query"
         );
         s.apply(ShellCommand::CloseOverlay, WIDE);
@@ -1409,7 +1485,8 @@ mod tests {
                 "20987654321",
                 "Sierra SRL",
                 "2026-11",
-            ));
+            ))
+            .expect("distinct workspace");
         c.stage_proposal(demo_proposal()).expect("stage Andino");
         c.workspaces_mut().switch_to(1);
         let mut sierra = demo_proposal();

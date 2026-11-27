@@ -456,7 +456,10 @@ mod tests {
         let ws_a = FiscalWorkspace::new("20123456789", "Andino SAC", "2026-10");
         let ws_b = FiscalWorkspace::new("20987654321", "Sierra SRL", "2026-11");
         let mut controller = DrenyraHostController::new(ws_a);
-        let idx_b = controller.workspaces_mut().add_workspace(ws_b);
+        let idx_b = controller
+            .workspaces_mut()
+            .add_workspace(ws_b)
+            .expect("distinct workspace");
         controller
             .stage_proposal(sample_proposal("je-a", RiskTier::R1Draft, true))
             .expect("proposal matches workspace A");
@@ -586,7 +589,10 @@ mod tests {
         let ws_a = FiscalWorkspace::new("20123456789", "Andino SAC", "2026-10");
         let ws_b = FiscalWorkspace::new("20987654321", "Sierra SRL", "2026-11");
         let mut controller = DrenyraHostController::new(ws_a);
-        let idx_b = controller.workspaces_mut().add_workspace(ws_b);
+        let idx_b = controller
+            .workspaces_mut()
+            .add_workspace(ws_b)
+            .expect("distinct workspace");
 
         controller
             .stage_proposal(sample_proposal("je-a", RiskTier::R2Material, true))
@@ -690,7 +696,10 @@ mod tests {
         let ws1 = FiscalWorkspace::new("20123456789", "Andino SAC", "2026-10");
         let ws2 = FiscalWorkspace::new("20987654321", "Sierra SRL", "2026-11");
         let mut controller = DrenyraHostController::new(ws1);
-        let idx2 = controller.workspaces_mut().add_workspace(ws2);
+        let idx2 = controller
+            .workspaces_mut()
+            .add_workspace(ws2)
+            .expect("distinct workspace");
         assert!(controller.workspaces_mut().switch_to(idx2));
         assert_eq!(controller.workspaces().active().entity_ruc, "20987654321");
 

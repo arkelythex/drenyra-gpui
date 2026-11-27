@@ -50,7 +50,8 @@ pub fn demo_controller() -> DrenyraHostController {
     let mut controller = DrenyraHostController::new(demo_workspace());
     controller
         .workspaces_mut()
-        .add_workspace(FiscalWorkspace::new("20987654321", "Sierra SRL", "2026-11"));
+        .add_workspace(FiscalWorkspace::new("20987654321", "Sierra SRL", "2026-11"))
+        .expect("demo workspaces are distinct");
     controller
         .stage_proposal(demo_proposal())
         .expect("demo proposal matches the demo workspace scope");

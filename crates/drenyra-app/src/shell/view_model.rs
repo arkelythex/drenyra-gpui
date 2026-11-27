@@ -198,6 +198,8 @@ pub struct AgentPaneView {
     pub composer: String,
     pub composer_active: bool,
     pub can_send: bool,
+    /// How to restart a stopped agent; `None` while it runs.
+    pub restart_hint: Option<String>,
 }
 
 impl AgentPaneView {
@@ -223,6 +225,7 @@ impl AgentPaneView {
             composer: pane.composer().to_owned(),
             composer_active,
             can_send: pane.accepts_prompts(),
+            restart_hint: None,
         }
     }
 }
@@ -509,7 +512,8 @@ mod tests {
         ));
         controller
             .workspaces_mut()
-            .add_workspace(FiscalWorkspace::new("20987654321", "Sierra SRL", "2026-11"));
+            .add_workspace(FiscalWorkspace::new("20987654321", "Sierra SRL", "2026-11"))
+            .expect("distinct workspace");
         controller
     }
 

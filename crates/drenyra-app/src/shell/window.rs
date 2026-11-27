@@ -29,7 +29,7 @@ use super::view_model::{
     WorkspaceChip, FOOTER_HEIGHT, REVIEW_PANEL_WIDTH, SIDEBAR_WIDTH, TOP_BAR_HEIGHT,
 };
 use crate::ui::DesktopShellConfig;
-use drenyra_workspace::{PaneKind, WorkspaceActivity};
+use drenyra_workspace::{PaneKind, WorkspaceActivity, WorkspaceKey};
 
 actions!(
     drenyra,
@@ -51,6 +51,7 @@ actions!(
         OpenApproval,
         OpenPalette,
         ToggleSidebar,
+        RestartAgent,
         Quit
     ]
 );
@@ -178,6 +179,7 @@ fn key_bindings() -> Vec<KeyBinding> {
             ShellCommand::OpenApproval => KeyBinding::new(key, OpenApproval, context),
             ShellCommand::OpenPalette => KeyBinding::new(key, OpenPalette, context),
             ShellCommand::ToggleSidebar => KeyBinding::new(key, ToggleSidebar, context),
+            ShellCommand::RestartAgent => KeyBinding::new(key, RestartAgent, context),
         })
         .collect()
 }
@@ -188,8 +190,8 @@ struct ShellWindow {
     settings_path: Option<PathBuf>,
     /// Last failure to save settings, shown in the footer until a save succeeds.
     save_error: Option<String>,
-    /// Running agent processes by workspace index. Dropping one closes the agent gracefully.
-    sessions: BTreeMap<usize, AgentSession>,
+    /// Running agent processes by company and period. Dropping one closes the agent gracefully.
+    sessions: BTreeMap<WorkspaceKey, AgentSession>,
 }
 
 impl ShellWindow {
@@ -206,8 +208,8 @@ impl ShellWindow {
     /// whatever every agent wrote since the last poll.
     fn poll_agents(&mut self, cx: &mut Context<Self>) {
         let mut changed = self.ensure_active_agent();
-        for (&index, session) in &self.sessions {
-            let pane = self.state.agent_pane_mut(index);
+        for (key, session) in &self.sessions {
+            let pane = self.state.agent_pane_mut(key);
             for frame in pane.take_outbox() {
                 if let Err(err) = session.send(&frame) {
                     changed |= pane.apply(AgentUpdate::Failed(err.to_string()));
@@ -224,16 +226,21 @@ impl ShellWindow {
     }
 
     fn ensure_active_agent(&mut self) -> bool {
-        let index = self.state.active_workspace();
-        if self.state.agent_pane(index).status() != &AgentStatus::NotStarted {
+        let key = self.state.active_workspace_key();
+        if self.state.agent_pane(&key).status() != &AgentStatus::NotStarted {
             return false;
         }
-        let pane = self.state.agent_pane_mut(index);
+        // A restarted pane may still own its previous session. Its Drop can wait for the agent's
+        // grace period, so it runs off the UI thread.
+        if let Some(previous) = self.sessions.remove(&key) {
+            std::thread::spawn(move || drop(previous));
+        }
+        let pane = self.state.agent_pane_mut(&key);
         match agent_launch(crate::find_in_path) {
             Ok(config) => match AgentSession::spawn(&config) {
                 Ok(session) => {
                     pane.mark_started();
-                    self.sessions.insert(index, session);
+                    self.sessions.insert(key, session);
                 }
                 Err(err) => pane.mark_unavailable(format!("Could not start the agent: {err}")),
             },
@@ -412,6 +419,9 @@ impl Render for ShellWindow {
             }))
             .on_action(cx.listener(|this, _: &OpenPalette, w, cx| {
                 this.dispatch(ShellCommand::OpenPalette, w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &RestartAgent, w, cx| {
+                this.dispatch(ShellCommand::RestartAgent, w, cx)
             }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, w, cx| {
                 this.dispatch(ShellCommand::ToggleSidebar, w, cx)
@@ -770,6 +780,9 @@ fn agent_body(
                         .child("Ask the Fiscal Agent about this company. Press I or click below to start typing.")
                 }))
                 .children(agent.transcript.iter().map(|entry| transcript_entry(entry.role, &entry.text, t)))
+                .children(agent.restart_hint.as_ref().map(|hint| {
+                    div().text_color(rgb(t.warning)).child(hint.clone())
+                }))
                 .children((!agent.streaming_text.is_empty()).then(|| {
                     transcript_entry(EntryRole::Agent, &format!("{}▍", agent.streaming_text), t)
                 })),
