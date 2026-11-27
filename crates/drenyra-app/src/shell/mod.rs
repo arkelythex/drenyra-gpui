@@ -5,6 +5,8 @@
 
 pub mod commands;
 pub mod demo;
+pub mod settings;
+pub mod theme;
 pub mod view_model;
 
 #[cfg(test)]

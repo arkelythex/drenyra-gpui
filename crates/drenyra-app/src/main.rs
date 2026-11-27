@@ -119,9 +119,15 @@ pub const fn window_unavailable_message() -> &'static str {
 
 #[cfg(feature = "gpui")]
 fn run_window() -> ExitCode {
+    let settings_path = shell::settings::default_settings_path();
+    let settings = settings_path
+        .as_deref()
+        .map(shell::settings::Settings::load)
+        .unwrap_or_default();
     match ui::mount_native_window(
         ui::DesktopShellConfig::default(),
-        shell::commands::ShellState::demo(),
+        shell::commands::ShellState::demo().with_settings(settings),
+        settings_path,
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
