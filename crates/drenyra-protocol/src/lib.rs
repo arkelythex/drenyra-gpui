@@ -8,6 +8,7 @@ pub enum ProtocolError {
     EmptyParams,
     MultilineParams,
     InvalidParamsContainer,
+    InvalidResponseFrame,
 }
 
 impl fmt::Display for ProtocolError {
@@ -20,6 +21,9 @@ impl fmt::Display for ProtocolError {
             Self::InvalidParamsContainer => {
                 f.write_str("params_json must be a JSON object ({...}) or array ([...])")
             }
+            Self::InvalidResponseFrame => f.write_str(
+                "response must be a single JSON object with at most one top-level \"id\"",
+            ),
         }
     }
 }
@@ -182,6 +186,25 @@ pub fn validate_json_container(input: &str) -> Result<(), ProtocolError> {
     Ok(())
 }
 
+/// Returns the raw literal of the top-level `"id"` member of a JSON-RPC response line
+/// (for example `7`, `"abc"` or `null`), or `None` for a notification without one.
+///
+/// The line must be a single valid RFC 8259 JSON object; nested `"id"` members are ignored and a
+/// duplicated top-level `"id"` is rejected as ambiguous.
+pub fn response_id(line: &str) -> Result<Option<&str>, ProtocolError> {
+    let mut validator = JsonValidator::new(line.as_bytes());
+    validator.skip_ws();
+    let span = validator
+        .parse_top_level_object_id()
+        .map_err(|_| ProtocolError::InvalidResponseFrame)?;
+    validator.skip_ws();
+    if validator.pos != validator.bytes.len() {
+        return Err(ProtocolError::InvalidResponseFrame);
+    }
+    // Spans start and end on ASCII JSON token boundaries, so slicing is char-boundary safe.
+    Ok(span.map(|(start, end)| &line[start..end]))
+}
+
 struct JsonValidator<'a> {
     bytes: &'a [u8],
     pos: usize,
@@ -258,6 +281,45 @@ impl<'a> JsonValidator<'a> {
             match self.next() {
                 Some(b',') => continue,
                 Some(b'}') => return Ok(()),
+                _ => return Err(ProtocolError::InvalidParamsContainer),
+            }
+        }
+    }
+
+    /// Parses a top-level object like [`Self::parse_object`] and returns the byte span of its
+    /// single `"id"` value, if present.
+    fn parse_top_level_object_id(&mut self) -> Result<Option<(usize, usize)>, ProtocolError> {
+        if self.next() != Some(b'{') {
+            return Err(ProtocolError::InvalidParamsContainer);
+        }
+        self.skip_ws();
+        if self.peek() == Some(b'}') {
+            self.pos += 1;
+            return Ok(None);
+        }
+        let mut id_span = None;
+        loop {
+            self.skip_ws();
+            let key_start = self.pos;
+            self.parse_string()?;
+            let is_id = &self.bytes[key_start..self.pos] == b"\"id\"";
+            self.skip_ws();
+            if self.next() != Some(b':') {
+                return Err(ProtocolError::InvalidParamsContainer);
+            }
+            self.skip_ws();
+            let value_start = self.pos;
+            self.parse_value(0)?;
+            if is_id {
+                if id_span.is_some() {
+                    return Err(ProtocolError::InvalidParamsContainer);
+                }
+                id_span = Some((value_start, self.pos));
+            }
+            self.skip_ws();
+            match self.next() {
+                Some(b',') => continue,
+                Some(b'}') => return Ok(id_span),
                 _ => return Err(ProtocolError::InvalidParamsContainer),
             }
         }
@@ -632,5 +694,50 @@ mod tests {
                 "expected validate_json_container to accept {valid:?}"
             );
         }
+    }
+
+    #[test]
+    fn response_id_returns_raw_top_level_id_literal() {
+        assert_eq!(
+            response_id(r#"{"jsonrpc":"2.0","id":7,"result":{"id":99}}"#),
+            Ok(Some("7"))
+        );
+        assert_eq!(
+            response_id(r#" { "result" : [1,{"id":3}] , "id" : "abc" } "#),
+            Ok(Some(r#""abc""#))
+        );
+        assert_eq!(
+            response_id(r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700}}"#),
+            Ok(Some("null"))
+        );
+    }
+
+    #[test]
+    fn response_id_is_none_for_notifications_without_top_level_id() {
+        assert_eq!(
+            response_id(r#"{"jsonrpc":"2.0","method":"log","params":{"id":1}}"#),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn response_id_rejects_non_object_or_ambiguous_frames() {
+        for bad in [
+            "pong",
+            "[1,2]",
+            r#"{"id":1"#,
+            r#"{"id":1,"id":2}"#,
+            r#"{"id":1} trailing"#,
+        ] {
+            assert_eq!(
+                response_id(bad),
+                Err(ProtocolError::InvalidResponseFrame),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            ProtocolError::InvalidResponseFrame.to_string(),
+            "response must be a single JSON object with at most one top-level \"id\""
+        );
     }
 }

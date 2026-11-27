@@ -7,7 +7,7 @@ use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use drenyra_protocol::{JsonRpcRequest, ProtocolError};
+use drenyra_protocol::{response_id, JsonRpcRequest, ProtocolError};
 
 /// Default timeout for a single JSON-RPC request waiting for a response line.
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -29,8 +29,15 @@ pub enum RpcError {
     UnexpectedEof,
     EmptyCommand,
     Timeout,
-    ResponseTooLarge { limit: usize },
+    ResponseTooLarge {
+        limit: usize,
+    },
     SessionPoisoned,
+    /// The server answered with a response for a different request: the stream is desynchronized.
+    ResponseIdMismatch {
+        expected: u64,
+        received: String,
+    },
 }
 
 impl fmt::Display for RpcError {
@@ -50,6 +57,10 @@ impl fmt::Display for RpcError {
             Self::SessionPoisoned => f.write_str(
                 "RPC session is poisoned after a timeout or framing violation; spawn a new session",
             ),
+            Self::ResponseIdMismatch { expected, received } => write!(
+                f,
+                "RPC response id {received} does not match request id {expected}"
+            ),
         }
     }
 }
@@ -63,7 +74,8 @@ impl std::error::Error for RpcError {
             | Self::EmptyCommand
             | Self::Timeout
             | Self::ResponseTooLarge { .. }
-            | Self::SessionPoisoned => None,
+            | Self::SessionPoisoned
+            | Self::ResponseIdMismatch { .. } => None,
         }
     }
 }
@@ -221,7 +233,12 @@ impl RpcSession {
         }
     }
 
-    /// Sends one validated NDJSON `JsonRpcRequest` line and reads one NDJSON response line.
+    /// Sends one validated NDJSON `JsonRpcRequest` line and returns the NDJSON response line whose
+    /// top-level `id` matches the request (or is `null`, the JSON-RPC parse-error reply).
+    ///
+    /// Notifications (lines without a top-level `id`) received meanwhile are skipped within the
+    /// same `request_timeout`. A non-object line or a response for another id means the stream is
+    /// desynchronized, so the session is poisoned.
     pub fn request(&mut self, req: &JsonRpcRequest) -> Result<String, RpcError> {
         if self.poisoned {
             return Err(RpcError::SessionPoisoned);
@@ -243,7 +260,31 @@ impl RpcSession {
             return Err(RpcError::Io(err));
         }
 
-        match self.stdout_rx.recv_timeout(self.request_timeout) {
+        let deadline = Instant::now() + self.request_timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let line = self.recv_line(remaining)?;
+            match response_id(&line) {
+                Ok(None) => continue,
+                Ok(Some(id)) if id == "null" || id == req.id.to_string() => return Ok(line),
+                Ok(Some(id)) => {
+                    self.poisoned = true;
+                    return Err(RpcError::ResponseIdMismatch {
+                        expected: req.id,
+                        received: id.to_owned(),
+                    });
+                }
+                Err(err) => {
+                    self.poisoned = true;
+                    return Err(RpcError::Protocol(err));
+                }
+            }
+        }
+    }
+
+    /// Receives one stdout line within `timeout`, poisoning the session on any failure.
+    fn recv_line(&mut self, timeout: Duration) -> Result<String, RpcError> {
+        match self.stdout_rx.recv_timeout(timeout) {
             Ok(Ok(Some(line))) => Ok(line),
             Ok(Ok(None)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
                 self.wait_stderr_briefly();
@@ -769,5 +810,94 @@ mod tests {
     #[test]
     fn drop_kills_child_that_outlives_zero_shutdown_grace() {
         assert_eq!(drop_slow_flushing_child(Duration::ZERO), "");
+    }
+
+    #[cfg(unix)]
+    fn ping(id: u64) -> JsonRpcRequest {
+        JsonRpcRequest {
+            id,
+            method: "ping".into(),
+            params_json: "{}".into(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn request_skips_notifications_until_matching_response() {
+        let script = r#"IFS= read -r _; printf '{"jsonrpc":"2.0","method":"notifications/progress","params":{"id":1}}\n{"jsonrpc":"2.0","id":1,"result":"ok"}\n'; IFS= read -r _"#;
+        let cfg = RpcTransportConfig::new("sh", vec!["-c".into(), script.into()]);
+        let mut session = RpcSession::spawn(&cfg).expect("spawn notifying responder");
+        let resp = session
+            .request(&ping(1))
+            .expect("matching response after notification");
+        assert_eq!(resp, r#"{"jsonrpc":"2.0","id":1,"result":"ok"}"#);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn request_rejects_response_for_another_id_and_poisons_session() {
+        let script = r#"IFS= read -r _; printf '{"jsonrpc":"2.0","id":99,"result":"stale"}\n'; IFS= read -r _; printf '{"jsonrpc":"2.0","id":2,"result":"ok"}\n'"#;
+        let cfg = RpcTransportConfig::new("sh", vec!["-c".into(), script.into()]);
+        let mut session = RpcSession::spawn(&cfg).expect("spawn desynchronized responder");
+        let err = session.request(&ping(1)).expect_err("expected id mismatch");
+        assert!(
+            matches!(&err, RpcError::ResponseIdMismatch { expected: 1, received } if received == "99"),
+            "got {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "RPC response id 99 does not match request id 1"
+        );
+        let err2 = session
+            .request(&ping(2))
+            .expect_err("session must be poisoned");
+        assert!(matches!(err2, RpcError::SessionPoisoned), "got {err2:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn request_rejects_non_json_response_and_poisons_session() {
+        let script = r#"IFS= read -r _; printf 'pong\n'; IFS= read -r _"#;
+        let cfg = RpcTransportConfig::new("sh", vec!["-c".into(), script.into()]);
+        let mut session = RpcSession::spawn(&cfg).expect("spawn non-json responder");
+        let err = session
+            .request(&ping(1))
+            .expect_err("expected invalid response");
+        assert!(
+            matches!(err, RpcError::Protocol(ProtocolError::InvalidResponseFrame)),
+            "got {err:?}"
+        );
+        let err2 = session
+            .request(&ping(2))
+            .expect_err("session must be poisoned");
+        assert!(matches!(err2, RpcError::SessionPoisoned), "got {err2:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn request_accepts_null_id_error_response_for_in_flight_request() {
+        let script = r#"IFS= read -r _; printf '{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}\n'; IFS= read -r _"#;
+        let cfg = RpcTransportConfig::new("sh", vec!["-c".into(), script.into()]);
+        let mut session = RpcSession::spawn(&cfg).expect("spawn parse-error responder");
+        let resp = session
+            .request(&ping(1))
+            .expect("null-id error belongs to the only in-flight request");
+        assert!(resp.contains(r#""id":null"#));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn notifications_alone_still_time_out_and_poison() {
+        let script = r#"IFS= read -r _; while :; do printf '{"jsonrpc":"2.0","method":"tick"}\n'; sleep 0.01; done"#;
+        let mut cfg = RpcTransportConfig::new("sh", vec!["-c".into(), script.into()]);
+        cfg.request_timeout = Duration::from_millis(80);
+        let mut session = RpcSession::spawn(&cfg).expect("spawn chatty notifier");
+        let start = Instant::now();
+        let err = session.request(&ping(1)).expect_err("expected timeout");
+        assert!(matches!(err, RpcError::Timeout), "got {err:?}");
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "timeout must stay bounded"
+        );
     }
 }
