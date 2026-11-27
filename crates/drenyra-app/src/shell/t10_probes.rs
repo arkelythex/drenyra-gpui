@@ -8,7 +8,7 @@
 //! 3. A1: the posted record is what the `ledger_post` frame carried. A2: an open overlay blocks
 //!    workspace switches, and the approval dialog compares against the approver it showed.
 
-use super::commands::{ShellCommand, ShellState};
+use super::commands::{ShellCommand, ShellState, APPROVAL_CLEARED_MESSAGE};
 use super::demo::{demo_controller, demo_proposal, demo_workspace};
 use super::view_model::Rect;
 use crate::controller::{DrenyraHostController, EvidenceKind};
@@ -181,9 +181,15 @@ fn every_refused_operation_leaves_the_controller_identical_and_logs_nothing() {
 
     // A frame superseded by a retry can no longer be confirmed.
     c.build_post_request().expect("first frame");
+    let superseded = c.pending_post_request().expect("first id in flight");
     c.build_post_request().expect("retry frame");
+    assert_ne!(
+        c.pending_post_request(),
+        Some(superseded),
+        "retry gets a new id"
+    );
     assert_refused(&mut c, "confirm superseded id", |c| {
-        c.confirm_posted(1).is_err()
+        c.confirm_posted(superseded).is_err()
     });
 
     // The workspace without a review refuses everything, even while Andino has one in flight.
@@ -435,4 +441,36 @@ fn dialog_opened_without_an_approval_refuses_when_one_appeared_meanwhile() {
     assert!(s.apply(ShellCommand::OpenApproval, WIDE));
     assert!(s.controller_mut().approve_active("CPA-2"));
     assert_confirm_refused_as_stale(&mut s, "CPA-3");
+}
+
+#[test]
+fn dialog_refuses_with_guidance_when_the_shown_approval_was_cleared_meanwhile() {
+    let mut s = ShellState::demo();
+    accept_every_line(&mut s);
+    assert!(s.controller_mut().approve_active("CPA-1"));
+    assert!(s.apply(ShellCommand::OpenApproval, WIDE));
+    // A line change behind the dialog clears the approval; re-accepting unblocks approval.
+    assert!(s.controller_mut().reject_active_line(0, "check"));
+    assert!(s.controller_mut().accept_active_line(0));
+    let evidence_before = s.controller().evidence(&s.active_workspace_key()).len();
+
+    assert!(s.type_text("CPA-3"));
+    assert!(s.apply(ShellCommand::Confirm, WIDE));
+    let dialog = s.view(WIDE).approval.expect("stays open");
+    assert_eq!(
+        dialog.error.as_deref(),
+        Some(APPROVAL_CLEARED_MESSAGE),
+        "cleared approval gets the stale-approval guidance, not a raw domain error"
+    );
+    assert_eq!(
+        s.controller()
+            .active_review()
+            .and_then(|review| review.approved_by()),
+        None
+    );
+    assert_eq!(
+        s.controller().evidence(&s.active_workspace_key()).len(),
+        evidence_before,
+        "nothing logged"
+    );
 }

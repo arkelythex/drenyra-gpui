@@ -69,6 +69,24 @@ key ctrl+p; shot 02-approval-blocked; key Escape
 for _ in 1 2 3; do key a; key j; done
 key ctrl+p; typ "CPA-PERU-001"; shot 03-approval-ready
 key Return; shot 04-approved
+# Re-approval: the same ID is refused, a different one replaces it explicitly.
+key ctrl+p; typ "CPA-PERU-001"; key Return; shot 04b-same-approver-refused; key Escape
+key ctrl+p; typ "CPA-PERU-002"; shot 04c-replace-dialog; key Return; shot 04d-replaced
+# Ledger, Evidence and CLI panes (each split opens the next kind), then back to one pane.
+key ctrl+d; key ctrl+d; key ctrl+d; shot 04e-ledger-evidence-cli
+# Focus returns to the agent after each close, so step to the next pane before closing it.
+key ctrl+w; key ctrl+Tab; key ctrl+w; key ctrl+Tab; key ctrl+w; shot 04e2-agent-only
+# Restart: kill Andino's agent, then Ctrl+Shift+R must start a new process.
+OLD_AGENT=$(pgrep -P "$APP_PID" | head -1 || true)
+if [ -n "$OLD_AGENT" ]; then
+  kill "$OLD_AGENT"; sleep 2; shot 04f-agent-stopped
+  key ctrl+shift+r; sleep 6; shot 04g-agent-restarted
+  NEW_AGENT=$(pgrep -P "$APP_PID" | head -1 || true)
+  check "restart started a new agent ($OLD_AGENT -> ${NEW_AGENT:-none})" \
+    "[ -n '$NEW_AGENT' ] && [ '$NEW_AGENT' != '$OLD_AGENT' ]"
+else
+  echo "SKIP: restart check (no agent process; is pi installed?)"
+fi
 key ctrl+shift+p; typ "sierra"; shot 05-palette
 key Return; sleep 8; shot 06-sierra
 key ctrl+b; shot 07-no-sidebar; key ctrl+b

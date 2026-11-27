@@ -168,7 +168,9 @@ pub fn run_demo_session_json() -> Result<String, ControllerError> {
         .len();
     // Line decisions and the approval go through the controller so they reach its evidence log.
     for line in 0..line_count {
-        controller.accept_active_line(line);
+        if !controller.accept_active_line(line) {
+            return Err(ControllerError::ReviewNotReadyToPost);
+        }
     }
     if !controller.approve_active("CPA-PERU-001") {
         return Err(ControllerError::ReviewNotReadyToPost);

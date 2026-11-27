@@ -29,6 +29,10 @@ pub const APPROVAL_NEEDS_APPROVER: &str = "Enter the approver's ID: 1 to 128 vis
 
 /// Dialog error when the recorded approval changed after the dialog opened (the operator decided
 /// against an approver that is no longer the current one).
+/// Shown when the approval the dialog displayed was cleared (by a line change) while it was open.
+pub const APPROVAL_CLEARED_MESSAGE: &str =
+    "The approval was cleared while this dialog was open. Close it and review again.";
+
 pub fn approval_changed_message(current: &str) -> String {
     format!(
         "The approval changed to {current} while this dialog was open. Close it and review again."
@@ -747,7 +751,9 @@ impl ShellState {
                             ReplaceApprovalError::StaleApproval { current } => {
                                 approval_changed_message(&current)
                             }
-                            ReplaceApprovalError::NothingToReplace => error.to_string(),
+                            ReplaceApprovalError::NothingToReplace => {
+                                APPROVAL_CLEARED_MESSAGE.to_owned()
+                            }
                         }),
                 };
                 match outcome {

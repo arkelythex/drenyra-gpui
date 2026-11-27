@@ -1486,7 +1486,7 @@ fn approval_dialog(dialog: &ApprovalDialogView, t: &ThemeTokens) -> impl IntoEle
             .text_xs()
             .text_color(rgb(t.warning))
             .child(format!(
-                "Approved by {current}. Confirming replaces that approval; both stay in the evidence log."
+                "Approved by {current}. Confirming replaces that approval; both are recorded in this session's evidence log (in memory, unsigned)."
             ))
     });
     div()
