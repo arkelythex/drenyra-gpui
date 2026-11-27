@@ -23,7 +23,7 @@ pub const APPROVAL_NEEDS_ACCEPTED_LINES: &str = "Accept every line before approv
 /// Shown when the entry does not balance.
 pub const APPROVAL_NOT_BALANCED: &str = "The entry is not balanced, so it cannot be approved.";
 /// Shown when Enter is pressed without an approver ID.
-pub const APPROVAL_NEEDS_APPROVER: &str = "Enter the approver's ID.";
+pub const APPROVAL_NEEDS_APPROVER: &str = "Enter the approver's ID: 1 to 128 visible characters.";
 
 /// The approval dialog's input state.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1358,5 +1358,132 @@ mod tests {
         assert!(KEY_BINDINGS.contains(&("ctrl-p", ShellCommand::OpenApproval)));
         assert!(KEY_BINDINGS.contains(&("ctrl-shift-p", ShellCommand::OpenPalette)));
         assert!(KEY_BINDINGS.contains(&("ctrl-b", ShellCommand::ToggleSidebar)));
+    }
+
+    // Regression tests adopted from the independent verifier (T4).
+
+    fn accept_every_line(s: &mut ShellState) {
+        for _ in 0..3 {
+            s.apply(ShellCommand::AcceptLine, WIDE);
+            s.apply(ShellCommand::ReviewCursorDown, WIDE);
+        }
+    }
+
+    #[test]
+    fn approval_lands_only_on_the_active_workspace_and_reaches_the_post_frame() {
+        use crate::controller::{ControllerError, DrenyraHostController};
+        use crate::shell::demo::{demo_proposal, demo_workspace};
+        let mut c = DrenyraHostController::new(demo_workspace());
+        c.workspaces_mut()
+            .add_workspace(drenyra_workspace::FiscalWorkspace::new(
+                "20987654321",
+                "Sierra SRL",
+                "2026-11",
+            ));
+        c.stage_proposal(demo_proposal()).expect("stage Andino");
+        c.workspaces_mut().switch_to(1);
+        let mut sierra = demo_proposal();
+        (sierra.id, sierra.entity_ruc, sierra.fiscal_period) = (
+            "je-sierra-001".into(),
+            "20987654321".into(),
+            "2026-11".into(),
+        );
+        c.stage_proposal(sierra).expect("stage Sierra");
+        c.workspaces_mut().switch_to(0);
+        let mut s = ShellState::new(c, true);
+        accept_every_line(&mut s);
+        s.apply(ShellCommand::NextWorkspace, WIDE);
+        accept_every_line(&mut s);
+        s.apply(ShellCommand::NextWorkspace, WIDE);
+        assert!(s.apply(ShellCommand::OpenApproval, WIDE));
+        assert!(
+            !s.apply(ShellCommand::NextWorkspace, WIDE),
+            "switch blocked while modal"
+        );
+        s.type_text("  CPA-ANDINO ");
+        assert!(s.apply(ShellCommand::Confirm, WIDE));
+        let frame = s
+            .controller()
+            .clone()
+            .build_post_request()
+            .expect("Andino posts");
+        assert!(frame.contains("\"approved_by\":\"CPA-ANDINO\""));
+        s.apply(ShellCommand::NextWorkspace, WIDE);
+        assert_eq!(
+            s.controller()
+                .active_review()
+                .expect("Sierra review")
+                .approved_by(),
+            None,
+            "Sierra unaffected"
+        );
+        assert_eq!(
+            s.controller().clone().build_post_request(),
+            Err(ControllerError::ReviewNotReadyToPost)
+        );
+        s.apply(ShellCommand::OpenApproval, WIDE);
+        assert_eq!(s.view(WIDE).approval.expect("open").approver, "");
+    }
+
+    #[test]
+    fn unbalanced_entry_cannot_be_approved_from_the_dialog() {
+        let mut p = crate::shell::demo::demo_proposal();
+        p.lines[2].credit = drenyra_protocol::MoneyCents::from_cents(1_700);
+        let mut c =
+            crate::controller::DrenyraHostController::new(crate::shell::demo::demo_workspace());
+        c.stage_proposal(p).expect("stage");
+        let mut s = ShellState::new(c, true);
+        accept_every_line(&mut s);
+        s.apply(ShellCommand::OpenApproval, WIDE);
+        s.type_text("CPA-1");
+        assert!(s.apply(ShellCommand::Confirm, WIDE));
+        assert_eq!(
+            s.controller()
+                .active_review()
+                .expect("review")
+                .approved_by(),
+            None
+        );
+        assert_eq!(
+            s.view(WIDE).approval.expect("open").error,
+            Some(APPROVAL_NOT_BALANCED)
+        );
+    }
+
+    #[test]
+    fn dialog_and_composer_text_stay_separate_and_controls_are_dropped() {
+        let mut s = state();
+        s.apply(ShellCommand::FocusComposer, WIDE);
+        s.type_text("hola");
+        assert!(!s.apply(ShellCommand::OpenApproval, WIDE));
+        s.apply(ShellCommand::CloseOverlay, WIDE);
+        s.apply(ShellCommand::OpenApproval, WIDE);
+        s.type_text("CPA\n-0\t0\r1\u{7}");
+        assert_eq!(s.view(WIDE).approval.expect("open").approver, "CPA-001");
+        assert_eq!(s.view(WIDE).agent.expect("agent").composer, "hola");
+        s.apply(ShellCommand::CloseOverlay, WIDE);
+        s.apply(ShellCommand::OpenApproval, WIDE);
+        assert_eq!(s.view(WIDE).approval.expect("open").approver, "");
+    }
+
+    #[test]
+    fn invisible_approver_ids_are_refused_with_the_documented_limit() {
+        let mut s = state();
+        accept_every_line(&mut s);
+        s.apply(ShellCommand::OpenApproval, WIDE);
+        s.type_text("\u{200B}");
+        assert!(s.apply(ShellCommand::Confirm, WIDE));
+        assert_eq!(
+            s.controller()
+                .active_review()
+                .expect("review")
+                .approved_by(),
+            None
+        );
+        assert_eq!(
+            s.view(WIDE).approval.expect("open").error,
+            Some(APPROVAL_NEEDS_APPROVER)
+        );
+        assert!(APPROVAL_NEEDS_APPROVER.contains(&drenyra_ui::MAX_APPROVER_ID_CHARS.to_string()));
     }
 }

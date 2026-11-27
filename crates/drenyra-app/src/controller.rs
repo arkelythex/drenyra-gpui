@@ -517,7 +517,10 @@ mod tests {
         {
             let review = controller.active_review_mut().expect("staged review");
             review.accept_all();
-            assert!(review.record_human_approval("CPA\\\"01\nPERU"));
+            // Approver IDs cannot carry newlines or other hidden characters (drenyra-ui guard);
+            // quotes and backslashes are visible and still need escaping in the frame.
+            assert!(!review.record_human_approval("CPA\\\"01\nPERU"));
+            assert!(review.record_human_approval("CPA\\\"01 PERU"));
         }
 
         let frame = controller

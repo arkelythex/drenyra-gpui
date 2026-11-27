@@ -75,3 +75,10 @@ Assumptions (marked): keys keep Ctrl on Linux; the selected theme persists acros
   - Not verified live (desktop automation stopped, see L7): sidebar rendering, `Ctrl+B`, company clicks.
   - Risk: none of items 1-6 (adds a read-only accessor; layout gains a column).
   - Remaining from S4: additional pane kinds (Ledger, Evidence, CLI bodies) — pending, not started.
+- **L10 — 2026-11-27 T4 verifier and approver-ID hardening.**
+  - T4 verifier: PASS, no blockers (no sequence records an approval on an unbalanced entry, with pending/rejected lines, a blank ID, or on another workspace; dialog/composer text separate; CLI output byte-identical; static review: the only `record_human_approval` call is `ShellState::apply_in_approval`).
+  - Advisories A1 (invisible IDs such as U+200B or bidi overrides accepted) and A2 (no length cap) fixed in `EntryDiffReview::record_human_approval`: trimmed ID must be 1..=128 chars with no control, zero-width or bidi-formatting characters; a rejected ID keeps the previous approval. RED observed ("\u{200b}" must be rejected) → GREEN.
+  - Contract change (item 3, tightening): an approver ID with a newline is now refused. The only consumer is `drenyra-app`; the controller escaping test kept its quote/backslash approver and now pins the refusal; newline escaping stays covered by the proposal ID.
+  - Adopted 3 verifier probes (tenant isolation of approval into the post frame, unbalanced entry, dialog/composer separation) plus one test tying the dialog message to `MAX_APPROVER_ID_CHARS`.
+  - Not fixed (recorded): A3 Ctrl+C cannot stop the agent while the dialog is open; A4 the dialog backdrop does not block clicks (all handlers behind it go through the modal `dispatch`); A5 R0/R1 entries can carry an optional approval (existing drenyra-ui behavior; product decision).
+  - Checks: 153 tests headless / 152 with features; clippy both ways; fmt.
