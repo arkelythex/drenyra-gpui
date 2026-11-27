@@ -9,10 +9,12 @@ use super::demo;
 use super::settings::Settings;
 use super::theme::ThemeId;
 use super::view_model::{
-    risk_tier_label, AgentPaneView, ApprovalDialogView, PaletteEntry, PaletteView, Rect,
-    SettingsPanel, ShellViewModel, SidebarCompany, SidebarEntry, SidebarView, ThemeOption,
+    risk_tier_label, AgentPaneView, ApprovalDialogView, CliPaneView, EvidencePaneView,
+    LedgerPaneView, PaletteEntry, PaletteView, Rect, SettingsPanel, ShellViewModel, SidebarCompany,
+    SidebarEntry, SidebarView, ThemeOption,
 };
 use crate::controller::DrenyraHostController;
+use crate::EnvironmentCheck;
 use drenyra_ui::{EntryDiffReview, LineDecision, ReplaceApprovalError};
 
 /// Comment recorded when a line is rejected from the keyboard (no free-text input yet).
@@ -248,6 +250,8 @@ pub struct ShellState {
     /// The command palette, when open.
     palette: Option<PaletteDraft>,
     sidebar_open: bool,
+    /// Environment check captured once at start-up for the Fiscal CLI pane; never recomputed.
+    environment: Option<EnvironmentCheck>,
 }
 
 impl ShellState {
@@ -263,7 +267,14 @@ impl ShellState {
             approval: None,
             palette: None,
             sidebar_open: true,
+            environment: None,
         }
+    }
+
+    /// Stores the environment check the Fiscal CLI pane shows (captured once by the caller).
+    pub fn with_environment(mut self, environment: EnvironmentCheck) -> Self {
+        self.environment = Some(environment);
+        self
     }
 
     /// True while the sidebar is shown (it takes width from the panes).
@@ -455,6 +466,10 @@ impl ShellState {
             )
         });
         view.agent = Some(agent);
+        // Ledger and Evidence read only the active workspace's RUC and period.
+        view.ledger = Some(LedgerPaneView::build(&self.controller, entry_status));
+        view.evidence = Some(EvidencePaneView::build(&self.controller));
+        view.cli = Some(CliPaneView::build(self.environment.as_ref()));
         view.sidebar = self.sidebar_open.then(|| SidebarView {
             companies: self
                 .controller
@@ -1708,5 +1723,262 @@ mod tests {
             Some(APPROVAL_NEEDS_APPROVER)
         );
         assert!(APPROVAL_NEEDS_APPROVER.contains(&drenyra_ui::MAX_APPROVER_ID_CHARS.to_string()));
+    }
+
+    // T11: Ledger, Evidence and CLI panes.
+
+    use crate::shell::view_model::{
+        CliField, CliFlag, LedgerLine, LedgerPostedEntry, LedgerStagedEntry, CLI_LIMITS,
+        EVIDENCE_LIMITS, LEDGER_LIMITS, NO_APPROVAL_REQUIRED,
+    };
+
+    const DEMO_ID: &str = "je-demo-2026-10-001";
+
+    /// Builds and confirms the active workspace's `ledger_post`; returns its request id.
+    fn post_active(s: &mut ShellState) -> u64 {
+        s.controller.build_post_request().expect("ready to post");
+        let request_id = s.controller.pending_post_request().expect("in flight");
+        s.controller.confirm_posted(request_id).expect("confirmed");
+        request_id
+    }
+
+    fn demo_lines() -> Vec<LedgerLine> {
+        let line = |account: &str, description: &str, debit: &str, credit: &str| LedgerLine {
+            account_code: account.into(),
+            description: description.into(),
+            debit: debit.into(),
+            credit: credit.into(),
+        };
+        vec![
+            line("1212", "Accounts receivable", "118.00", ""),
+            line("7011", "Sales revenue", "", "100.00"),
+            line("40111", "IGV 18%", "", "18.00"),
+        ]
+    }
+
+    #[test]
+    fn ledger_shows_the_active_workspace_s_staged_entry_with_exact_money_and_totals() {
+        let s = state();
+        let ledger = s.view(WIDE).ledger.expect("ledger pane");
+        assert_eq!(ledger.entity_ruc, "20123456789");
+        assert_eq!(ledger.fiscal_period, "2026-10");
+        assert_eq!(
+            ledger.staged,
+            Some(LedgerStagedEntry {
+                proposal_id: DEMO_ID.into(),
+                risk_tier_label: "R2 Material",
+                status: ENTRY_IN_REVIEW,
+                lines: demo_lines(),
+                total_debit: "118.00".into(),
+                total_credit: "118.00".into(),
+                balanced: true,
+            })
+        );
+        assert!(ledger.posted.is_empty());
+        assert_eq!(ledger.empty_message, None);
+        assert_eq!(
+            LEDGER_LIMITS,
+            "Entries staged or posted in this session. Posted ledger history arrives when Drenyra Shell serves it."
+        );
+        assert_eq!(ledger.limits, LEDGER_LIMITS);
+    }
+
+    #[test]
+    fn ledger_lists_entries_posted_in_this_session_with_approver_and_request_id() {
+        let mut s = state();
+        accept_every_line(&mut s);
+        approve_from_dialog(&mut s, "CPA-PERU-001");
+        assert_eq!(
+            s.view(WIDE)
+                .ledger
+                .expect("ledger")
+                .staged
+                .expect("staged")
+                .status,
+            ENTRY_READY_TO_POST
+        );
+        let request_id = post_active(&mut s);
+
+        let ledger = s.view(WIDE).ledger.expect("ledger");
+        assert_eq!(ledger.staged, None, "posting removes the staged entry");
+        let andino_posted = vec![LedgerPostedEntry {
+            proposal_id: DEMO_ID.into(),
+            risk_tier_label: "R2 Material",
+            approved_by: "CPA-PERU-001".into(),
+            request_id,
+            total_debit: "118.00".into(),
+            total_credit: "118.00".into(),
+        }];
+        assert_eq!(ledger.posted, andino_posted);
+        assert_eq!(ledger.empty_message, None);
+
+        // An R1 entry in Sierra needs no approval; it lists only under Sierra.
+        assert!(s.switch_workspace(1));
+        let mut draft = crate::shell::demo::demo_proposal();
+        (
+            draft.id,
+            draft.entity_ruc,
+            draft.fiscal_period,
+            draft.risk_tier,
+        ) = (
+            "je-sierra-001".into(),
+            "20987654321".into(),
+            "2026-11".into(),
+            drenyra_protocol::RiskTier::R1Draft,
+        );
+        s.controller.stage_proposal(draft).expect("stage Sierra");
+        accept_every_line(&mut s);
+        let sierra_request = post_active(&mut s);
+        assert_ne!(sierra_request, request_id);
+        let ledger = s.view(WIDE).ledger.expect("ledger");
+        assert_eq!(
+            ledger.posted,
+            vec![LedgerPostedEntry {
+                proposal_id: "je-sierra-001".into(),
+                risk_tier_label: "R1 Draft",
+                approved_by: NO_APPROVAL_REQUIRED.into(),
+                request_id: sierra_request,
+                total_debit: "118.00".into(),
+                total_credit: "118.00".into(),
+            }]
+        );
+        assert_eq!(NO_APPROVAL_REQUIRED, "no approval required");
+        assert!(s.switch_workspace(0));
+        assert_eq!(s.view(WIDE).ledger.expect("ledger").posted, andino_posted);
+    }
+
+    #[test]
+    fn evidence_lists_the_active_workspace_s_events_newest_first() {
+        let mut s = state();
+        accept_every_line(&mut s);
+        approve_from_dialog(&mut s, "CPA-1");
+        approve_from_dialog(&mut s, "CPA-2");
+        assert!(s.apply(ShellCommand::RejectLine, WIDE));
+        assert!(s.apply(ShellCommand::AcceptLine, WIDE));
+        approve_from_dialog(&mut s, "CPA-PERU-001");
+        let request_id = post_active(&mut s);
+        assert_eq!(request_id, 1);
+
+        let evidence = s.view(WIDE).evidence.expect("evidence pane");
+        assert_eq!(evidence.entity_ruc, "20123456789");
+        assert_eq!(evidence.fiscal_period, "2026-10");
+        assert_eq!(
+            evidence.entries,
+            vec![
+                "#7  Posted je-demo-2026-10-001 (request 1)",
+                "#6  Post requested for je-demo-2026-10-001 (request 1)",
+                "#5  Approved je-demo-2026-10-001 by CPA-PERU-001",
+                "#4  Approval of je-demo-2026-10-001 by CPA-2 cleared by a line change",
+                "#3  Approval of je-demo-2026-10-001 by CPA-1 replaced by CPA-2",
+                "#2  Approved je-demo-2026-10-001 by CPA-1",
+                "#1  Staged je-demo-2026-10-001 (R2 Material)",
+            ]
+        );
+        assert_eq!(evidence.empty_message, None);
+        assert_eq!(
+            EVIDENCE_LIMITS,
+            "Session evidence: in memory, unsigned, cleared when the window closes."
+        );
+        assert_eq!(evidence.limits, EVIDENCE_LIMITS);
+    }
+
+    #[test]
+    fn ledger_and_evidence_show_none_of_another_company_s_data() {
+        let mut s = state();
+        accept_every_line(&mut s);
+        approve_from_dialog(&mut s, "CPA-PERU-001");
+        post_active(&mut s);
+        assert!(s.apply(ShellCommand::NextWorkspace, WIDE));
+
+        let vm = s.view(WIDE);
+        let ledger = vm.ledger.expect("ledger");
+        let evidence = vm.evidence.expect("evidence");
+        assert_eq!(
+            (ledger.entity_ruc.as_str(), ledger.fiscal_period.as_str()),
+            ("20987654321", "2026-11")
+        );
+        assert_eq!(ledger.staged, None);
+        assert!(ledger.posted.is_empty());
+        assert_eq!(
+            ledger.empty_message.as_deref(),
+            Some("No entries staged or posted for RUC 20987654321 · 2026-11 in this session.")
+        );
+        assert!(evidence.entries.is_empty());
+        assert_eq!(
+            evidence.empty_message.as_deref(),
+            Some("No evidence recorded for RUC 20987654321 · 2026-11 in this session.")
+        );
+        for text in [format!("{ledger:?}"), format!("{evidence:?}")] {
+            assert!(!text.contains("20123456789"), "Andino's RUC leaked: {text}");
+            assert!(!text.contains("je-demo"), "Andino's entry leaked: {text}");
+            assert!(!text.contains("CPA-PERU-001"), "Andino's approver leaked");
+        }
+    }
+
+    #[test]
+    fn cli_pane_shows_the_captured_environment_and_the_four_flags_without_recomputing() {
+        let captured = crate::EnvironmentCheck {
+            version: "9.9.9-test".into(),
+            rda_default: false,
+            shell_bin_found: false,
+            kernel_bin_found: true,
+        };
+        let mut s = state().with_environment(captured);
+        let cli = s.view(WIDE).cli.expect("cli pane");
+        let field = |name: &'static str, value: &str| CliField {
+            name,
+            value: value.into(),
+        };
+        assert_eq!(
+            cli.environment,
+            vec![
+                field("app", "drenyra-gpui"),
+                field("version", "9.9.9-test"),
+                field("zero_float_money", "0.00"),
+                field("rda_default", "false"),
+                field("shell_bin_found", "false"),
+                field("kernel_bin_found", "true"),
+            ]
+        );
+        let flag = |usage: &'static str, description: &'static str| CliFlag { usage, description };
+        assert_eq!(
+            cli.flags,
+            vec![
+                flag(
+                    "--check-env",
+                    "Print headless RPC host environment diagnostics (JSON)"
+                ),
+                flag(
+                    "--demo-session",
+                    "Run deterministic end-to-end controller & approval gate demo (JSON)"
+                ),
+                flag(
+                    "--probe-rpc <cmd> [args...]",
+                    "Probe an NDJSON stdio JSON-RPC 2.0 server"
+                ),
+                flag(
+                    "--window",
+                    "Open the native GPUI window on demo data (requires --features gpui)"
+                ),
+            ]
+        );
+        assert_eq!(
+            CLI_LIMITS,
+            "Captured once when the window started. The window runs no commands: run these flags from a terminal."
+        );
+        assert_eq!(cli.limits, CLI_LIMITS);
+
+        assert_eq!(
+            s.view(WIDE).cli.as_ref(),
+            Some(&cli),
+            "stable between frames"
+        );
+        assert!(s.apply(ShellCommand::NextWorkspace, WIDE));
+        assert_eq!(s.view(WIDE).cli, Some(cli), "the same for every company");
+
+        // Without a captured check the pane says so instead of probing.
+        let bare = state().view(WIDE).cli.expect("cli pane");
+        assert!(bare.environment.is_empty());
+        assert_eq!(bare.flags.len(), 4);
     }
 }
