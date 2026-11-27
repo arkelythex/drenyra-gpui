@@ -5,7 +5,8 @@
 # xdotool (XTEST input only reaches that display, never the operator's desktop), asserts the
 # non-visual outcomes and leaves screenshots for visual review.
 #
-# Requirements: Xvfb (Arch: xorg-server-xvfb), xdotool, ImageMagick (`import`), a Vulkan driver.
+# Requirements: Xvfb (Arch: xorg-server-xvfb), xdotool, ImageMagick (`import`, `compare`), a
+# Vulkan driver.
 # The agent pane starts `pi --mode rpc` when `pi` is on PATH; no prompt is ever sent, so no
 # model is called.
 #
@@ -17,7 +18,7 @@ OUT=${1:-$(mktemp -d "${TMPDIR:-/tmp}/drenyra-gpui-e2e.XXXXXX")}
 BIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug/drenyra-gpui"
 mkdir -p "$OUT/xdg"
 
-for tool in Xvfb xdotool import; do
+for tool in Xvfb xdotool import compare; do
   command -v "$tool" >/dev/null || { echo "missing: $tool" >&2; exit 2; }
 done
 
@@ -63,6 +64,18 @@ key() { xdotool key --clearmodifiers "$@"; sleep 0.35; }
 typ() { xdotool type --delay 40 "$1"; sleep 0.3; }
 fail=0
 check() { if eval "$2"; then echo "PASS: $1"; else echo "FAIL: $1"; fail=1; fi; }
+# Mouse wheel down N notches at window-relative X Y (XTEST on this Xvfb display only).
+wheel() {
+  xdotool mousemove --window "$WIN" "$1" "$2"; sleep 0.2
+  xdotool click --repeat "$3" --delay 80 5; sleep 0.4
+}
+# True when the WxH+X+Y region differs between two screenshots (compare exits 1 on a difference).
+# shellcheck disable=SC2329 # invoked through check's eval
+region_changed() {
+  local rc=0
+  compare -metric AE "$OUT/$1.png[$3]" "$OUT/$2.png[$3]" null: 2>/dev/null || rc=$?
+  [ "$rc" -eq 1 ]
+}
 
 shot 01-start
 key ctrl+p; shot 02-approval-blocked; key Escape
@@ -74,6 +87,16 @@ key ctrl+p; typ "CPA-PERU-001"; key Return; shot 04b-same-approver-refused; key 
 key ctrl+p; typ "CPA-PERU-002"; shot 04c-replace-dialog; key Return; shot 04d-replaced
 # Ledger, Evidence and CLI panes (each split opens the next kind), then back to one pane.
 key ctrl+d; key ctrl+d; key ctrl+d; shot 04e-ledger-evidence-cli
+# Scroll: in this layout (Ledger bottom left, Evidence and CLI stacked bottom right) the Evidence
+# and CLI bodies overflow; the wheel must reveal older events and the flag reference while the
+# pane headers and footnotes stay put.
+EVIDENCE_REGION=350x75+640+528
+CLI_REGION=350x75+640+735
+wheel 815 580 6; wheel 815 780 6; wheel 445 700 6; shot 04e1-panes-scrolled
+check "mouse wheel scrolls the Evidence pane" \
+  "region_changed 04e-ledger-evidence-cli 04e1-panes-scrolled $EVIDENCE_REGION"
+check "mouse wheel scrolls the CLI pane" \
+  "region_changed 04e-ledger-evidence-cli 04e1-panes-scrolled $CLI_REGION"
 # Focus returns to the agent after each close, so step to the next pane before closing it.
 key ctrl+w; key ctrl+Tab; key ctrl+w; key ctrl+Tab; key ctrl+w; shot 04e2-agent-only
 # Restart: kill Andino's agent, then Ctrl+Shift+R must start a new process.
