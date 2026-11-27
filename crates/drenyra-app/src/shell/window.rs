@@ -74,9 +74,6 @@ const COMPOSER_CONTEXT: &str = "DrenyraComposer";
 /// Footer keys while the command palette is open.
 const PALETTE_HINT: &str = "Type to filter · Up/Down choose · Enter run · Esc close";
 
-/// Footer keys while the approval dialog is open.
-const APPROVAL_HINT: &str = "Type the approver's ID · Enter record approval · Esc cancel";
-
 /// Footer keys while the Settings overlay is open.
 const SETTINGS_HINT: &str =
     "J/K choose theme · Enter apply · Esc close · click a theme to apply it";
@@ -507,7 +504,7 @@ impl Render for ShellWindow {
             .child(footer(
                 vm.settings.is_some(),
                 vm.palette.is_some(),
-                vm.approval.is_some(),
+                vm.approval.as_ref(),
                 vm.agent.as_ref().is_some_and(|a| a.composer_active),
                 self.save_error.as_deref(),
                 &t,
@@ -1264,18 +1261,25 @@ fn review_row(row: &super::view_model::ReviewRow, t: &ThemeTokens) -> impl IntoE
 fn footer(
     settings_open: bool,
     palette_open: bool,
-    approving: bool,
+    approval: Option<&ApprovalDialogView>,
     composing: bool,
     save_error: Option<&str>,
     t: &ThemeTokens,
 ) -> impl IntoElement {
+    let hint = if settings_open {
+        SETTINGS_HINT
+    } else if palette_open {
+        PALETTE_HINT
+    } else if let Some(dialog) = approval {
+        dialog.footer_hint()
+    } else if composing {
+        COMPOSER_HINT
+    } else {
+        FOOTER_HINT
+    };
     let (text, color) = match save_error {
         Some(err) => (err.to_owned(), t.error),
-        None if settings_open => (SETTINGS_HINT.to_owned(), t.text_subtle),
-        None if palette_open => (PALETTE_HINT.to_owned(), t.text_subtle),
-        None if approving => (APPROVAL_HINT.to_owned(), t.text_subtle),
-        None if composing => (COMPOSER_HINT.to_owned(), t.text_subtle),
-        None => (FOOTER_HINT.to_owned(), t.text_subtle),
+        None => (hint.to_owned(), t.text_subtle),
     };
     div()
         .h(px(FOOTER_HEIGHT as f32))
@@ -1518,7 +1522,7 @@ fn approval_dialog(dialog: &ApprovalDialogView, t: &ThemeTokens) -> impl IntoEle
                                 .text_lg()
                                 .text_color(rgb(t.text_heading))
                                 .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .child("Record human approval"),
+                                .child(dialog.title()),
                         )
                         .child(chip(dialog.risk_tier_label, t.warning, t)),
                 )

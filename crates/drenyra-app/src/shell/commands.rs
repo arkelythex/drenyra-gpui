@@ -27,11 +27,22 @@ pub const APPROVAL_NOT_BALANCED: &str = "The entry is not balanced, so it cannot
 /// Shown when Enter is pressed without an approver ID.
 pub const APPROVAL_NEEDS_APPROVER: &str = "Enter the approver's ID: 1 to 128 visible characters.";
 
+/// Dialog error when the recorded approval changed after the dialog opened (the operator decided
+/// against an approver that is no longer the current one).
+pub fn approval_changed_message(current: &str) -> String {
+    format!(
+        "The approval changed to {current} while this dialog was open. Close it and review again."
+    )
+}
+
 /// The approval dialog's input state.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ApprovalDraft {
     approver: String,
     error: Option<String>,
+    /// Approver recorded when the dialog opened, which the dialog shows; Confirm replaces exactly
+    /// this one (compare-and-swap) or, when `None`, records a first approval.
+    shown_approver: Option<String>,
 }
 
 /// Sidebar status of a staged entry with pending lines.
@@ -283,8 +294,13 @@ impl ShellState {
     }
 
     /// Makes workspace `index` active (sidebar click). Leaves the composer, which belongs to the
-    /// previous company, and resets the review cursor. Returns `false` when nothing changed.
+    /// previous company, and resets the review cursor. Returns `false` when nothing changed,
+    /// including while the approval dialog, the palette or the Settings overlay is open: those
+    /// are modal, so a click behind them never moves the dialog's typed text to another company.
     pub fn switch_workspace(&mut self, index: usize) -> bool {
+        if self.approval.is_some() || self.palette.is_some() || self.settings_cursor.is_some() {
+            return false;
+        }
         let manager = self.controller.workspaces_mut();
         if index == manager.active_index() || index >= manager.workspaces().len() {
             return false;
@@ -453,6 +469,12 @@ impl ShellState {
         &self.controller
     }
 
+    /// Direct controller access for tests that simulate a change made behind an open overlay.
+    #[cfg(test)]
+    pub(crate) fn controller_mut(&mut self) -> &mut DrenyraHostController {
+        &mut self.controller
+    }
+
     pub fn view(&self, pane_area: Rect) -> ShellViewModel {
         let mut view =
             ShellViewModel::build(&self.controller, pane_area, self.review_cursor, self.demo);
@@ -520,7 +542,7 @@ impl ShellState {
                     total_credit: panel.total_credit.clone(),
                     required: review.proposal().risk_tier.requires_human_approval(),
                     approver: draft.approver.clone(),
-                    current_approver: review.approved_by().map(str::to_owned),
+                    current_approver: draft.shown_approver.clone(),
                     ready: blocker.is_none(),
                     blocker,
                     error: draft.error.clone(),
@@ -572,10 +594,13 @@ impl ShellState {
                 true
             }
             ShellCommand::OpenApproval => {
-                if self.controller.active_review().is_none() {
+                let Some(review) = self.controller.active_review() else {
                     return false;
-                }
-                self.approval = Some(ApprovalDraft::default());
+                };
+                self.approval = Some(ApprovalDraft {
+                    shown_approver: review.approved_by().map(str::to_owned),
+                    ..ApprovalDraft::default()
+                });
                 true
             }
             ShellCommand::FocusComposer => {
@@ -673,9 +698,11 @@ impl ShellState {
 
     /// The approval dialog is modal: Enter records the approval, Escape closes.
     ///
-    /// With no approval recorded, Enter records the typed ID. With one recorded (the dialog shows
-    /// it), Enter explicitly replaces it with a different ID; the same ID is refused with
-    /// "Already approved by <id>.". Both paths go through the controller, which logs them.
+    /// With no approval shown when the dialog opened, Enter records the typed ID. With one shown,
+    /// Enter explicitly replaces exactly that approver with a different ID; the same ID is
+    /// refused with "Already approved by <id>.". If the recorded approval changed after the
+    /// dialog opened, Enter changes nothing and the dialog says so ([`approval_changed_message`]).
+    /// Both paths go through the controller, which logs them.
     fn apply_in_approval(&mut self, command: ShellCommand) -> bool {
         match command {
             ShellCommand::CloseOverlay => {
@@ -687,35 +714,40 @@ impl ShellState {
                     self.set_approval_error(blocker);
                     return true;
                 }
-                let approver = self
+                let (approver, shown) = self
                     .approval
                     .as_ref()
-                    .map(|draft| draft.approver.clone())
+                    .map(|draft| (draft.approver.clone(), draft.shown_approver.clone()))
                     .unwrap_or_default();
-                let current = self
-                    .controller
-                    .active_review()
-                    .and_then(EntryDiffReview::approved_by)
-                    .map(str::to_owned);
-                let outcome = match current {
+                let outcome = match shown {
                     None => {
                         if self.controller.approve_active(&approver) {
                             Ok(())
+                        } else if let Some(current) = self
+                            .controller
+                            .active_review()
+                            .and_then(EntryDiffReview::approved_by)
+                        {
+                            // Recorded by someone else after the dialog opened without one.
+                            Err(approval_changed_message(current))
                         } else {
                             Err(APPROVAL_NEEDS_APPROVER.to_owned())
                         }
                     }
-                    Some(current) => self
+                    Some(shown) => self
                         .controller
-                        .replace_active_approval(&current, &approver)
+                        .replace_active_approval(&shown, &approver)
                         .map_err(|error| match error {
                             ReplaceApprovalError::SameApprover => {
-                                format!("Already approved by {current}.")
+                                format!("Already approved by {shown}.")
                             }
                             ReplaceApprovalError::InvalidApprover => {
                                 APPROVAL_NEEDS_APPROVER.to_owned()
                             }
-                            other => other.to_string(),
+                            ReplaceApprovalError::StaleApproval { current } => {
+                                approval_changed_message(&current)
+                            }
+                            ReplaceApprovalError::NothingToReplace => error.to_string(),
                         }),
                 };
                 match outcome {

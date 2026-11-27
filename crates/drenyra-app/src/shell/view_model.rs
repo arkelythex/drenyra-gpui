@@ -134,6 +134,43 @@ pub struct ApprovalDialogView {
     pub error: Option<String>,
 }
 
+/// Dialog title when no approval was recorded when the dialog opened.
+pub const APPROVAL_TITLE_RECORD: &str = "Record human approval";
+/// Dialog title when the dialog replaces the approval it shows.
+pub const APPROVAL_TITLE_REPLACE: &str = "Replace approval";
+/// Footer keys while the dialog records a first approval.
+pub const APPROVAL_HINT_RECORD: &str =
+    "Type the approver's ID · Enter record approval · Esc cancel";
+/// Footer keys while the dialog replaces the approval it shows.
+pub const APPROVAL_HINT_REPLACE: &str =
+    "Type the new approver's ID · Enter replace approval · Esc cancel";
+
+impl ApprovalDialogView {
+    /// True when Enter replaces the approval the dialog shows instead of recording a first one.
+    pub fn replaces(&self) -> bool {
+        self.current_approver.is_some()
+    }
+
+    /// Dialog title: "Replace approval" when an approval is shown, otherwise "Record human
+    /// approval".
+    pub fn title(&self) -> &'static str {
+        if self.replaces() {
+            APPROVAL_TITLE_REPLACE
+        } else {
+            APPROVAL_TITLE_RECORD
+        }
+    }
+
+    /// Footer keys matching [`Self::title`].
+    pub fn footer_hint(&self) -> &'static str {
+        if self.replaces() {
+            APPROVAL_HINT_REPLACE
+        } else {
+            APPROVAL_HINT_RECORD
+        }
+    }
+}
+
 /// A staged journal entry listed in the sidebar.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidebarEntry {
@@ -980,5 +1017,37 @@ mod tests {
                 height: 0
             }
         );
+    }
+
+    fn dialog(current_approver: Option<&str>) -> ApprovalDialogView {
+        ApprovalDialogView {
+            proposal_id: "je-1".into(),
+            risk_tier_label: "R2 Material",
+            total_debit: "118.00".into(),
+            total_credit: "118.00".into(),
+            required: true,
+            approver: String::new(),
+            current_approver: current_approver.map(str::to_owned),
+            ready: true,
+            blocker: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn approval_dialog_says_replace_when_an_approval_is_already_recorded() {
+        let record = dialog(None);
+        assert_eq!(record.title(), "Record human approval");
+        assert_eq!(
+            record.footer_hint(),
+            "Type the approver's ID · Enter record approval · Esc cancel"
+        );
+        let replace = dialog(Some("CPA-1"));
+        assert_eq!(replace.title(), "Replace approval");
+        assert_eq!(
+            replace.footer_hint(),
+            "Type the new approver's ID · Enter replace approval · Esc cancel"
+        );
+        assert!(!replace.title().contains("Record") && !replace.footer_hint().contains("record"));
     }
 }
