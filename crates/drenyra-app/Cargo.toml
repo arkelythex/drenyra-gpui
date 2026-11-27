@@ -12,10 +12,11 @@ path = "src/main.rs"
 
 [features]
 default = []
-gpui = []
+gpui = ["dep:gpui"]
 
 [dependencies]
 drenyra-protocol = { path = "../drenyra-protocol" }
 drenyra-rpc = { path = "../drenyra-rpc" }
 drenyra-ui = { path = "../drenyra-ui" }
 drenyra-workspace = { path = "../drenyra-workspace" }
+gpui = { version = "0.2.2", optional = true }
