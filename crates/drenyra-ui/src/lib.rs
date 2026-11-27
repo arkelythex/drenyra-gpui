@@ -3,20 +3,34 @@
 use drenyra_protocol::{JournalEntryProposal, MoneyCents};
 
 /// Per-line human review decision for a proposed double-entry journal line.
-/// Characters that render invisibly or reorder text: controls, zero-width characters, the soft
-/// hyphen, the byte-order mark and Unicode bidirectional formatting characters.
+/// Characters that render invisibly, reorder text or break lines: controls, line and paragraph
+/// separators, zero-width and joiner characters, the soft hyphen, the byte-order mark, Unicode
+/// bidirectional formatting, variation selectors, tag characters, interlinear annotation marks
+/// and blank "filler" letters.
 fn is_hidden_char(c: char) -> bool {
     c.is_control()
         || matches!(
             c,
             '\u{00AD}'
+                | '\u{034F}'
                 | '\u{061C}'
-                | '\u{180E}'
+                | '\u{115F}'
+                | '\u{1160}'
+                | '\u{17B4}'
+                | '\u{17B5}'
+                | '\u{180B}'..='\u{180F}'
                 | '\u{200B}'..='\u{200F}'
-                | '\u{202A}'..='\u{202E}'
+                | '\u{2028}'..='\u{202E}'
                 | '\u{2060}'..='\u{2064}'
-                | '\u{2066}'..='\u{2069}'
+                | '\u{2066}'..='\u{206F}'
+                | '\u{3164}'
+                | '\u{FE00}'..='\u{FE0F}'
                 | '\u{FEFF}'
+                | '\u{FFA0}'
+                | '\u{FFF9}'..='\u{FFFB}'
+                | '\u{1D173}'..='\u{1D17A}'
+                | '\u{E0000}'..='\u{E007F}'
+                | '\u{E0100}'..='\u{E01EF}'
         )
 }
 
@@ -431,6 +445,12 @@ mod tests {
             "CPA\u{2066}1",
             "CPA\u{200D}1",
             "CPA\n1",
+            "CPA\u{2028}1",
+            "CPA\u{3164}",
+            "\u{115F}\u{1160}",
+            "CPA\u{FE0F}1",
+            "CPA\u{E0041}1",
+            "CPA\u{206F}1",
         ] {
             assert!(
                 !review.record_human_approval(invisible),

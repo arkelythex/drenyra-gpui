@@ -23,7 +23,7 @@ Assumptions (marked): keys keep Ctrl on Linux; the selected theme persists acros
 | T4 | Approval command/dialog | S4 | inline | done (see L7) | — |
 | T5 | Command palette | S4 | inline | done (see L8) | — |
 | T6 | Sidebar | S4 | inline | done (see L9) | — |
-| T7 | Checks, visual check both themes, verifier, RDD, PRs | S5 | verify | pending | — |
+| T7 | Checks, visual check both themes, verifier, RDD, PRs | S5 | verify | in progress (see L11) | — |
 
 ## Log
 
@@ -82,3 +82,9 @@ Assumptions (marked): keys keep Ctrl on Linux; the selected theme persists acros
   - Adopted 3 verifier probes (tenant isolation of approval into the post frame, unbalanced entry, dialog/composer separation) plus one test tying the dialog message to `MAX_APPROVER_ID_CHARS`.
   - Not fixed (recorded): A3 Ctrl+C cannot stop the agent while the dialog is open; A4 the dialog backdrop does not block clicks (all handlers behind it go through the modal `dispatch`); A5 R0/R1 entries can carry an optional approval (existing drenyra-ui behavior; product decision).
   - Checks: 153 tests headless / 152 with features; clippy both ways; fmt.
+- **L11 — 2026-11-27 native reviews (RDD), consent granted by the operator for all four.**
+  - Slice 2 agent client `review-639e163d7612c9c7` (risk, resilience, reliability), slice 3 live agent pane `review-4770acc9ecf2b27f` (resilience, reliability), slice 4 approval dialog `review-64101cc35ae1f697` (risk, reliability), approver-ID hardening `review-ffb7583c4d016742` (risk, reliability): all approved and acknowledged; advisories only.
+  - Fixed after review: AltGr text was dropped by the composer/approval field (`@` is AltGr+Q on Latin American keyboards) → pure `typed_text` helper with tests; hidden-character denylist extended (line/paragraph separators, Hangul fillers, variation selectors, tag characters, interlinear annotations, deprecated format chars, musical formatting); architecture doc no longer claims a declined dialog "never grants anything". RED not observed for these (tests written with the fix).
+  - Already fixed earlier: Drop blocking on the writer lock (`c171fba4`, reported again on slice 2 which predates it).
+  - Follow-ups (not fixed, recorded): (1) `AgentSession::send` runs on the UI thread and can block it if the agent stops reading stdin with a full pipe — needs a dedicated writer thread; (2) agents are keyed by workspace index (safe while workspaces are never removed or reordered; key by RUC + period when removal exists); (3) a stopped/failed agent has no restart action; (4) re-approval overwrites the previous approver; (5) R0/R1 entries can carry an optional approval; (6) Ctrl+C cannot stop the agent while a modal is open; (7) keyboard routing in `window.rs` has no automated test (the GPUI harness needs `git2`); (8) the "focused" chip in pane headers was dropped.
+  - Checks: 154 tests headless / 153 with features; clippy both ways; fmt.

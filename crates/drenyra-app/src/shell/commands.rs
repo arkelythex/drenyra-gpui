@@ -125,6 +125,21 @@ pub fn key_hint(command: ShellCommand) -> String {
         .join("+")
 }
 
+/// Text a key press types into a text field, or `None` when it is a shortcut or has no
+/// character. AltGr chords (reported as Alt, or Ctrl+Alt on some layouts) still type, so `@`
+/// and `€` work on Latin American and European keyboards; Ctrl-only and Super chords never do.
+pub fn typed_text(
+    control: bool,
+    alt: bool,
+    platform: bool,
+    key_char: Option<&str>,
+) -> Option<&str> {
+    if platform || (control && !alt) {
+        return None;
+    }
+    key_char.filter(|text| !text.is_empty())
+}
+
 /// Case-insensitive subsequence match: every query character appears in `label`, in order.
 fn fuzzy_matches(label: &str, query: &str) -> bool {
     let mut haystack = label.chars().flat_map(char::to_lowercase);
@@ -1333,6 +1348,21 @@ mod tests {
         assert!(!s.switch_workspace(9), "no such workspace");
         assert!(s.switch_workspace(0));
         assert!(s.view(WIDE).review.expect("review").rows[0].cursor);
+    }
+
+    #[test]
+    fn typed_text_keeps_altgr_characters_and_drops_shortcuts() {
+        // Plain and Shift keys type.
+        assert_eq!(typed_text(false, false, false, Some("a")), Some("a"));
+        // AltGr (reported as Alt, or as Ctrl+Alt on some layouts) types `@`, `€`, `[`.
+        assert_eq!(typed_text(false, true, false, Some("@")), Some("@"));
+        assert_eq!(typed_text(true, true, false, Some("€")), Some("€"));
+        // Ctrl and Super chords are shortcuts, never text.
+        assert_eq!(typed_text(true, false, false, Some("c")), None);
+        assert_eq!(typed_text(false, false, true, Some("v")), None);
+        // Keys without a character (arrows, F-keys) type nothing.
+        assert_eq!(typed_text(false, false, false, None), None);
+        assert_eq!(typed_text(false, false, false, Some("")), None);
     }
 
     #[test]

@@ -20,7 +20,7 @@ use drenyra_rpc::agent::{AgentSession, AgentUpdate};
 
 use super::agent_pane::{agent_launch, AgentStatus, EntryRole};
 
-use super::commands::{ShellCommand, ShellState, KEY_BINDINGS};
+use super::commands::{typed_text, ShellCommand, ShellState, KEY_BINDINGS};
 use super::settings::save_if_changed;
 use super::theme::{ThemeId, ThemeTokens};
 use super::view_model::{
@@ -268,8 +268,12 @@ impl ShellWindow {
                 self.dispatch(ShellCommand::ReviewCursorDown, window, cx);
                 false
             }
-            _ if mods.control || mods.alt || mods.platform || mods.function => return,
-            _ => match keystroke.key_char.as_deref() {
+            _ => match typed_text(
+                mods.control,
+                mods.alt,
+                mods.platform,
+                keystroke.key_char.as_deref(),
+            ) {
                 Some(text) => self.state.type_text(text),
                 None => return,
             },
