@@ -2,7 +2,7 @@
 
 # WEB-MAP — Drenyra Web App Navigation
 
-**Última actualización**: 2026-07-08
+**Última actualización**: 2026-11-27
 
 > 🗺️ Este mapa es tu guía de navegación del web app de Drenyra. No necesitás leerlo completo — usalo como referencia cuando necesités encontrar algo. Cada sección es independiente: saltá directo a lo que te interese.
 
@@ -265,7 +265,8 @@ All routes are flat under `src/routes/` except `settings/` and `workspace/` whic
 | `scanner.tsx`          | `/scanner`          | Document scanner                                     |
 | `mobile-summary.tsx`   | `/mobile-summary`   | Mobile-optimized summary                             |
 | `profile.tsx`          | `/profile`          | User profile                                         |
-| `settings.tsx`         | `/settings`         | Settings layout (redirect to index)                  |
+| `settings.tsx`         | `/settings`         | Settings placeholder; links to ledger keys           |
+| `settings_.ledger-keys.tsx` | `/settings/ledger-keys` | Read-only ledger keys (issue once, list, revoke); not nested under `/settings` |
 
 ### Settings sub-routes (`src/routes/settings/`)
 
@@ -303,6 +304,7 @@ All routes are flat under `src/routes/` except `settings/` and `workspace/` whic
 | central-board          | src/features/central-board/          | Área Central: ledger editable, pending journal review, document upload     |
 | drenyra [hooks]        | src/features/drenyra/hooks/          | Journal entries TanStack Query hooks (useJournalEntriesApi)                |
 | settings               | src/features/settings/               | Settings UI views (appearance, shell)                                      |
+| ledger-keys            | src/features/ledger-keys/            | Read-only ledger keys `drn_ro_…`: `/api/ledger-keys` client, page, dialogs |
 | ledger                 | src/features/ledger/                 | General ledger view                                                        |
 | reconciliations        | src/features/reconciliations/        | Reconciliation data, types, utils                                          |
 | products               | src/features/products/               | Product catalog, product form, SKU management                              |
@@ -347,6 +349,7 @@ All routes are flat under `src/routes/` except `settings/` and `workspace/` whic
 | Review pending agent proposals          | `src/features/central-board/components/JournalPendingList.tsx`                                         |
 | Add a journal-entries API query filter  | `src/features/drenyra/hooks/useJournalEntriesApi.ts`                                                   |
 | Export general ledger to PDF/XLSX       | `src/features/central-board/components/LedgerEditableTable.tsx` → POST `/api/ledger/export`            |
+| Issue / list / revoke read-only ledger keys | `src/features/ledger-keys/services/ledger-keys.ts` (contract: `docs/04-api/ledger-read-keys.md`); the plaintext key lives only in the issue mutation (`gcTime: 0`, reset on dialog close) |
 
 ## Component tree
 
