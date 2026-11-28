@@ -16,7 +16,10 @@ import {
 	users,
 } from "@drenyra/persistence/schema";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { parseLedgerDayBound } from "../../_internal/fiscal-day";
+import {
+	LedgerDateRangeError,
+	parseLedgerDayBound,
+} from "../../_internal/fiscal-day";
 import { getGeneralLedger, getTrialBalance } from "../../queries";
 
 const describeDb = process.env.RUN_DB_TESTS === "1" ? describe : describe.skip;
@@ -54,6 +57,21 @@ const ZONES = {
 		rows: [
 			"2026-03-31T14:59:59.999Z", // 1.00  31 Mar 23:59 in Tokyo
 			"2026-03-31T15:00:00.000Z", // 2.00  1 Apr 00:00 in Tokyo
+		],
+	},
+	// Extreme offsets bound the sargable issue_date prefilter (±1/2 days).
+	kiritimati: {
+		timeZone: "Pacific/Kiritimati",
+		rows: [
+			"2026-03-31T09:59:59.999Z", // 1.00  31 Mar 23:59 at UTC+14
+			"2026-03-31T10:00:00.000Z", // 2.00  1 Apr 00:00 at UTC+14
+		],
+	},
+	minus12: {
+		timeZone: "Etc/GMT+12",
+		rows: [
+			"2026-04-01T11:59:59.999Z", // 1.00  31 Mar 23:59 at UTC-12
+			"2026-04-01T12:00:00.000Z", // 2.00  1 Apr 00:00 at UTC-12
 		],
 	},
 	// A value the settings route accepts today but Postgres does not know.
@@ -166,6 +184,56 @@ describeDb("ledger fiscal-day boundaries (integration)", () => {
 			"2026-03-31T00:00:00.000Z",
 			"2026-04-01T04:59:59.999Z",
 			"last microsecond of 31 Mar",
+		]);
+	});
+
+	// R3-001 — mixed bounds are ordered on fiscal days in the company zone.
+	it("accepts start = instant late on 31 Mar in Lima (after 00:00Z), end = day 31 Mar", async () => {
+		const entries = await getGeneralLedger(
+			ids.lima,
+			day("2026-04-01T03:00:00.000Z"),
+			day("2026-03-31"),
+		);
+		expect(entries.map((entry) => entry.glosa).sort()).toEqual([
+			"2026-03-31T00:00:00.000Z",
+			"2026-04-01T04:59:59.999Z",
+			"last microsecond of 31 Mar",
+		]);
+	});
+
+	it("rejects start = day 31 Mar, end = instant 03:00Z 31 Mar (30 Mar in Lima)", async () => {
+		const failure = getGeneralLedger(
+			ids.lima,
+			day("2026-03-31"),
+			day("2026-03-31T03:00:00.000Z"),
+		);
+		await expect(failure).rejects.toBeInstanceOf(LedgerDateRangeError);
+		await expect(failure).rejects.toMatchObject({
+			startDay: "2026-03-31",
+			endDay: "2026-03-30",
+		});
+	});
+
+	it("keeps whole fiscal days at UTC+14 and UTC-12 (prefilter edges)", async () => {
+		expect(await credits("kiritimati", "2026-03-30")).toBe("0.00");
+		expect(await credits("kiritimati", "2026-03-31")).toBe("1.00");
+		expect(await credits("kiritimati", "2026-04-01")).toBe("3.00");
+		expect(await credits("minus12", "2026-03-31")).toBe("1.00");
+		expect(await credits("minus12", "2026-04-01")).toBe("3.00");
+
+		const glosas = async (
+			company: keyof typeof ZONES,
+			start: string,
+			end: string,
+		) =>
+			(await getGeneralLedger(ids[company], day(start), day(end)))
+				.map((entry) => entry.glosa)
+				.sort();
+		expect(await glosas("kiritimati", "2026-04-01", "2026-04-01")).toEqual([
+			"2026-03-31T10:00:00.000Z",
+		]);
+		expect(await glosas("minus12", "2026-03-31", "2026-03-31")).toEqual([
+			"2026-04-01T11:59:59.999Z",
 		]);
 	});
 

@@ -7,8 +7,8 @@ import {
 } from "../_internal/fiscal-day";
 import {
 	companyFiscalTimeZone,
-	requestedFiscalDay,
-	transactionFiscalDay,
+	fiscalDayUpToFilter,
+	resolveFiscalDay,
 } from "../_internal/fiscal-day-sql";
 import {
 	resolveAccountCode,
@@ -82,6 +82,7 @@ export async function getTrialBalance(
 	asOf: LedgerDayInput,
 ): Promise<TrialBalanceResult> {
 	const timeZone = await companyFiscalTimeZone(companyId);
+	const asOfDay = await resolveFiscalDay(timeZone, asOf);
 	const debitSum = sql`COALESCE(SUM(CASE WHEN ${transactions.type} = 'EXPENSE' THEN ${transactions.totalAmount} END), 0)`;
 	const creditSum = sql`COALESCE(SUM(CASE WHEN ${transactions.type} = 'INCOME' THEN ${transactions.totalAmount} END), 0)`;
 
@@ -104,7 +105,7 @@ export async function getTrialBalance(
 			and(
 				eq(transactions.companyId, companyId),
 				eq(transactions.categoryId, categories.id),
-				sql`${transactionFiscalDay(timeZone)} <= ${requestedFiscalDay(asOf, timeZone)}`,
+				fiscalDayUpToFilter(timeZone, asOfDay),
 			),
 		)
 		// Unnamed categories are not listed, so they must not reach the totals.

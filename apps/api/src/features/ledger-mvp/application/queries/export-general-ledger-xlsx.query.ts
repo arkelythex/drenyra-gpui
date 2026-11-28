@@ -2,6 +2,8 @@ import { eq } from "@drenyra/persistence/query";
 import { companies } from "@drenyra/persistence/schema";
 import ExcelJS from "exceljs";
 import {
+	isInvertedCalendarDayRange,
+	LedgerDateRangeError,
 	ledgerDayToInstant,
 	parseLedgerDayBound,
 } from "../../../../features/ledger/_internal/fiscal-day";
@@ -132,23 +134,29 @@ export async function exportGeneralLedgerXlsx(input: {
 			code: "INVALID_DATE",
 		};
 	}
+	// Report header labels only; never used to order the bounds.
 	const startDate = startBound ? ledgerDayToInstant(startBound) : null;
 	const endDate = endBound ? ledgerDayToInstant(endBound) : null;
+	const invalidRange = {
+		ok: false,
+		status: 400,
+		message: "startDate must be <= endDate",
+		code: "INVALID_DATE_RANGE",
+	} as const;
 
-	if (startDate && endDate && startDate.getTime() > endDate.getTime()) {
-		return {
-			ok: false,
-			status: 400,
-			message: "startDate must be <= endDate",
-			code: "INVALID_DATE_RANGE",
-		};
+	const rangeStart = startBound ?? new Date(0);
+	const rangeEnd = endBound ?? new Date();
+	// Two calendar days are ordered here; a range with an instant is ordered
+	// by the query on fiscal days in the company zone.
+	if (isInvertedCalendarDayRange(rangeStart, rangeEnd)) return invalidRange;
+
+	let entries: GeneralLedgerEntry[];
+	try {
+		entries = await getGeneralLedger(input.companyId, rangeStart, rangeEnd);
+	} catch (error: unknown) {
+		if (error instanceof LedgerDateRangeError) return invalidRange;
+		throw error;
 	}
-
-	const entries = await getGeneralLedger(
-		input.companyId,
-		startBound ?? new Date(0),
-		endBound ?? new Date(),
-	);
 
 	const [company] = await db
 		.select({ businessName: companies.businessName, ruc: companies.ruc })

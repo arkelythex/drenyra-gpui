@@ -6,6 +6,7 @@
 
 import { db } from "@drenyra/persistence/client";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { resetKnownTimeZoneNamesCache } from "../../_internal/known-time-zones";
 import { LedgerService } from "../../index";
 
 vi.mock("@drenyra/persistence/client", () => ({
@@ -30,9 +31,30 @@ vi.mock("@drenyra/persistence/query", () => ({
 	sql: vi.fn((strings: TemplateStringsArray) => strings.join("")),
 }));
 
+/** Answers by the (mocked) SQL text: company zone, zone names, instant days. */
+function answerExecute(instantDays: string) {
+	(db.execute as ReturnType<typeof vi.fn>).mockImplementation(
+		async (query: unknown) => {
+			const text = String(query);
+			if (text.includes("pg_timezone_names")) {
+				return [{ name: "America/Lima" }];
+			}
+			if (text.includes("concat_ws")) return [{ days: instantDays }];
+			return [{ zone: "America/Lima" }];
+		},
+	);
+}
+
+const executedSql = () =>
+	(db.execute as ReturnType<typeof vi.fn>).mock.calls.map(([query]) =>
+		String(query),
+	);
+
 describe("LedgerService", () => {
 	beforeEach(() => {
 		vi.clearAllMocks();
+		resetKnownTimeZoneNamesCache();
+		answerExecute("2026-03-31");
 	});
 
 	describe("getChartOfAccounts", () => {
@@ -463,21 +485,29 @@ describe("LedgerService", () => {
 	});
 
 	describe("fiscal zone lookup", () => {
-		// pg_timezone_names is a full function scan (~13-50 ms); it must run
-		// once per report, not once per use of the zone in the SQL.
-		it("resolves the company zone with a single query per trial balance", async () => {
+		// pg_timezone_names is a full function scan (~13-50 ms): it is cached
+		// per process (TTL), and the company zone is read once per report.
+		it("reads the company zone once per trial balance and scans zone names once per process", async () => {
 			(db.orderBy as ReturnType<typeof vi.fn>).mockResolvedValue([]);
-
-			await LedgerService.getTrialBalance("cmp-1", {
-				kind: "instant",
+			const asOf = {
+				kind: "instant" as const,
 				at: new Date("2026-04-01T04:59:59.999Z"),
-			});
+			};
 
-			expect(db.execute).toHaveBeenCalledOnce();
+			await LedgerService.getTrialBalance("cmp-1", asOf);
+			await LedgerService.getTrialBalance("cmp-1", asOf);
+
+			const queries = executedSql();
+			expect(queries.filter((q) => q.includes("AS zone"))).toHaveLength(2);
+			expect(
+				queries.filter((q) => q.includes("pg_timezone_names")),
+			).toHaveLength(1);
+			expect(queries.filter((q) => q.includes("concat_ws"))).toHaveLength(2);
 		});
 
-		it("resolves the company zone with a single query per general ledger", async () => {
+		it("resolves both instant bounds of a general ledger in one query", async () => {
 			(db.orderBy as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+			answerExecute("2026-03-01,2026-03-31");
 
 			await LedgerService.getGeneralLedger(
 				"cmp-1",
@@ -485,7 +515,23 @@ describe("LedgerService", () => {
 				{ kind: "instant", at: new Date("2026-04-01T04:59:59.999Z") },
 			);
 
-			expect(db.execute).toHaveBeenCalledOnce();
+			const queries = executedSql();
+			expect(queries.filter((q) => q.includes("AS zone"))).toHaveLength(1);
+			expect(queries.filter((q) => q.includes("concat_ws"))).toHaveLength(1);
+		});
+
+		it("needs no day query for calendar-day bounds", async () => {
+			(db.orderBy as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+			await LedgerService.getGeneralLedger(
+				"cmp-1",
+				{ kind: "calendar-day", day: "2026-03-01" },
+				{ kind: "calendar-day", day: "2026-03-31" },
+			);
+
+			expect(executedSql().filter((q) => q.includes("concat_ws"))).toHaveLength(
+				0,
+			);
 		});
 	});
 });

@@ -29,6 +29,9 @@ const { exportGeneralLedgerPdf } = await import(
 const { exportGeneralLedgerXlsx } = await import(
 	"../../application/queries/export-general-ledger-xlsx.query"
 );
+const { LedgerDateRangeError } = await import(
+	"../../../ledger/_internal/fiscal-day"
+);
 
 const exporters = [
 	["pdf", exportGeneralLedgerPdf],
@@ -80,6 +83,41 @@ describe.each(exporters)(
 				code: "INVALID_DATE_RANGE",
 			});
 			expect(mocks.getGeneralLedger).not.toHaveBeenCalled();
+		});
+
+		// R3-001 — mixed bounds are ordered on fiscal days (by the query).
+		it("accepts an instant late on 31 Mar in Lima (after 00:00Z) up to day 31 Mar", async () => {
+			const result = await exporter({
+				companyId: "cmp-1",
+				startDate: "2026-04-01T03:00:00.000Z",
+				endDate: "2026-03-31",
+			});
+
+			expect(result.ok).toBe(true);
+			expect(mocks.getGeneralLedger).toHaveBeenCalledExactlyOnceWith(
+				"cmp-1",
+				{ kind: "instant", at: new Date("2026-04-01T03:00:00.000Z") },
+				{ kind: "calendar-day", day: "2026-03-31" },
+			);
+		});
+
+		it("answers 400 INVALID_DATE_RANGE when the fiscal range is inverted (day 31 Mar to 03:00Z 31 Mar)", async () => {
+			mocks.getGeneralLedger.mockRejectedValue(
+				new LedgerDateRangeError("2026-03-31", "2026-03-30"),
+			);
+
+			const result = await exporter({
+				companyId: "cmp-1",
+				startDate: "2026-03-31",
+				endDate: "2026-03-31T03:00:00.000Z",
+			});
+
+			expect(result).toEqual({
+				ok: false,
+				status: 400,
+				message: "startDate must be <= endDate",
+				code: "INVALID_DATE_RANGE",
+			});
 		});
 
 		it("rejects a calendar day that does not exist with 400 INVALID_DATE", async () => {

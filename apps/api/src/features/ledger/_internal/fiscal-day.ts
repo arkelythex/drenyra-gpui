@@ -28,7 +28,8 @@ const CALENDAR_DAY_PATTERN = /^(\d{4})-(\d{2})-(\d{2})$/;
 
 const DAY_MS = 86_400_000;
 
-function isValidCalendarDay(value: string): boolean {
+/** Whether `value` is a `YYYY-MM-DD` day that exists in the calendar. */
+export function isValidCalendarDay(value: string): boolean {
 	const match = CALENDAR_DAY_PATTERN.exec(value);
 	if (!match) return false;
 	const year = Number(match[1]);
@@ -84,12 +85,52 @@ export function toLedgerDayBound(input: LedgerDayInput): LedgerDayBound {
 }
 
 /**
- * Representative instant of a bound, used to order two bounds and to echo the
- * requested date in responses (`YYYY-MM-DD` → `YYYY-MM-DDT00:00:00.000Z`).
+ * Representative instant of a bound, used to echo the requested date in
+ * responses and report headers (`YYYY-MM-DD` → `YYYY-MM-DDT00:00:00.000Z`).
+ * Never use it to order two bounds: an instant's day depends on the company
+ * zone (see `isInvertedCalendarDayRange` and `LedgerDateRangeError`).
  */
 export function ledgerDayToInstant(input: LedgerDayInput): Date {
 	const bound = toLedgerDayBound(input);
 	return bound.kind === "instant"
 		? bound.at
 		: new Date(`${bound.day}T00:00:00.000Z`);
+}
+
+/**
+ * Whether both bounds are calendar days and the start day is after the end
+ * day. Decidable without the company zone, so callers can refuse it before any
+ * query. A range with an instant is ordered by the query, on fiscal days in the
+ * company zone, which throws `LedgerDateRangeError` when it is inverted.
+ */
+export function isInvertedCalendarDayRange(
+	start: LedgerDayInput,
+	end: LedgerDayInput,
+): boolean {
+	const first = toLedgerDayBound(start);
+	const last = toLedgerDayBound(end);
+	return (
+		first.kind === "calendar-day" &&
+		last.kind === "calendar-day" &&
+		first.day > last.day
+	);
+}
+
+/**
+ * The requested start day is after the end day once both bounds are resolved
+ * to fiscal days in the company zone. Routes answer it with
+ * `400 INVALID_DATE_RANGE` instead of an empty ledger.
+ */
+export class LedgerDateRangeError extends Error {
+	readonly code = "INVALID_DATE_RANGE";
+
+	constructor(
+		readonly startDay: string,
+		readonly endDay: string,
+	) {
+		super(
+			`Ledger start day ${startDay} is after end day ${endDay} in the company fiscal zone`,
+		);
+		this.name = "LedgerDateRangeError";
+	}
 }
