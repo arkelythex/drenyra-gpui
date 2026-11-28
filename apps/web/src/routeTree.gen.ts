@@ -19,6 +19,7 @@ import { Route as LoginRouteImport } from "./routes/login";
 import { Route as OnboardingRouteImport } from "./routes/onboarding";
 import { Route as ResetPasswordRouteImport } from "./routes/reset-password";
 import { Route as SettingsRouteImport } from "./routes/settings";
+import { Route as SettingsLedgerKeysRouteImport } from "./routes/settings_.ledger-keys";
 import { Route as SignupRouteImport } from "./routes/signup";
 import { Route as TesoreriaReconciliationsRouteImport } from "./routes/tesoreria.reconciliations";
 import { Route as VerifyEmailRouteImport } from "./routes/verify-email";
@@ -85,6 +86,11 @@ const TesoreriaReconciliationsRoute =
 		path: "/tesoreria/reconciliations",
 		getParentRoute: () => rootRouteImport,
 	} as any);
+const SettingsLedgerKeysRoute = SettingsLedgerKeysRouteImport.update({
+	id: "/settings_/ledger-keys",
+	path: "/settings/ledger-keys",
+	getParentRoute: () => rootRouteImport,
+} as any);
 const CumplimientoExpedientesRoute = CumplimientoExpedientesRouteImport.update({
 	id: "/cumplimiento/expedientes",
 	path: "/cumplimiento/expedientes",
@@ -110,6 +116,7 @@ export interface FileRoutesByFullPath {
 	"/signup": typeof SignupRoute;
 	"/verify-email": typeof VerifyEmailRoute;
 	"/cumplimiento/expedientes": typeof CumplimientoExpedientesRoute;
+	"/settings/ledger-keys": typeof SettingsLedgerKeysRoute;
 	"/tesoreria/reconciliations": typeof TesoreriaReconciliationsRoute;
 	"/workspace/$companyId/$year/$month/$intent": typeof WorkspaceCompanyIdYearMonthIntentRoute;
 }
@@ -126,6 +133,7 @@ export interface FileRoutesByTo {
 	"/signup": typeof SignupRoute;
 	"/verify-email": typeof VerifyEmailRoute;
 	"/cumplimiento/expedientes": typeof CumplimientoExpedientesRoute;
+	"/settings/ledger-keys": typeof SettingsLedgerKeysRoute;
 	"/tesoreria/reconciliations": typeof TesoreriaReconciliationsRoute;
 	"/workspace/$companyId/$year/$month/$intent": typeof WorkspaceCompanyIdYearMonthIntentRoute;
 }
@@ -143,6 +151,7 @@ export interface FileRoutesById {
 	"/signup": typeof SignupRoute;
 	"/verify-email": typeof VerifyEmailRoute;
 	"/cumplimiento/expedientes": typeof CumplimientoExpedientesRoute;
+	"/settings_/ledger-keys": typeof SettingsLedgerKeysRoute;
 	"/tesoreria/reconciliations": typeof TesoreriaReconciliationsRoute;
 	"/workspace/$companyId/$year/$month/$intent": typeof WorkspaceCompanyIdYearMonthIntentRoute;
 }
@@ -161,6 +170,7 @@ export interface FileRouteTypes {
 		| "/signup"
 		| "/verify-email"
 		| "/cumplimiento/expedientes"
+		| "/settings/ledger-keys"
 		| "/tesoreria/reconciliations"
 		| "/workspace/$companyId/$year/$month/$intent";
 	fileRoutesByTo: FileRoutesByTo;
@@ -177,6 +187,7 @@ export interface FileRouteTypes {
 		| "/signup"
 		| "/verify-email"
 		| "/cumplimiento/expedientes"
+		| "/settings/ledger-keys"
 		| "/tesoreria/reconciliations"
 		| "/workspace/$companyId/$year/$month/$intent";
 	id:
@@ -193,6 +204,7 @@ export interface FileRouteTypes {
 		| "/signup"
 		| "/verify-email"
 		| "/cumplimiento/expedientes"
+		| "/settings_/ledger-keys"
 		| "/tesoreria/reconciliations"
 		| "/workspace/$companyId/$year/$month/$intent";
 	fileRoutesById: FileRoutesById;
@@ -210,6 +222,7 @@ export interface RootRouteChildren {
 	SignupRoute: typeof SignupRoute;
 	VerifyEmailRoute: typeof VerifyEmailRoute;
 	CumplimientoExpedientesRoute: typeof CumplimientoExpedientesRoute;
+	SettingsLedgerKeysRoute: typeof SettingsLedgerKeysRoute;
 	TesoreriaReconciliationsRoute: typeof TesoreriaReconciliationsRoute;
 	WorkspaceCompanyIdYearMonthIntentRoute: typeof WorkspaceCompanyIdYearMonthIntentRoute;
 }
@@ -300,6 +313,13 @@ declare module "@tanstack/react-router" {
 			preLoaderRoute: typeof TesoreriaReconciliationsRouteImport;
 			parentRoute: typeof rootRouteImport;
 		};
+		"/settings_/ledger-keys": {
+			id: "/settings_/ledger-keys";
+			path: "/settings/ledger-keys";
+			fullPath: "/settings/ledger-keys";
+			preLoaderRoute: typeof SettingsLedgerKeysRouteImport;
+			parentRoute: typeof rootRouteImport;
+		};
 		"/cumplimiento/expedientes": {
 			id: "/cumplimiento/expedientes";
 			path: "/cumplimiento/expedientes";
@@ -330,6 +350,7 @@ const rootRouteChildren: RootRouteChildren = {
 	SignupRoute: SignupRoute,
 	VerifyEmailRoute: VerifyEmailRoute,
 	CumplimientoExpedientesRoute: CumplimientoExpedientesRoute,
+	SettingsLedgerKeysRoute: SettingsLedgerKeysRoute,
 	TesoreriaReconciliationsRoute: TesoreriaReconciliationsRoute,
 	WorkspaceCompanyIdYearMonthIntentRoute:
 		WorkspaceCompanyIdYearMonthIntentRoute,
