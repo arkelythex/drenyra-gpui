@@ -5,8 +5,8 @@
  * company. Only a Better Auth session may call these routes: a ledger key,
  * header identity or no identity are refused before anything is read or
  * written. `auth.api.*` and the membership lookup are mocked; the plugin's
- * list/delete semantics (own keys only, someone else's key is NOT_FOUND) are
- * modelled by an in-memory store. The real plugin round trip is covered by
+ * list/get/delete semantics (own keys only, someone else's key is NOT_FOUND)
+ * are modelled by an in-memory store. The real plugin round trip is covered by
  * `integration/ledger-keys.integration.test.ts` (RUN_DB_TESTS=1).
  */
 import { randomUUID } from "node:crypto";
@@ -201,6 +201,7 @@ describe("ledger key management routes", () => {
 	let getSessionSpy: ReturnType<typeof vi.fn>;
 	let createSpy: ReturnType<typeof vi.fn>;
 	let listSpy: ReturnType<typeof vi.fn>;
+	let getSpy: ReturnType<typeof vi.fn>;
 	let deleteSpy: ReturnType<typeof vi.fn>;
 	let verifySpy: ReturnType<typeof vi.fn>;
 
@@ -250,6 +251,16 @@ describe("ledger key management routes", () => {
 			const apiKeys = store.filter((key) => key.referenceId === userId);
 			return { apiKeys, total: apiKeys.length };
 		});
+		getSpy = vi.fn(async (input: unknown) => {
+			const userId = requireSessionUser(input);
+			const id = (input as { query: { id: string } }).query.id;
+			const found = store.find((key) => key.id === id);
+			if (!found || found.referenceId !== userId) {
+				throw new APIError("NOT_FOUND", { message: "API Key not found" });
+			}
+			const { key: _hash, ...returned } = found;
+			return returned;
+		});
 		deleteSpy = vi.fn(async (input: unknown) => {
 			const userId = requireSessionUser(input);
 			const keyId = (input as { body: { keyId: string } }).body.keyId;
@@ -270,6 +281,9 @@ describe("ledger key management routes", () => {
 		);
 		vi.spyOn(auth.api, "listApiKeys").mockImplementation(
 			listSpy as unknown as typeof auth.api.listApiKeys,
+		);
+		vi.spyOn(auth.api, "getApiKey").mockImplementation(
+			getSpy as unknown as typeof auth.api.getApiKey,
 		);
 		vi.spyOn(auth.api, "deleteApiKey").mockImplementation(
 			deleteSpy as unknown as typeof auth.api.deleteApiKey,
@@ -428,7 +442,7 @@ describe("ledger key management routes", () => {
 			};
 		}
 
-		it("pages through listApiKeys until total is reached for list, cap and revoke", async () => {
+		it("pages through listApiKeys until total is reached for the list", async () => {
 			const keys = Array.from({ length: 5 }, (_, index) =>
 				fakeKey({ name: `key ${index}` }),
 			);
@@ -449,13 +463,6 @@ describe("ledger key management routes", () => {
 					(call) => (call[0] as { query?: { offset?: number } }).query?.offset,
 				),
 			).toEqual([0, 2, 4]);
-
-			const last = keys[4];
-			const revoke = await app.handle(
-				request(`/api/ledger-keys/${last?.id}`, { method: "DELETE" }),
-			);
-			expect(revoke.status).toBe(200);
-			expect(deleteSpy).toHaveBeenCalledTimes(1);
 		});
 
 		it("counts keys beyond the first page toward the cap (409, nothing issued)", async () => {
@@ -479,12 +486,15 @@ describe("ledger key management routes", () => {
 			["no total", { apiKeys: [] }],
 			["total not a number", { apiKeys: [], total: "1" }],
 			["negative total", { apiKeys: [], total: -1 }],
-			["record without id", { apiKeys: [{ name: "x" }], total: 1 }],
+			[
+				"ledger key record without id",
+				{ apiKeys: [{ name: "x", prefix: "drn_ro_" }], total: 1 },
+			],
 			["empty page before total", { apiKeys: [], total: 3 }],
 		];
 
 		it.each(UNEXPECTED_RESPONSES)(
-			"answers 500 LEDGER_KEY_ERROR and logs when listApiKeys returns %s",
+			"answers 500 LEDGER_KEY_ERROR to list and issue, and logs, when listApiKeys returns %s",
 			async (_label, response) => {
 				const own = fakeKey();
 				store = [own];
@@ -494,9 +504,6 @@ describe("ledger key management routes", () => {
 					await app.handle(request(`/api/ledger-keys?companyId=${COMPANY_A}`)),
 					await app.handle(
 						request("/api/ledger-keys", { method: "POST", body: validBody() }),
-					),
-					await app.handle(
-						request(`/api/ledger-keys/${own.id}`, { method: "DELETE" }),
 					),
 				];
 				for (const res of responses) {
@@ -517,10 +524,44 @@ describe("ledger key management routes", () => {
 				).toEqual([
 					{ operation: "list", errorName: "LedgerKeyListError" },
 					{ operation: "issue", errorName: "LedgerKeyListError" },
-					{ operation: "revoke", errorName: "LedgerKeyListError" },
 				]);
 			},
 		);
+
+		it("skips keys of other configurations (null prefix, no string id) instead of failing", async () => {
+			const own = fakeKey({ name: "own" });
+			const foreignConfig = {
+				configId: "partner-integrations",
+				prefix: null,
+				name: "partner",
+				referenceId: OWNER,
+				enabled: true,
+				metadata: { companyId: COMPANY_A },
+			};
+			const malformedForeign = { id: 42, prefix: "sk_live_", enabled: true };
+			listSpy.mockResolvedValue({
+				apiKeys: [foreignConfig, own, malformedForeign, null],
+				total: 4,
+			});
+			store = [own];
+
+			const list = await app.handle(
+				request(`/api/ledger-keys?companyId=${COMPANY_A}`),
+			);
+			expect(list.status).toBe(200);
+			expect(
+				((await readJson(list)).data as Array<{ id: string }>).map(
+					(key) => key.id,
+				),
+			).toEqual([own.id]);
+
+			const issue = await app.handle(
+				request("/api/ledger-keys", { method: "POST", body: validBody() }),
+			);
+			expect(issue.status).toBe(201);
+			expect(createSpy).toHaveBeenCalledTimes(1);
+			expect(logEntries.filter((entry) => entry.level === "error")).toEqual([]);
+		});
 
 		it("answers 500 instead of a silently truncated list when the plugin may have cut it at 100 rows", async () => {
 			store = Array.from({ length: 100 }, (_, index) =>
@@ -539,6 +580,27 @@ describe("ledger key management routes", () => {
 			expect(issue.status).toBe(500);
 			expect((await readJson(list)).code).toBe("LEDGER_KEY_ERROR");
 			expect(createSpy).not.toHaveBeenCalled();
+		});
+
+		it("still revokes a key when the caller holds more keys than the plugin can list", async () => {
+			store = Array.from({ length: 150 }, () => fakeKey());
+			const leaked = store[149] as FakeKey;
+
+			const res = await app.handle(
+				request(`/api/ledger-keys/${leaked.id}`, { method: "DELETE" }),
+			);
+			expect(res.status).toBe(200);
+			expect(await readJson(res)).toEqual({
+				success: true,
+				data: { id: leaked.id, revoked: true },
+			});
+			expect(listSpy).not.toHaveBeenCalled();
+			expect(getSpy).toHaveBeenCalledTimes(1);
+			const call = getSpy.mock.calls[0]?.[0] as { query: { id: string } };
+			expect(call.query).toEqual({ id: leaked.id });
+			expect(sessionHeadersOf(call)?.get("cookie")).toBe(SESSION_COOKIE);
+			expect(store).toHaveLength(149);
+			expect(store.some((key) => key.id === leaked.id)).toBe(false);
 		});
 
 		it("still lists 99 keys in one page", async () => {
@@ -1091,6 +1153,79 @@ describe("ledger key management routes", () => {
 				error: "Ledger key not found",
 				code: "LEDGER_KEY_NOT_FOUND",
 			});
+		});
+
+		it("answers byte-identical 404s for another user's key and an unknown id, deleting nothing", async () => {
+			const foreign = fakeKey({ referenceId: OTHER_USER });
+			store = [...Array.from({ length: 150 }, () => fakeKey()), foreign];
+			const before = [...store];
+
+			const foreignRes = await app.handle(
+				request(`/api/ledger-keys/${foreign.id}`, { method: "DELETE" }),
+			);
+			const unknownRes = await app.handle(
+				request("/api/ledger-keys/key-does-not-exist", { method: "DELETE" }),
+			);
+			expect(foreignRes.status).toBe(404);
+			expect(unknownRes.status).toBe(404);
+			expect([...foreignRes.headers.entries()]).toEqual([
+				...unknownRes.headers.entries(),
+			]);
+			const foreignText = await foreignRes.text();
+			expect(foreignText).toBe(await unknownRes.text());
+			expect(JSON.parse(foreignText)).toEqual({
+				success: false,
+				error: "Ledger key not found",
+				code: "LEDGER_KEY_NOT_FOUND",
+			});
+			expect(listSpy).not.toHaveBeenCalled();
+			expect(deleteSpy).not.toHaveBeenCalled();
+			expect(store).toEqual(before);
+		});
+
+		it("answers the same 404 for an own key of another configuration (no drn_ro_ prefix) and keeps it", async () => {
+			const unknown = await app.handle(
+				request("/api/ledger-keys/key-does-not-exist", { method: "DELETE" }),
+			);
+			const unknownText = await unknown.text();
+			for (const prefix of ["sk_live_", null]) {
+				const other = fakeKey({ prefix });
+				store = [other];
+				const res = await app.handle(
+					request(`/api/ledger-keys/${other.id}`, { method: "DELETE" }),
+				);
+				expect(res.status, String(prefix)).toBe(404);
+				expect(await res.text()).toBe(unknownText);
+				expect(store).toEqual([other]);
+			}
+			expect(deleteSpy).not.toHaveBeenCalled();
+		});
+
+		it("answers the same 404 if the plugin ever returns a key owned by someone else", async () => {
+			const foreign = fakeKey({ referenceId: OTHER_USER });
+			store = [foreign];
+			const { key: _hash, ...returned } = foreign;
+			getSpy.mockResolvedValueOnce(returned);
+			const res = await app.handle(
+				request(`/api/ledger-keys/${foreign.id}`, { method: "DELETE" }),
+			);
+			expect(res.status).toBe(404);
+			expect((await readJson(res)).code).toBe("LEDGER_KEY_NOT_FOUND");
+			expect(deleteSpy).not.toHaveBeenCalled();
+			expect(store).toEqual([foreign]);
+		});
+
+		it("answers 500 LEDGER_KEY_ERROR and deletes nothing when the key lookup fails", async () => {
+			const own = fakeKey();
+			store = [own];
+			getSpy.mockRejectedValueOnce(new Error("database unreachable"));
+			const res = await app.handle(
+				request(`/api/ledger-keys/${own.id}`, { method: "DELETE" }),
+			);
+			expect(res.status).toBe(500);
+			expect((await readJson(res)).code).toBe("LEDGER_KEY_ERROR");
+			expect(deleteSpy).not.toHaveBeenCalled();
+			expect(store).toEqual([own]);
 		});
 
 		it("answers 404 when the plugin reports NOT_FOUND (deleted concurrently)", async () => {

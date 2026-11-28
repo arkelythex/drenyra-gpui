@@ -119,10 +119,12 @@ Returns only **your** keys for that company, without secrets: `id`, `name`,
 Use `start` and `name` to recognise a key. The response carries
 `Cache-Control: no-store`.
 
-The server reads all your keys (every company) page by page. If the plugin's
-answer cannot be trusted to be complete — an unexpected shape, or 100 or more
-keys in total, the most the plugin can return — list, issue and revoke answer
-`500 LEDGER_KEY_ERROR` instead of acting on a partial list.
+The server reads all your keys (every company) page by page and keeps only
+`drn_ro_` keys; keys of other API key configurations are skipped. If the
+plugin's answer cannot be trusted to be complete — an unexpected shape, a
+`drn_ro_` key without an id, or 100 or more keys in total, the most the plugin
+can return — list and issue answer `500 LEDGER_KEY_ERROR` instead of acting on
+a partial list. Revoke is not affected: it never reads the list.
 
 ## 4. Revoke a key
 
@@ -134,7 +136,9 @@ curl -sS -X DELETE "$DRENYRA_API/api/ledger-keys/<key id>" \
 `200 { "success": true, "data": { "id": "<key id>", "revoked": true } }`.
 The `Origin` rule of issuance applies here too (`403 ORIGIN_NOT_ALLOWED`).
 The key stops working on the next request (`401 API_KEY_INVALID`). Someone
-else's key and an unknown id both answer `404 LEDGER_KEY_NOT_FOUND`. You can
+else's key and an unknown id both answer `404 LEDGER_KEY_NOT_FOUND`. The
+server checks only that one key — it must exist, be yours and start with
+`drn_ro_` — so you can revoke a leaked key however many keys you hold. You can
 revoke your keys even after you leave the company.
 
 To rotate: issue a new key, switch the client to it, revoke the old one.
@@ -168,7 +172,7 @@ To rotate: issue a new key, switch the client to it, revoke the old one.
 | Per-key rate | 60 requests per minute per key (`429 API_KEY_RATE_LIMITED`, `Retry-After`)        |
 | Global rate  | 100 requests per minute per client, whole API (`429 RATE_LIMITED`, `Retry-After`) |
 | Name         | 1–64 visible characters                                                           |
-| Keys in all  | Fewer than 100 per user across companies (list/issue/revoke answer `500` beyond)  |
+| Keys in all  | Fewer than 100 per user across companies (list/issue answer `500` beyond)         |
 
 The per-key limit is the lower one, so a key holder normally meets it first.
 The global limit counts per client (the `Authorization` value, else the
