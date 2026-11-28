@@ -210,7 +210,7 @@ describe("read-only ledger key caller", () => {
 		expect(listUserCompanyMemberships).not.toHaveBeenCalled();
 	});
 
-	it("refuses a rate-limited key with API_KEY_RATE_LIMITED", async () => {
+	it("refuses a rate-limited key with 429 API_KEY_RATE_LIMITED at the source", async () => {
 		for (const code of ["RATE_LIMITED", "USAGE_EXCEEDED"]) {
 			verifySpy.mockResolvedValueOnce({
 				valid: false,
@@ -225,7 +225,7 @@ describe("read-only ledger key caller", () => {
 
 			expect(result).toEqual({
 				ok: false,
-				status: 403,
+				status: 429,
 				code: "API_KEY_RATE_LIMITED",
 				error: "API key rate limit exceeded; retry later",
 				retryAfterSeconds: 60,
@@ -262,19 +262,69 @@ describe("read-only ledger key caller", () => {
 		}
 	});
 
-	it("refuses a key that does not carry the drn_ro_ prefix", async () => {
+	it("ignores an x-api-key without the drn_ro_ prefix, as if no key were sent", async () => {
 		const result = await resolveAuthenticatedCaller({
 			headers: { "x-api-key": "sk_live_other" },
 			allowReadOnlyLedgerKey: true,
 			method: "GET",
 		});
+		const withoutKey = await resolveAuthenticatedCaller({
+			headers: {},
+			allowReadOnlyLedgerKey: true,
+			method: "GET",
+		});
 
+		expect(result).toEqual(withoutKey);
 		expect(result).toMatchObject({
 			ok: false,
 			status: 401,
-			code: "API_KEY_INVALID",
+			code: "SESSION_REQUIRED",
 		});
 		expect(verifySpy).not.toHaveBeenCalled();
+	});
+
+	it("keeps the header-fallback caller when an unrelated x-api-key is sent without a session", async () => {
+		process.env.SECURITY_ENFORCE_TEST_SESSION = "false";
+		const identity = {
+			"x-user-id": "user-1",
+			"x-user-role": "owner",
+			"x-company-id": COMPANY_A,
+		};
+		const input = {
+			requireSession: false,
+			allowHeaderFallback: true,
+			allowReadOnlyLedgerKey: true,
+			method: "GET",
+		};
+
+		const result = await resolveAuthenticatedCaller({
+			...input,
+			headers: { ...identity, "x-api-key": "sk_live_other" },
+		});
+		const baseline = await resolveAuthenticatedCaller({
+			...input,
+			headers: identity,
+		});
+
+		expect(result).toEqual(baseline);
+		expect(result).toMatchObject({
+			ok: true,
+			caller: { kind: "header-fallback", companyId: COMPANY_A },
+		});
+		expect(verifySpy).not.toHaveBeenCalled();
+	});
+
+	it("uses a drn_ro_ bearer key even when an unrelated x-api-key is also sent", async () => {
+		const result = await resolveAuthenticatedCaller({
+			headers: bearer({ "x-api-key": "sk_live_other" }),
+			allowReadOnlyLedgerKey: true,
+			method: "GET",
+		});
+
+		expect(result).toMatchObject({ ok: true, caller: { kind: "api-key" } });
+		expect(verifySpy).toHaveBeenCalledWith({
+			body: { key: KEY, permissions: { ledger: ["read"] } },
+		});
 	});
 
 	it("refuses a key without ledger:read even if the plugin reports it valid", async () => {
@@ -332,7 +382,15 @@ describe("read-only ledger key caller", () => {
 		});
 	});
 
-	it("fails closed with 401 when verification throws", async () => {
+	const UNAVAILABLE = {
+		ok: false,
+		status: 503,
+		code: "API_KEY_VERIFICATION_UNAVAILABLE",
+		error: "API key verification is temporarily unavailable; retry later",
+		retryAfterSeconds: 5,
+	} as const;
+
+	it("fails closed with 503 API_KEY_VERIFICATION_UNAVAILABLE when verification throws", async () => {
 		verifySpy.mockRejectedValueOnce(new Error("db down"));
 
 		const result = await resolveAuthenticatedCaller({
@@ -341,14 +399,11 @@ describe("read-only ledger key caller", () => {
 			method: "GET",
 		});
 
-		expect(result).toMatchObject({
-			ok: false,
-			status: 401,
-			code: "API_KEY_INVALID",
-		});
+		expect(result).toEqual(UNAVAILABLE);
+		expect(listUserCompanyMemberships).not.toHaveBeenCalled();
 	});
 
-	it("fails closed with 401 when the membership lookup throws", async () => {
+	it("fails closed with 503 API_KEY_VERIFICATION_UNAVAILABLE when the membership lookup throws", async () => {
 		vi.mocked(listUserCompanyMemberships).mockRejectedValueOnce(
 			new Error("db down"),
 		);
@@ -359,11 +414,26 @@ describe("read-only ledger key caller", () => {
 			method: "GET",
 		});
 
-		expect(result).toMatchObject({
-			ok: false,
-			status: 401,
-			code: "API_KEY_INVALID",
+		expect(result).toEqual(UNAVAILABLE);
+	});
+
+	it("never falls back to header identity when verification is unavailable", async () => {
+		process.env.SECURITY_ENFORCE_TEST_SESSION = "false";
+		verifySpy.mockRejectedValueOnce(new Error("db down"));
+
+		const result = await resolveAuthenticatedCaller({
+			headers: bearer({
+				"x-user-id": "user-1",
+				"x-user-role": "owner",
+				"x-company-id": COMPANY_A,
+			}),
+			requireSession: false,
+			allowReadOnlyLedgerKey: true,
+			allowHeaderFallback: true,
+			method: "GET",
 		});
+
+		expect(result).toEqual(UNAVAILABLE);
 	});
 
 	describe("tenant isolation", () => {
@@ -408,6 +478,57 @@ describe("read-only ledger key caller", () => {
 				ok: false,
 				status: 403,
 				code: "API_KEY_TENANT_MISMATCH",
+			});
+		});
+
+		it("refuses a key-only requested companyId (query) for another company", async () => {
+			for (const requested of [[COMPANY_B], [COMPANY_A, COMPANY_B], [""]]) {
+				const result = await resolveAuthenticatedCaller({
+					headers: bearer(),
+					readOnlyLedgerKeyRequestedCompanyIds: requested,
+					allowReadOnlyLedgerKey: true,
+					method: "GET",
+				});
+
+				expect(result, JSON.stringify(requested)).toEqual({
+					ok: false,
+					status: 403,
+					code: "API_KEY_TENANT_MISMATCH",
+					error: "API key company does not match the requested company",
+				});
+			}
+		});
+
+		it("accepts a key-only requested companyId equal to the key company", async () => {
+			const result = await resolveAuthenticatedCaller({
+				headers: bearer(),
+				readOnlyLedgerKeyRequestedCompanyIds: [COMPANY_A],
+				allowReadOnlyLedgerKey: true,
+				method: "GET",
+			});
+
+			expect(result).toMatchObject({
+				ok: true,
+				caller: { kind: "api-key", companyId: COMPANY_A },
+			});
+		});
+
+		it("does not apply the key-only requested companyId to a session caller", async () => {
+			vi.mocked(auth.api.getSession).mockResolvedValue({
+				session: { id: "sess-1" },
+				user: { id: "auth-user-1", role: "admin", activeCompanyId: COMPANY_A },
+			} as never);
+
+			const result = await resolveAuthenticatedCaller({
+				headers: { cookie: "better-auth.session_token=s" },
+				readOnlyLedgerKeyRequestedCompanyIds: [COMPANY_B],
+				allowReadOnlyLedgerKey: true,
+				method: "GET",
+			});
+
+			expect(result).toMatchObject({
+				ok: true,
+				caller: { kind: "session", companyId: COMPANY_A },
 			});
 		});
 

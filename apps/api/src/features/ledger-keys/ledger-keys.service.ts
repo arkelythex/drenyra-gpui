@@ -29,6 +29,11 @@ import {
  * The 10-key cap holds under concurrency: counting and creating run under a
  * per (user, company) Postgres advisory lock (`ledger-keys-issue-lock.ts`).
  *
+ * Listing the caller's keys (for the cap, the list and revoke) pages through
+ * `listApiKeys` until its `total`, and throws `LedgerKeyListError` (the
+ * routes answer 500 `LEDGER_KEY_ERROR`) on any unexpected response instead of
+ * acting on a partial or empty list.
+ *
  * @module ledger-keys/service
  */
 
@@ -95,6 +100,28 @@ const NOT_FOUND: LedgerKeyFailure = {
 	code: "LEDGER_KEY_NOT_FOUND",
 	error: "Ledger key not found",
 };
+
+/**
+ * Rows `@better-auth/api-key@1.6.23` can return from one `listApiKeys` call:
+ * its database read passes no limit, so the adapter's `defaultFindManyLimit`
+ * (100) applies, and `total` counts only the rows read (`limit`/`offset` then
+ * slice those rows in memory). A `total` at this bound may hide more keys.
+ */
+export const LEDGER_KEY_LIST_PLUGIN_READ_LIMIT = 100;
+
+/** Page size requested from `listApiKeys`. */
+const LEDGER_KEY_LIST_PAGE_SIZE = 100;
+
+/**
+ * `listApiKeys` answered something this module cannot trust to be the
+ * caller's complete key list. The message names the problem only.
+ */
+export class LedgerKeyListError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "LedgerKeyListError";
+	}
+}
 
 /** Fields this module reads from a plugin key record. */
 interface PluginKeyRecord {
@@ -163,24 +190,67 @@ async function isActiveMember(
 	return memberships.some((membership) => membership.companyId === companyId);
 }
 
+/** One `listApiKeys` page, checked: an array of keys and a whole `total`. */
+function readListPage(result: unknown): {
+	apiKeys: unknown[];
+	total: number;
+} {
+	if (!result || typeof result !== "object") {
+		throw new LedgerKeyListError("listApiKeys returned no object");
+	}
+	const { apiKeys, total } = result as { apiKeys?: unknown; total?: unknown };
+	if (!Array.isArray(apiKeys)) {
+		throw new LedgerKeyListError("listApiKeys returned no apiKeys array");
+	}
+	if (typeof total !== "number" || !Number.isInteger(total) || total < 0) {
+		throw new LedgerKeyListError("listApiKeys returned no valid total");
+	}
+	return { apiKeys, total };
+}
+
 /**
  * The session user's read-only ledger keys, as the plugin stores them.
  * `sessionHeaders` must carry the caller's Better Auth session.
+ *
+ * Pages through `listApiKeys` until `total` keys are read. Throws
+ * `LedgerKeyListError` on an unexpected response (no array, no valid total,
+ * a record without id, an empty page before `total`) and when `total`
+ * reaches `LEDGER_KEY_LIST_PLUGIN_READ_LIMIT`, where the plugin may have cut
+ * the list.
  */
 async function listOwnLedgerKeyRecords(
 	sessionHeaders: Headers,
 ): Promise<PluginKeyRecord[]> {
-	const result: unknown = await auth.api.listApiKeys({
-		headers: sessionHeaders,
-	});
-	const apiKeys = (result as { apiKeys?: unknown } | null)?.apiKeys;
-	if (!Array.isArray(apiKeys)) return [];
-	return apiKeys
-		.map(toPluginKeyRecord)
-		.filter(
-			(record): record is PluginKeyRecord =>
-				record !== null && record.prefix === READ_ONLY_LEDGER_KEY_PREFIX,
+	const rows: unknown[] = [];
+	let total = 0;
+	do {
+		const page = readListPage(
+			await auth.api.listApiKeys({
+				headers: sessionHeaders,
+				query: { limit: LEDGER_KEY_LIST_PAGE_SIZE, offset: rows.length },
+			}),
 		);
+		total = page.total;
+		if (total >= LEDGER_KEY_LIST_PLUGIN_READ_LIMIT) {
+			throw new LedgerKeyListError(
+				"listApiKeys total reached the plugin read limit; the list may be incomplete",
+			);
+		}
+		if (page.apiKeys.length === 0 && rows.length < total) {
+			throw new LedgerKeyListError("listApiKeys returned an empty page");
+		}
+		rows.push(...page.apiKeys);
+	} while (rows.length < total);
+
+	const records: PluginKeyRecord[] = [];
+	for (const row of rows) {
+		const record = toPluginKeyRecord(row);
+		if (record === null) {
+			throw new LedgerKeyListError("listApiKeys returned a key without id");
+		}
+		if (record.prefix === READ_ONLY_LEDGER_KEY_PREFIX) records.push(record);
+	}
+	return records;
 }
 
 function toSummary(

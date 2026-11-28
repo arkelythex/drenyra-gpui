@@ -14,6 +14,51 @@ import { APIError } from "better-auth/api";
 import { Elysia } from "elysia";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+type LogEntry = {
+	bindings: Record<string, unknown>;
+	level: string;
+	payload: unknown;
+};
+const logEntries = vi.hoisted((): LogEntry[] => []);
+const RECORDED_LEVELS = new Set(["debug", "info", "warn", "error"]);
+
+vi.mock("../../../lib/logger", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../../../lib/logger")>();
+	return {
+		...actual,
+		createLogger: (bindings: Record<string, unknown>) =>
+			new Proxy(actual.createLogger(bindings), {
+				get(target, property, receiver) {
+					if (typeof property === "string" && RECORDED_LEVELS.has(property)) {
+						return (payload: unknown) => {
+							logEntries.push({ bindings, level: property, payload });
+						};
+					}
+					return Reflect.get(target, property, receiver);
+				},
+			}),
+	};
+});
+
+// Lets a test make the session lookup itself throw; otherwise the real
+// resolver runs (backed by the mocked `auth.api.getSession`).
+const sessionLookup = vi.hoisted(() => ({ failure: null as Error | null }));
+vi.mock("../../auth/handlers/session-identity", async (importOriginal) => {
+	const actual =
+		await importOriginal<
+			typeof import("../../auth/handlers/session-identity")
+		>();
+	return {
+		...actual,
+		resolveSessionIdentityFromHeaders: async (
+			headers: Parameters<typeof actual.resolveSessionIdentityFromHeaders>[0],
+		) => {
+			if (sessionLookup.failure) throw sessionLookup.failure;
+			return actual.resolveSessionIdentityFromHeaders(headers);
+		},
+	};
+});
+
 vi.mock("../../auth/handlers/company-membership", async (importOriginal) => {
 	const actual =
 		await importOriginal<
@@ -166,6 +211,8 @@ describe("ledger key management routes", () => {
 		delete process.env.SECURITY_ENFORCE_TEST_SESSION;
 		store = [];
 		sessionUserId = OWNER;
+		sessionLookup.failure = null;
+		logEntries.length = 0;
 		lockCalls.length = 0;
 		lockBusy = false;
 		for (const name of [
@@ -316,6 +363,192 @@ describe("ledger key management routes", () => {
 			expect(createSpy).not.toHaveBeenCalled();
 			expect(listSpy).not.toHaveBeenCalled();
 			expect(deleteSpy).not.toHaveBeenCalled();
+		});
+
+		it("still refuses any x-api-key value, even one without the drn_ro_ prefix", async () => {
+			for (const build of ROUTES) {
+				const req = build();
+				req.headers.set("x-api-key", "sk_live_unrelated");
+				const res = await app.handle(req);
+				expect(res.status, req.method).toBe(403);
+				expect((await readJson(res)).code).toBe("API_KEY_NOT_ALLOWED");
+			}
+			expect(createSpy).not.toHaveBeenCalled();
+			expect(listSpy).not.toHaveBeenCalled();
+			expect(deleteSpy).not.toHaveBeenCalled();
+		});
+
+		it("answers a failing session lookup with the LEDGER_KEY_ERROR envelope on every route", async () => {
+			sessionLookup.failure = new Error("session store unreachable");
+			for (const build of ROUTES) {
+				const req = build();
+				const res = await app.handle(req);
+				expect(res.status, req.method).toBe(500);
+				expect(await readJson(res)).toEqual({
+					success: false,
+					error: "Could not complete the ledger key operation",
+					code: "LEDGER_KEY_ERROR",
+				});
+				if (req.method !== "DELETE") {
+					expect(res.headers.get("cache-control"), req.method).toBe("no-store");
+				}
+			}
+			expect(
+				logEntries
+					.filter((entry) => entry.level === "error")
+					.map((entry) => entry.payload),
+			).toEqual([
+				{ operation: "issue", errorName: "Error" },
+				{ operation: "list", errorName: "Error" },
+				{ operation: "revoke", errorName: "Error" },
+			]);
+			expect(createSpy).not.toHaveBeenCalled();
+			expect(listSpy).not.toHaveBeenCalled();
+			expect(deleteSpy).not.toHaveBeenCalled();
+		});
+	});
+
+	describe("listing the plugin's keys", () => {
+		/** A plugin that honours `limit`/`offset` with pages of `pageSize`. */
+		function pagedList(pageSize: number) {
+			return async (input: unknown) => {
+				const userId = requireSessionUser(input);
+				const query =
+					(input as { query?: { limit?: number; offset?: number } }).query ??
+					{};
+				const own = store.filter((key) => key.referenceId === userId);
+				const offset = query.offset ?? 0;
+				const limit = Math.min(query.limit ?? own.length, pageSize);
+				return {
+					apiKeys: own.slice(offset, offset + limit),
+					total: own.length,
+					limit,
+					offset,
+				};
+			};
+		}
+
+		it("pages through listApiKeys until total is reached for list, cap and revoke", async () => {
+			const keys = Array.from({ length: 5 }, (_, index) =>
+				fakeKey({ name: `key ${index}` }),
+			);
+			store = [...keys];
+			listSpy.mockImplementation(pagedList(2));
+
+			const list = await app.handle(
+				request(`/api/ledger-keys?companyId=${COMPANY_A}`),
+			);
+			expect(list.status).toBe(200);
+			expect(
+				((await readJson(list)).data as Array<{ id: string }>).map(
+					(key) => key.id,
+				),
+			).toEqual(keys.map((key) => key.id));
+			expect(
+				listSpy.mock.calls.map(
+					(call) => (call[0] as { query?: { offset?: number } }).query?.offset,
+				),
+			).toEqual([0, 2, 4]);
+
+			const last = keys[4];
+			const revoke = await app.handle(
+				request(`/api/ledger-keys/${last?.id}`, { method: "DELETE" }),
+			);
+			expect(revoke.status).toBe(200);
+			expect(deleteSpy).toHaveBeenCalledTimes(1);
+		});
+
+		it("counts keys beyond the first page toward the cap (409, nothing issued)", async () => {
+			store = Array.from({ length: LEDGER_KEYS_MAX_ACTIVE_PER_COMPANY }, () =>
+				fakeKey(),
+			);
+			listSpy.mockImplementation(pagedList(3));
+
+			const res = await app.handle(
+				request("/api/ledger-keys", { method: "POST", body: validBody() }),
+			);
+			expect(res.status).toBe(409);
+			expect((await readJson(res)).code).toBe("LEDGER_KEY_LIMIT_REACHED");
+			expect(createSpy).not.toHaveBeenCalled();
+		});
+
+		const UNEXPECTED_RESPONSES: ReadonlyArray<[string, unknown]> = [
+			["null", null],
+			["no apiKeys", { total: 0 }],
+			["apiKeys not an array", { apiKeys: "nope", total: 1 }],
+			["no total", { apiKeys: [] }],
+			["total not a number", { apiKeys: [], total: "1" }],
+			["negative total", { apiKeys: [], total: -1 }],
+			["record without id", { apiKeys: [{ name: "x" }], total: 1 }],
+			["empty page before total", { apiKeys: [], total: 3 }],
+		];
+
+		it.each(UNEXPECTED_RESPONSES)(
+			"answers 500 LEDGER_KEY_ERROR and logs when listApiKeys returns %s",
+			async (_label, response) => {
+				const own = fakeKey();
+				store = [own];
+				listSpy.mockResolvedValue(response);
+
+				const responses = [
+					await app.handle(request(`/api/ledger-keys?companyId=${COMPANY_A}`)),
+					await app.handle(
+						request("/api/ledger-keys", { method: "POST", body: validBody() }),
+					),
+					await app.handle(
+						request(`/api/ledger-keys/${own.id}`, { method: "DELETE" }),
+					),
+				];
+				for (const res of responses) {
+					expect(res.status).toBe(500);
+					expect(await readJson(res)).toEqual({
+						success: false,
+						error: "Could not complete the ledger key operation",
+						code: "LEDGER_KEY_ERROR",
+					});
+				}
+				expect(createSpy).not.toHaveBeenCalled();
+				expect(deleteSpy).not.toHaveBeenCalled();
+				expect(store).toEqual([own]);
+				expect(
+					logEntries
+						.filter((entry) => entry.level === "error")
+						.map((entry) => entry.payload),
+				).toEqual([
+					{ operation: "list", errorName: "LedgerKeyListError" },
+					{ operation: "issue", errorName: "LedgerKeyListError" },
+					{ operation: "revoke", errorName: "LedgerKeyListError" },
+				]);
+			},
+		);
+
+		it("answers 500 instead of a silently truncated list when the plugin may have cut it at 100 rows", async () => {
+			store = Array.from({ length: 100 }, (_, index) =>
+				fakeKey({
+					metadata: { companyId: index < 5 ? COMPANY_A : randomUUID() },
+				}),
+			);
+
+			const list = await app.handle(
+				request(`/api/ledger-keys?companyId=${COMPANY_A}`),
+			);
+			const issue = await app.handle(
+				request("/api/ledger-keys", { method: "POST", body: validBody() }),
+			);
+			expect(list.status).toBe(500);
+			expect(issue.status).toBe(500);
+			expect((await readJson(list)).code).toBe("LEDGER_KEY_ERROR");
+			expect(createSpy).not.toHaveBeenCalled();
+		});
+
+		it("still lists 99 keys in one page", async () => {
+			store = Array.from({ length: 99 }, () => fakeKey());
+			const list = await app.handle(
+				request(`/api/ledger-keys?companyId=${COMPANY_A}`),
+			);
+			expect(list.status).toBe(200);
+			expect((await readJson(list)).data).toHaveLength(99);
+			expect(listSpy).toHaveBeenCalledTimes(1);
 		});
 	});
 

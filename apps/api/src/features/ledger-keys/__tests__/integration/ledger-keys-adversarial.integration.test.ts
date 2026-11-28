@@ -11,7 +11,7 @@
  */
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { db } from "@drenyra/persistence/client";
-import { eq, sql } from "@drenyra/persistence/query";
+import { eq, inArray, sql } from "@drenyra/persistence/query";
 import {
 	authApiKeys,
 	authSessions,
@@ -110,8 +110,15 @@ describeDb("read-only ledger keys (DB integration, adversarial)", () => {
 	}
 
 	const withKey = (secret: string) => ({ authorization: `Bearer ${secret}` });
+	// Counts only this file's users' keys, so other DB test files running at
+	// the same time against the same database cannot change the count.
 	const countKeys = async () =>
-		(await db.select({ id: authApiKeys.id }).from(authApiKeys)).length;
+		(
+			await db
+				.select({ id: authApiKeys.id })
+				.from(authApiKeys)
+				.where(inArray(authApiKeys.referenceId, [owner, stranger, doomed]))
+		).length;
 
 	beforeAll(async () => {
 		expect((process.env.BETTER_AUTH_SECRET ?? "").length).toBeGreaterThan(31);
@@ -281,6 +288,14 @@ describeDb("read-only ledger keys (DB integration, adversarial)", () => {
 					expect(response.status, `${env} ${header}`).toBe(403);
 					expect(response.code).toBe("API_KEY_TENANT_MISMATCH");
 				}
+				const foreignQuery = await call(
+					"GET",
+					`${ACCOUNTS}?companyId=${companyB}`,
+					withKey(issued.secret),
+				);
+				expect(foreignQuery.status, `${env} ?companyId`).toBe(403);
+				expect(foreignQuery.code).toBe("API_KEY_TENANT_MISMATCH");
+				expect(foreignQuery.data).toBeNull();
 				const conflicting = await call("GET", ACCOUNTS, {
 					...withKey(issued.secret),
 					"x-company-id": companyA,

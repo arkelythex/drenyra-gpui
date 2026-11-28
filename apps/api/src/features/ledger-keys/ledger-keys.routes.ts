@@ -6,7 +6,7 @@ import {
 	type HeaderContainer,
 	resolveSessionIdentityFromHeaders,
 } from "../auth/handlers/session-identity";
-import { readPresentedLedgerKey } from "../security/read-only-ledger-key";
+import { presentsAnyApiKey } from "../security/read-only-ledger-key";
 import { fail, ok } from "../shared/api-response";
 import {
 	firstIssueMessage,
@@ -29,9 +29,11 @@ import {
  * - `GET /?companyId=` lists the caller's own keys for that company.
  * - `DELETE /:id` revokes one of the caller's own keys.
  *
- * Session only: a presented API key (`x-api-key` or
+ * Session only: a presented API key (any `x-api-key` value, or
  * `Authorization: Bearer drn_ro_…`) is refused before anything else, and
  * header identity (`x-user-id`, …) is never accepted, in any environment.
+ * Any unexpected failure, the session lookup included, answers 500
+ * `LEDGER_KEY_ERROR` (logged without secrets).
  * This module does not use `companyScopeGuard`: the company comes from the
  * request and is checked against the session user's active memberships.
  *
@@ -58,7 +60,7 @@ type SessionCaller =
 async function resolveSessionCaller(
 	headers: HeaderContainer,
 ): Promise<SessionCaller> {
-	if (readPresentedLedgerKey(headers) !== null) {
+	if (presentsAnyApiKey(headers)) {
 		return {
 			ok: false,
 			status: 403,
@@ -167,22 +169,22 @@ export const ledgerKeysRoutes = new Elysia({ prefix: "/api/ledger-keys" })
 		"/",
 		async ({ headers, body, set }) => {
 			set.headers["cache-control"] = NO_STORE;
-			const caller = await resolveSessionCaller(headers);
-			if (!caller.ok) return refusal(set, caller);
-			if (!originAllowed(headers.origin)) {
-				return refusal(set, ORIGIN_NOT_ALLOWED);
-			}
-			if (!isJsonContentType(headers["content-type"])) {
-				return refusal(set, UNSUPPORTED_MEDIA_TYPE);
-			}
-
-			const parsed = issueLedgerKeyBodySchema.safeParse(body);
-			if (!parsed.success) {
-				set.status = 400;
-				return fail(firstIssueMessage(parsed.error), "VALIDATION_ERROR");
-			}
-
 			try {
+				const caller = await resolveSessionCaller(headers);
+				if (!caller.ok) return refusal(set, caller);
+				if (!originAllowed(headers.origin)) {
+					return refusal(set, ORIGIN_NOT_ALLOWED);
+				}
+				if (!isJsonContentType(headers["content-type"])) {
+					return refusal(set, UNSUPPORTED_MEDIA_TYPE);
+				}
+
+				const parsed = issueLedgerKeyBodySchema.safeParse(body);
+				if (!parsed.success) {
+					set.status = 400;
+					return fail(firstIssueMessage(parsed.error), "VALIDATION_ERROR");
+				}
+
 				const result = await issueLedgerKey({
 					userId: caller.userId,
 					companyId: parsed.data.companyId,
@@ -210,16 +212,16 @@ export const ledgerKeysRoutes = new Elysia({ prefix: "/api/ledger-keys" })
 		"/",
 		async ({ headers, query, set }) => {
 			set.headers["cache-control"] = NO_STORE;
-			const caller = await resolveSessionCaller(headers);
-			if (!caller.ok) return refusal(set, caller);
-
-			const parsed = listLedgerKeysQuerySchema.safeParse(query);
-			if (!parsed.success) {
-				set.status = 400;
-				return fail(firstIssueMessage(parsed.error), "VALIDATION_ERROR");
-			}
-
 			try {
+				const caller = await resolveSessionCaller(headers);
+				if (!caller.ok) return refusal(set, caller);
+
+				const parsed = listLedgerKeysQuerySchema.safeParse(query);
+				if (!parsed.success) {
+					set.status = 400;
+					return fail(firstIssueMessage(parsed.error), "VALIDATION_ERROR");
+				}
+
 				const result = await listLedgerKeys({
 					userId: caller.userId,
 					companyId: parsed.data.companyId,
@@ -242,19 +244,19 @@ export const ledgerKeysRoutes = new Elysia({ prefix: "/api/ledger-keys" })
 	.delete(
 		"/:id",
 		async ({ headers, params, set }) => {
-			const caller = await resolveSessionCaller(headers);
-			if (!caller.ok) return refusal(set, caller);
-			if (!originAllowed(headers.origin)) {
-				return refusal(set, ORIGIN_NOT_ALLOWED);
-			}
-
-			const keyId = ledgerKeyIdSchema.safeParse(params.id);
-			if (!keyId.success) {
-				set.status = 404;
-				return fail("Ledger key not found", "LEDGER_KEY_NOT_FOUND");
-			}
-
 			try {
+				const caller = await resolveSessionCaller(headers);
+				if (!caller.ok) return refusal(set, caller);
+				if (!originAllowed(headers.origin)) {
+					return refusal(set, ORIGIN_NOT_ALLOWED);
+				}
+
+				const keyId = ledgerKeyIdSchema.safeParse(params.id);
+				if (!keyId.success) {
+					set.status = 404;
+					return fail("Ledger key not found", "LEDGER_KEY_NOT_FOUND");
+				}
+
 				const result = await revokeLedgerKey({
 					userId: caller.userId,
 					keyId: keyId.data,

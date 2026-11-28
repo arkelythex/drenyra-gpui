@@ -72,7 +72,9 @@ In production the session cookie is named
 
 ## 2. Use the key
 
-Send it as a bearer token (or as `x-api-key`) on the read routes:
+Send it as a bearer token (or as `x-api-key: drn_ro_…`) on the read routes.
+A header value without the `drn_ro_` prefix is not a ledger key and is
+ignored, as if no key were sent:
 
 ```bash
 curl -sS "$DRENYRA_API/api/ledger/trial-balance?asOfDate=2026-03-31" \
@@ -80,14 +82,26 @@ curl -sS "$DRENYRA_API/api/ledger/trial-balance?asOfDate=2026-03-31" \
 ```
 
 The key alone decides the company. Do not send identity headers; if you send
-`x-company-id` or `x-active-company-id`, each must be the key's company or the
-request is refused with `403 API_KEY_TENANT_MISMATCH` (also when the two
-headers disagree with each other). Writes are refused with `403
-API_KEY_READ_ONLY`.
+`x-company-id`, `x-active-company-id` or a `?companyId=` query parameter, each
+must be the key's company or the request is refused with `403
+API_KEY_TENANT_MISMATCH` (also when the two headers disagree with each other).
+Writes are refused with `403 API_KEY_READ_ONLY`.
 
 A key may make 60 requests per minute. Past that, requests get `429
 API_KEY_RATE_LIMITED` with a `Retry-After` header (seconds); wait that long
 before retrying.
+
+If the API cannot verify the key right now (a dependency such as the
+membership lookup failed), the request gets `503
+API_KEY_VERIFICATION_UNAVAILABLE` with `Retry-After: 5`. That says nothing
+about the key: **keep the stored key** and retry later. Only `401
+API_KEY_INVALID` means the key is invalid, expired or revoked.
+
+> **Known limitation.** The api-key plugin (`@better-auth/api-key` 1.6.23)
+> reports a failure to read the key store itself (database down, table
+> missing) as an invalid key, so that case still answers `401
+> API_KEY_INVALID`. A client should not delete a stored key after a single
+> `401` while the API is otherwise unreachable or failing.
 
 Routes that accept a key: `GET /api/ledger/accounts`,
 `GET /api/ledger/general`, `GET /api/ledger/trial-balance`,
@@ -104,6 +118,11 @@ Returns only **your** keys for that company, without secrets: `id`, `name`,
 `start`, `companyId`, `createdAt`, `expiresAt`, `lastRequest`, `enabled`.
 Use `start` and `name` to recognise a key. The response carries
 `Cache-Control: no-store`.
+
+The server reads all your keys (every company) page by page. If the plugin's
+answer cannot be trusted to be complete — an unexpected shape, or 100 or more
+keys in total, the most the plugin can return — list, issue and revoke answer
+`500 LEDGER_KEY_ERROR` instead of acting on a partial list.
 
 ## 4. Revoke a key
 
@@ -135,7 +154,10 @@ To rotate: issue a new key, switch the client to it, revoke the old one.
   and revoke need an allowlisted `Origin` when one is sent.
 - **Never cached.** Issue and list responses are `Cache-Control: no-store`.
 - **No secrets in logs.** Issuance and revocation are logged with user,
-  company and key ids only.
+  company and key ids only. Every refused key request is logged once
+  (`read_only_ledger_key_refused`) with the refusal code, status, route,
+  method and the key id when the key was verified — never the key, its hash,
+  headers or query values.
 
 ## Limits
 
@@ -146,6 +168,7 @@ To rotate: issue a new key, switch the client to it, revoke the old one.
 | Per-key rate | 60 requests per minute per key (`429 API_KEY_RATE_LIMITED`, `Retry-After`)        |
 | Global rate  | 100 requests per minute per client, whole API (`429 RATE_LIMITED`, `Retry-After`) |
 | Name         | 1–64 visible characters                                                           |
+| Keys in all  | Fewer than 100 per user across companies (list/issue/revoke answer `500` beyond)  |
 
 The per-key limit is the lower one, so a key holder normally meets it first.
 The global limit counts per client (the `Authorization` value, else the
@@ -172,11 +195,12 @@ Managing keys (`/api/ledger-keys`):
 | 409    | `LEDGER_KEY_ISSUE_BUSY`       | Another issue for you and that company is still running |
 | 415    | `UNSUPPORTED_MEDIA_TYPE`      | Issue request is not `application/json`                 |
 | 429    | `RATE_LIMITED`                | Global limit; see `Retry-After`                         |
-| 500    | `LEDGER_KEY_ERROR`            | Unexpected failure; nothing secret is returned          |
+| 500    | `LEDGER_KEY_ERROR`            | Unexpected failure or untrusted key list; no secrets    |
 
 Using a key: the `API_KEY_*` codes in the
 [route protection matrix](hardening/route-protection-matrix.md#how-a-request-with-a-key-is-decided),
-including `429 API_KEY_RATE_LIMITED` with `Retry-After`.
+including `429 API_KEY_RATE_LIMITED` and `503
+API_KEY_VERIFICATION_UNAVAILABLE`, both with `Retry-After`.
 
 Code:
 [`apps/api/src/features/ledger-keys/`](../../apps/api/src/features/ledger-keys/)

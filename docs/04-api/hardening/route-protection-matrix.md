@@ -95,6 +95,8 @@ an opted-in surface refuses them. `POST /api/ledger/export/pdf` and
 ### How a request with a key is decided
 
 Send the key as `Authorization: Bearer drn_ro_…` or `x-api-key: drn_ro_…`.
+A value without the `drn_ro_` prefix in either header is not a ledger key and
+is ignored: the request is decided exactly as if no key were sent.
 
 1. A Better Auth session, when present, wins; the key is not read.
 2. The method must be GET or HEAD — otherwise `403 API_KEY_READ_ONLY`, before
@@ -102,13 +104,20 @@ Send the key as `Authorization: Bearer drn_ro_…` or `x-api-key: drn_ro_…`.
 3. The key must verify with `ledger:read` (exists, enabled, not expired, under
    its rate limit) — otherwise `401 API_KEY_INVALID`, or `429
    API_KEY_RATE_LIMITED` with `Retry-After` (seconds until the key's window
-   allows another request).
+   allows another request). If verification or the membership lookup (step 5)
+   throws, the answer is `503 API_KEY_VERIFICATION_UNAVAILABLE` with
+   `Retry-After: 5`, never `401`: a client keeps its key and retries.
+   Limitation: `@better-auth/api-key` 1.6.23 catches its own key-store read
+   errors and reports them as an invalid key, so a database outage during the
+   key lookup still answers `401 API_KEY_INVALID`.
 4. The key must carry `ledger:read` (`403 API_KEY_FORBIDDEN`) and a company
    (`403 API_KEY_NOT_COMPANY_BOUND`).
 5. Its owner must still be an active member of that company at request time
    — otherwise `403 API_KEY_MEMBERSHIP_INACTIVE`.
-6. `x-company-id`, `x-active-company-id` or a requested company that differs
-   from the key's company — `403 API_KEY_TENANT_MISMATCH`. When
+6. `x-company-id`, `x-active-company-id` or a requested company (any
+   `?companyId=` value, repeated values included) that differs from the key's
+   company — `403 API_KEY_TENANT_MISMATCH`. The query is checked only for key
+   callers; sessions and header fallback are unchanged. When
    `x-company-id` and `x-active-company-id` disagree with each other and a
    key is sent, the answer is the same `403 API_KEY_TENANT_MISMATCH`, decided
    before the key is looked up (never `401`/`500`).
@@ -117,6 +126,24 @@ The key decides identity and tenant on its own: `x-user-id`, `x-user-role` and
 the other identity headers are ignored, and a refused key never falls back to
 header identity. The caller gets role `viewer` and `readOnly: true` in its
 company context. Production and non-production behave the same.
+
+Every refusal above is logged once at `warn` (`info` for
+`API_KEY_RATE_LIMITED`) as `read_only_ledger_key_refused` with `code`,
+`status`, `route` (registered path, e.g. `/api/journal-entries/:id`),
+`method`, `apiKeyId` once the key was verified, and for `503` the error's
+`errorName` and short `errorCode`. Key material, hashes, headers and query
+values are never logged.
+
+| Status | Code                               | Meaning                                                    |
+| ------ | ---------------------------------- | ---------------------------------------------------------- |
+| 401    | `API_KEY_INVALID`                  | Key unknown, disabled, expired or revoked                  |
+| 403    | `API_KEY_READ_ONLY`                | Method other than GET/HEAD                                 |
+| 403    | `API_KEY_FORBIDDEN`                | Key lacks `ledger:read`                                    |
+| 403    | `API_KEY_NOT_COMPANY_BOUND`        | Key has no company                                         |
+| 403    | `API_KEY_MEMBERSHIP_INACTIVE`      | Owner no longer an active member of the key's company      |
+| 403    | `API_KEY_TENANT_MISMATCH`          | Tenant header or `?companyId=` not the key's company       |
+| 429    | `API_KEY_RATE_LIMITED`             | Per-key limit; see `Retry-After`                           |
+| 503    | `API_KEY_VERIFICATION_UNAVAILABLE` | Could not verify now; `Retry-After: 5`; keep the key       |
 
 ### Key properties
 
@@ -159,6 +186,11 @@ Session only, as above. In addition, for the cookie-authenticated writes:
 - Issue and list responses carry `Cache-Control: no-store`.
 - Concurrent issues for one user and company run one at a time; a wait over
   5 seconds answers `409 LEDGER_KEY_ISSUE_BUSY`.
+- Every unexpected failure, the session lookup included, answers `500
+  LEDGER_KEY_ERROR` (logged with the operation and error name only). That
+  includes a `listApiKeys` answer that cannot be trusted to be complete: the
+  service pages until `total`, and refuses an unexpected shape or a `total`
+  of 100 or more (the most `@better-auth/api-key` 1.6.23 reads per call).
 
 Configuration lives in
 [`apps/api/src/features/auth/lib/read-only-ledger-key.ts`](../../../apps/api/src/features/auth/lib/read-only-ledger-key.ts);
