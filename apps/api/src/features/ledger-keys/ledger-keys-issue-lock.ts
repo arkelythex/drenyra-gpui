@@ -13,18 +13,22 @@ import { sql } from "@drenyra/persistence/query";
  * finished; the plugin's own writes commit on their own connections before
  * that, so the next holder counts them.
  *
- * Two safeguards keep the lock from starving the connection pool:
+ * Three safeguards keep the lock from starving the connection pool:
  * - Inside one process, callers for the same pair queue in memory first, so
  *   at most one pooled connection per pair waits on Postgres.
- * - The wait on Postgres is bounded by `lock_timeout`
- *   (`LEDGER_KEY_ISSUE_LOCK_TIMEOUT_MS`); past it the caller gets
+ * - At most `LEDGER_KEY_ISSUE_MAX_HOLDERS` callers per process hold the lock.
+ * - One deadline (`LEDGER_KEY_ISSUE_LOCK_TIMEOUT_MS`) bounds the queue, the
+ *   holder wait and `lock_timeout` together; past it the caller gets
  *   `LedgerKeyIssueLockTimeoutError` and nothing is created.
  *
  * @module ledger-keys/issue-lock
  */
 
-/** Longest wait for the advisory lock before giving up. */
+/** Longest total wait (queue, holder slot, advisory lock) before giving up. */
 export const LEDGER_KEY_ISSUE_LOCK_TIMEOUT_MS = 5_000;
+
+/** Most lock holders per process; each uses ≤ 2 pooled connections (≤ 4 of 10). */
+export const LEDGER_KEY_ISSUE_MAX_HOLDERS = 2;
 
 /** Postgres SQLSTATE `lock_not_available` (raised when `lock_timeout` hits). */
 const LOCK_NOT_AVAILABLE = "55P03";
@@ -53,23 +57,23 @@ export function ledgerKeyIssueLockId(
 }
 
 const inProcessTails = new Map<string, Promise<void>>();
+let activeHolders = 0;
+let holderFreed = signal();
 
-async function serializeInProcess<T>(
-	key: string,
-	work: () => Promise<T>,
-): Promise<T> {
-	const previous = inProcessTails.get(key) ?? Promise.resolve();
-	const run = previous.then(work);
-	const tail = run.then(
-		() => undefined,
-		() => undefined,
-	);
-	inProcessTails.set(key, tail);
-	try {
-		return await run;
-	} finally {
-		if (inProcessTails.get(key) === tail) inProcessTails.delete(key);
-	}
+function signal(): { promise: Promise<void>; fire: () => void } {
+	let fire = (): void => undefined;
+	const promise = new Promise<void>((resolve) => (fire = resolve));
+	return { promise, fire };
+}
+
+/** Resolves with `ready`, or throws the lock timeout at `deadline`. */
+function waitUntil(ready: Promise<void>, deadline: number): Promise<void> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const late = new Promise<never>((_, reject) => {
+		const timedOut = () => reject(new LedgerKeyIssueLockTimeoutError());
+		timer = setTimeout(timedOut, deadline - Date.now());
+	});
+	return Promise.race([ready, late]).finally(() => clearTimeout(timer));
 }
 
 function isLockTimeout(error: unknown): boolean {
@@ -99,20 +103,42 @@ function isLockTimeout(error: unknown): boolean {
 export async function withLedgerKeyIssueLock<T>(
 	lock: { userId: string; companyId: string },
 	work: () => Promise<T>,
+	timeoutMs = LEDGER_KEY_ISSUE_LOCK_TIMEOUT_MS,
 ): Promise<T> {
+	const deadline = Date.now() + timeoutMs;
 	const lockId = ledgerKeyIssueLockId(lock.userId, lock.companyId).toString();
-	return serializeInProcess(lockId, async () => {
-		try {
-			return await db.transaction(async (tx) => {
-				await tx.execute(
-					sql`select set_config('lock_timeout', ${`${LEDGER_KEY_ISSUE_LOCK_TIMEOUT_MS}ms`}, true)`,
-				);
-				await tx.execute(sql`select pg_advisory_xact_lock(${lockId}::bigint)`);
-				return work();
-			});
-		} catch (error) {
-			if (isLockTimeout(error)) throw new LedgerKeyIssueLockTimeoutError();
-			throw error;
+	const previous = inProcessTails.get(lockId) ?? Promise.resolve();
+	const done = signal();
+	// Successors also wait for the predecessor, even if this caller gives up.
+	const tail = previous.then(() => done.promise);
+	inProcessTails.set(lockId, tail);
+	let holding = false;
+	try {
+		await waitUntil(previous, deadline);
+		while (activeHolders >= LEDGER_KEY_ISSUE_MAX_HOLDERS) {
+			await waitUntil(holderFreed.promise, deadline);
 		}
-	});
+		activeHolders++;
+		holding = true;
+		// `lock_timeout` 0 means no bound, so keep at least 1 ms.
+		const remaining = `${Math.max(1, deadline - Date.now())}ms`;
+		return await db.transaction(async (tx) => {
+			await tx.execute(
+				sql`select set_config('lock_timeout', ${remaining}, true)`,
+			);
+			await tx.execute(sql`select pg_advisory_xact_lock(${lockId}::bigint)`);
+			return work();
+		});
+	} catch (error) {
+		if (isLockTimeout(error)) throw new LedgerKeyIssueLockTimeoutError();
+		throw error;
+	} finally {
+		if (holding) {
+			activeHolders--;
+			holderFreed.fire();
+			holderFreed = signal();
+		}
+		done.fire();
+		if (inProcessTails.get(lockId) === tail) inProcessTails.delete(lockId);
+	}
 }

@@ -223,7 +223,13 @@ export async function issueLedgerKey(input: {
 			() => countAndCreate(input),
 		);
 	} catch (error) {
-		if (error instanceof LedgerKeyIssueLockTimeoutError) return ISSUE_BUSY;
+		if (error instanceof LedgerKeyIssueLockTimeoutError) {
+			logger.warn(
+				{ userId: input.userId, companyId: input.companyId },
+				"Ledger key issue busy: lock not taken in time",
+			);
+			return ISSUE_BUSY;
+		}
 		throw error;
 	}
 }
