@@ -48,6 +48,8 @@ export type AuthenticatedCallerResult =
 			status: 401 | 403;
 			code: string;
 			error: string;
+			/** Seconds for `Retry-After`; only on a rate-limited key. */
+			retryAfterSeconds?: number;
 	  };
 
 export interface ResolveAuthenticatedCallerInput {
@@ -384,6 +386,15 @@ function resolveHeaderFallbackCaller(
 	};
 }
 
+function apiKeyTenantMismatch(): AuthenticatedCallerResult {
+	return {
+		ok: false,
+		status: 403,
+		code: "API_KEY_TENANT_MISMATCH",
+		error: "API key company does not match the requested company",
+	};
+}
+
 /**
  * Resolves a read-only ledger key caller. The key alone decides identity and
  * tenant: identity headers are ignored, and a tenant assertion
@@ -409,12 +420,7 @@ async function resolveReadOnlyLedgerKeyCaller(input: {
 		input.requestedCompanyId !== undefined &&
 		input.requestedCompanyId !== verified.companyId;
 	if (foreignAssertion || foreignRequest) {
-		return {
-			ok: false,
-			status: 403,
-			code: "API_KEY_TENANT_MISMATCH",
-			error: "API key company does not match the requested company",
-		};
+		return apiKeyTenantMismatch();
 	}
 
 	return {
@@ -463,6 +469,31 @@ function headerIdentityAllowed(allowHeaderFallback?: boolean): boolean {
 	return (process.env.NODE_ENV ?? "").toLowerCase() !== "production";
 }
 
+/**
+ * Refusal for conflicting `x-company-id` / `x-active-company-id`. The two
+ * headers can never both be a key's company, so a key on an opted-in route is
+ * refused as a tenant mismatch (fail closed, before the key is looked up)
+ * instead of the generic conflict, which header-fallback routes would pass
+ * through without context.
+ */
+function tenantConflictRefusal(
+	input: ResolveAuthenticatedCallerInput,
+	conflict: { status: 403; code: string; error: string },
+): AuthenticatedCallerResult {
+	if (
+		input.allowReadOnlyLedgerKey &&
+		readPresentedLedgerKey(input.headers) !== null
+	) {
+		return apiKeyTenantMismatch();
+	}
+	return {
+		ok: false,
+		status: conflict.status,
+		code: conflict.code,
+		error: conflict.error,
+	};
+}
+
 export async function resolveAuthenticatedCaller(
 	input: ResolveAuthenticatedCallerInput,
 ): Promise<AuthenticatedCallerResult> {
@@ -471,12 +502,7 @@ export async function resolveAuthenticatedCaller(
 	const requireRole = input.requireRole ?? true;
 	const tenantAssertion = resolveTenantAssertion(input.headers);
 	if (tenantAssertion.ok === false) {
-		return {
-			ok: false,
-			status: tenantAssertion.status,
-			code: tenantAssertion.code,
-			error: tenantAssertion.error,
-		};
+		return tenantConflictRefusal(input, tenantAssertion);
 	}
 
 	const assertedCompanyId = tenantAssertion.assertion.companyId;

@@ -22,6 +22,29 @@ vi.mock("../../auth/handlers/company-membership", async (importOriginal) => {
 	return { ...actual, listUserCompanyMemberships: vi.fn() };
 });
 
+// The Postgres advisory lock needs a database; here it only records the
+// (user, company) pair and runs the guarded work. The real lock is covered by
+// `integration/ledger-keys.integration.test.ts` (RUN_DB_TESTS=1).
+const lockCalls: Array<{ userId: string; companyId: string }> = [];
+let lockBusy = false;
+vi.mock("../ledger-keys-issue-lock", async (importOriginal) => {
+	const actual =
+		await importOriginal<typeof import("../ledger-keys-issue-lock")>();
+	return {
+		...actual,
+		withLedgerKeyIssueLock: vi.fn(
+			async <T>(
+				lock: { userId: string; companyId: string },
+				work: () => Promise<T>,
+			): Promise<T> => {
+				lockCalls.push({ userId: lock.userId, companyId: lock.companyId });
+				if (lockBusy) throw new actual.LedgerKeyIssueLockTimeoutError();
+				return work();
+			},
+		),
+	};
+});
+
 const { auth } = await import("../../auth/auth.config");
 const { listUserCompanyMemberships } = await import(
 	"../../auth/handlers/company-membership"
@@ -143,6 +166,16 @@ describe("ledger key management routes", () => {
 		delete process.env.SECURITY_ENFORCE_TEST_SESSION;
 		store = [];
 		sessionUserId = OWNER;
+		lockCalls.length = 0;
+		lockBusy = false;
+		for (const name of [
+			"CORS_ALLOWED_ORIGINS",
+			"ALLOWED_ORIGINS",
+			"FRONTEND_URL",
+			"LANDING_URL",
+		]) {
+			delete process.env[name];
+		}
 
 		getSessionSpy = vi.fn(async (input: unknown) => {
 			const cookie = sessionHeadersOf(input)?.get("cookie") ?? "";
@@ -451,6 +484,39 @@ describe("ledger key management routes", () => {
 			expect(store).toHaveLength(10);
 		});
 
+		it("counts and creates under the (user, company) issue lock, after the membership check", async () => {
+			const res = await app.handle(
+				request("/api/ledger-keys", { method: "POST", body: validBody() }),
+			);
+			expect(res.status).toBe(201);
+			expect(lockCalls).toEqual([{ userId: OWNER, companyId: COMPANY_A }]);
+
+			lockCalls.length = 0;
+			const refused = await app.handle(
+				request("/api/ledger-keys", {
+					method: "POST",
+					body: { companyId: COMPANY_B, name: "other company" },
+				}),
+			);
+			expect(refused.status).toBe(403);
+			expect(lockCalls).toEqual([]);
+		});
+
+		it("answers 409 LEDGER_KEY_ISSUE_BUSY when the issue lock cannot be taken in time", async () => {
+			lockBusy = true;
+			const res = await app.handle(
+				request("/api/ledger-keys", { method: "POST", body: validBody() }),
+			);
+			expect(res.status).toBe(409);
+			expect(await readJson(res)).toEqual({
+				success: false,
+				error: "Another ledger key is being issued for this company; retry",
+				code: "LEDGER_KEY_ISSUE_BUSY",
+			});
+			expect(createSpy).not.toHaveBeenCalled();
+			expect(store).toEqual([]);
+		});
+
 		it("does not count expired, disabled, other-company or other-user keys toward the cap", async () => {
 			store = [
 				...Array.from({ length: 9 }, () => fakeKey()),
@@ -536,6 +602,209 @@ describe("ledger key management routes", () => {
 				"COMPANY_MEMBERSHIP_REQUIRED",
 			);
 			expect(listSpy).not.toHaveBeenCalled();
+		});
+	});
+
+	describe("browser request rules: content type and origin", () => {
+		const form = (headers: Record<string, string> = {}) =>
+			new Request("http://localhost/api/ledger-keys", {
+				method: "POST",
+				headers: {
+					cookie: SESSION_COOKIE,
+					"content-type": "application/x-www-form-urlencoded",
+					...headers,
+				},
+				body: new URLSearchParams({
+					companyId: COMPANY_A,
+					name: "csrf",
+				}).toString(),
+			});
+
+		it("refuses a form-urlencoded or non-JSON issue with 415 and issues nothing", async () => {
+			const requests = [
+				form(),
+				new Request("http://localhost/api/ledger-keys", {
+					method: "POST",
+					headers: { cookie: SESSION_COOKIE, "content-type": "text/plain" },
+					body: JSON.stringify(validBody()),
+				}),
+				new Request("http://localhost/api/ledger-keys", {
+					method: "POST",
+					headers: { cookie: SESSION_COOKIE },
+				}),
+				new Request("http://localhost/api/ledger-keys", {
+					method: "POST",
+					headers: { cookie: SESSION_COOKIE },
+					body: (() => {
+						const data = new FormData();
+						data.set("companyId", COMPANY_A);
+						data.set("name", "csrf");
+						return data;
+					})(),
+				}),
+			];
+			for (const req of requests) {
+				const contentType = req.headers.get("content-type");
+				const res = await app.handle(req);
+				expect(res.status, String(contentType)).toBe(415);
+				expect(res.headers.get("cache-control")).toBe("no-store");
+				expect(await readJson(res)).toEqual({
+					success: false,
+					error: "Content-Type must be application/json",
+					code: "UNSUPPORTED_MEDIA_TYPE",
+				});
+			}
+			expect(createSpy).not.toHaveBeenCalled();
+			expect(listSpy).not.toHaveBeenCalled();
+			expect(store).toEqual([]);
+		});
+
+		it("accepts application/json with parameters", async () => {
+			const res = await app.handle(
+				new Request("http://localhost/api/ledger-keys", {
+					method: "POST",
+					headers: {
+						cookie: SESSION_COOKIE,
+						"content-type": "application/json; charset=utf-8",
+					},
+					body: JSON.stringify(validBody()),
+				}),
+			);
+			expect(res.status).toBe(201);
+		});
+
+		it("refuses issue and revoke from an origin outside the CORS allowlist (403), in test and production", async () => {
+			const own = fakeKey();
+			for (const nodeEnv of ["test", "production"]) {
+				process.env.NODE_ENV = nodeEnv;
+				process.env.CORS_ALLOWED_ORIGINS = "https://app.drenyra.test";
+				store = [own];
+				for (const origin of [
+					"https://evil.example",
+					"null",
+					"https://app.drenyra.test.evil.example",
+					"http://app.drenyra.test",
+				]) {
+					const issue = await app.handle(
+						request("/api/ledger-keys", {
+							method: "POST",
+							body: validBody(),
+							headers: { origin },
+						}),
+					);
+					const revoke = await app.handle(
+						request(`/api/ledger-keys/${own.id}`, {
+							method: "DELETE",
+							headers: { origin },
+						}),
+					);
+					for (const res of [issue, revoke]) {
+						expect(res.status, `${nodeEnv} ${origin}`).toBe(403);
+						expect(await readJson(res)).toEqual({
+							success: false,
+							error: "Origin is not allowed",
+							code: "ORIGIN_NOT_ALLOWED",
+						});
+					}
+				}
+				expect(store).toEqual([own]);
+			}
+			expect(createSpy).not.toHaveBeenCalled();
+			expect(deleteSpy).not.toHaveBeenCalled();
+		});
+
+		it("refuses a foreign-origin form post (the CSRF shape) before anything is issued", async () => {
+			const res = await app.handle(form({ origin: "https://evil.example" }));
+			expect(res.status).toBe(403);
+			expect((await readJson(res)).code).toBe("ORIGIN_NOT_ALLOWED");
+			expect(createSpy).not.toHaveBeenCalled();
+		});
+
+		it("lets the web app's normal requests through (allowlisted origin, JSON)", async () => {
+			process.env.CORS_ALLOWED_ORIGINS =
+				"https://app.drenyra.test/, https://landing.drenyra.test";
+			const origin = "https://app.drenyra.test";
+			const issue = await app.handle(
+				request("/api/ledger-keys", {
+					method: "POST",
+					body: validBody(),
+					headers: { origin },
+				}),
+			);
+			expect(issue.status).toBe(201);
+			const { id } = (await readJson(issue)).data as { id: string };
+			const list = await app.handle(
+				request(`/api/ledger-keys?companyId=${COMPANY_A}`, {
+					headers: { origin },
+				}),
+			);
+			expect(list.status).toBe(200);
+			const revoke = await app.handle(
+				request(`/api/ledger-keys/${id}`, {
+					method: "DELETE",
+					headers: { origin },
+				}),
+			);
+			expect(revoke.status).toBe(200);
+			expect(store).toEqual([]);
+		});
+
+		it("accepts the local dev origin outside production when no allowlist is configured", async () => {
+			const res = await app.handle(
+				request("/api/ledger-keys", {
+					method: "POST",
+					body: validBody(),
+					headers: { origin: "http://localhost:5173" },
+				}),
+			);
+			expect(res.status).toBe(201);
+		});
+
+		it("accepts requests without an Origin header (CLI, server-to-server)", async () => {
+			process.env.NODE_ENV = "production";
+			const own = fakeKey();
+			store = [own];
+			const issue = await app.handle(
+				request("/api/ledger-keys", { method: "POST", body: validBody() }),
+			);
+			const revoke = await app.handle(
+				request(`/api/ledger-keys/${own.id}`, { method: "DELETE" }),
+			);
+			expect(issue.status).toBe(201);
+			expect(revoke.status).toBe(200);
+		});
+
+		it("does not apply the origin rule to listing", async () => {
+			process.env.CORS_ALLOWED_ORIGINS = "https://app.drenyra.test";
+			const res = await app.handle(
+				request(`/api/ledger-keys?companyId=${COMPANY_A}`, {
+					headers: { origin: "https://evil.example" },
+				}),
+			);
+			expect(res.status).toBe(200);
+		});
+	});
+
+	describe("caching", () => {
+		it("marks issue and list responses Cache-Control: no-store", async () => {
+			const issue = await app.handle(
+				request("/api/ledger-keys", { method: "POST", body: validBody() }),
+			);
+			const list = await app.handle(
+				request(`/api/ledger-keys?companyId=${COMPANY_A}`),
+			);
+			const refusedIssue = await app.handle(
+				request("/api/ledger-keys", {
+					method: "POST",
+					body: { companyId: COMPANY_B, name: "x" },
+				}),
+			);
+			expect(issue.status).toBe(201);
+			expect(list.status).toBe(200);
+			expect(refusedIssue.status).toBe(403);
+			for (const res of [issue, list, refusedIssue]) {
+				expect(res.headers.get("cache-control")).toBe("no-store");
+			}
 		});
 	});
 

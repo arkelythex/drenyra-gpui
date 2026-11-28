@@ -5,6 +5,7 @@ import type { HeaderContainer } from "../auth/handlers/session-identity";
 import {
 	READ_ONLY_LEDGER_KEY_ACTION,
 	READ_ONLY_LEDGER_KEY_PREFIX,
+	READ_ONLY_LEDGER_KEY_RATE_LIMIT,
 	READ_ONLY_LEDGER_KEY_RESOURCE,
 	readOnlyLedgerKeyPermissions,
 } from "../auth/lib/read-only-ledger-key";
@@ -55,6 +56,11 @@ export type ReadOnlyLedgerKeyRefusal = {
 	status: 401 | 403;
 	code: string;
 	error: string;
+	/**
+	 * Seconds until the key may retry; present only on
+	 * `API_KEY_RATE_LIMITED` and sent as the `Retry-After` header.
+	 */
+	retryAfterSeconds?: number;
 };
 
 export type ReadOnlyLedgerKeyResult =
@@ -107,6 +113,22 @@ const INVALID_KEY = refuse(
 	"API key is invalid, expired or revoked",
 );
 
+/**
+ * Whole seconds (at least 1) until a rate-limited key may retry: the plugin's
+ * `details.tryAgainIn` (milliseconds) when present, else the key's window.
+ */
+function retryAfterSecondsOf(details: unknown): number {
+	const tryAgainIn =
+		details && typeof details === "object"
+			? (details as { tryAgainIn?: unknown }).tryAgainIn
+			: undefined;
+	const milliseconds =
+		typeof tryAgainIn === "number" && Number.isFinite(tryAgainIn)
+			? tryAgainIn
+			: READ_ONLY_LEDGER_KEY_RATE_LIMIT.timeWindowMs;
+	return Math.max(1, Math.ceil(milliseconds / 1000));
+}
+
 function readCompanyId(metadata: unknown): string | null {
 	if (!metadata || typeof metadata !== "object") return null;
 	const companyId = (metadata as { companyId?: unknown }).companyId;
@@ -156,11 +178,16 @@ export async function verifyReadOnlyLedgerKey(input: {
 		if (!verification.valid || !verification.key) {
 			const pluginCode = verification.error?.code ?? "";
 			if (RATE_LIMIT_PLUGIN_CODES.has(pluginCode)) {
-				return refuse(
-					403,
-					READ_ONLY_LEDGER_KEY_RATE_LIMITED,
-					"API key rate limit exceeded; retry later",
-				);
+				return {
+					...refuse(
+						403,
+						READ_ONLY_LEDGER_KEY_RATE_LIMITED,
+						"API key rate limit exceeded; retry later",
+					),
+					retryAfterSeconds: retryAfterSecondsOf(
+						(verification.error as { details?: unknown } | null)?.details,
+					),
+				};
 			}
 			return INVALID_KEY;
 		}

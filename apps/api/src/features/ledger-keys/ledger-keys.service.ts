@@ -6,6 +6,10 @@ import {
 	READ_ONLY_LEDGER_KEY_PREFIX,
 	readOnlyLedgerKeyPermissions,
 } from "../auth/lib/read-only-ledger-key";
+import {
+	LedgerKeyIssueLockTimeoutError,
+	withLedgerKeyIssueLock,
+} from "./ledger-keys-issue-lock";
 
 /**
  * Ledger key management — issue, list and revoke the caller's own read-only
@@ -22,8 +26,8 @@ import {
  * The plaintext key exists only in the issue response. Logs carry ids, never
  * the key or its hash.
  *
- * Known limit: the 10-key cap is checked before creating, so two concurrent
- * issue requests can end one key above the cap.
+ * The 10-key cap holds under concurrency: counting and creating run under a
+ * per (user, company) Postgres advisory lock (`ledger-keys-issue-lock.ts`).
  *
  * @module ledger-keys/service
  */
@@ -76,6 +80,13 @@ const LIMIT_REACHED: LedgerKeyFailure = {
 	status: 409,
 	code: "LEDGER_KEY_LIMIT_REACHED",
 	error: `At most ${LEDGER_KEYS_MAX_ACTIVE_PER_COMPANY} active ledger keys per company; revoke one first`,
+};
+
+const ISSUE_BUSY: LedgerKeyFailure = {
+	ok: false,
+	status: 409,
+	code: "LEDGER_KEY_ISSUE_BUSY",
+	error: "Another ledger key is being issued for this company; retry",
 };
 
 const NOT_FOUND: LedgerKeyFailure = {
@@ -191,7 +202,9 @@ function toSummary(
  * Issues a read-only ledger key for `companyId`, owned by `userId`.
  *
  * Refuses (403) when the user is not an active member of the company and
- * (409) when the user already holds the maximum of active keys there.
+ * (409) when the user already holds the maximum of active keys there, or when
+ * another issue for the same user and company holds the lock past its
+ * timeout.
  */
 export async function issueLedgerKey(input: {
 	userId: string;
@@ -204,6 +217,25 @@ export async function issueLedgerKey(input: {
 		return MEMBERSHIP_REQUIRED;
 	}
 
+	try {
+		return await withLedgerKeyIssueLock(
+			{ userId: input.userId, companyId: input.companyId },
+			() => countAndCreate(input),
+		);
+	} catch (error) {
+		if (error instanceof LedgerKeyIssueLockTimeoutError) return ISSUE_BUSY;
+		throw error;
+	}
+}
+
+/** Cap check and creation; callers must hold the issue lock. */
+async function countAndCreate(input: {
+	userId: string;
+	companyId: string;
+	name: string;
+	expiresInDays: number;
+	sessionHeaders: Headers;
+}): Promise<{ ok: true; key: IssuedLedgerKey } | LedgerKeyFailure> {
 	const now = Date.now();
 	const activeForCompany = (
 		await listOwnLedgerKeyRecords(input.sessionHeaders)

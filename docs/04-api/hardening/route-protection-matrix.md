@@ -101,13 +101,17 @@ Send the key as `Authorization: Bearer drn_ro_…` or `x-api-key: drn_ro_…`.
    the key is even looked up.
 3. The key must verify with `ledger:read` (exists, enabled, not expired, under
    its rate limit) — otherwise `401 API_KEY_INVALID`, or `429
-   API_KEY_RATE_LIMITED`.
+   API_KEY_RATE_LIMITED` with `Retry-After` (seconds until the key's window
+   allows another request).
 4. The key must carry `ledger:read` (`403 API_KEY_FORBIDDEN`) and a company
    (`403 API_KEY_NOT_COMPANY_BOUND`).
 5. Its owner must still be an active member of that company at request time
    — otherwise `403 API_KEY_MEMBERSHIP_INACTIVE`.
 6. `x-company-id`, `x-active-company-id` or a requested company that differs
-   from the key's company — `403 API_KEY_TENANT_MISMATCH`.
+   from the key's company — `403 API_KEY_TENANT_MISMATCH`. When
+   `x-company-id` and `x-active-company-id` disagree with each other and a
+   key is sent, the answer is the same `403 API_KEY_TENANT_MISMATCH`, decided
+   before the key is looked up (never `401`/`500`).
 
 The key decides identity and tenant on its own: `x-user-id`, `x-user-role` and
 the other identity headers are ignored, and a refused key never falls back to
@@ -116,17 +120,45 @@ company context. Production and non-production behave the same.
 
 ### Key properties
 
-| Property       | Value                                                                 |
-| -------------- | --------------------------------------------------------------------- |
-| Prefix         | `drn_ro_`                                                             |
-| Storage        | SHA-256 hash only (`auth_api_keys.key`)                               |
-| Sessions       | Never: `enableSessionForAPIKeys: false`                               |
-| Default expiry | 90 days; at most 365 days                                             |
-| Rate limit     | 120 verifications per minute per key                                  |
-| Issuance       | `POST /api/ledger-keys`, session only; plugin HTTP endpoints disabled |
-| Shown once     | The plaintext key is in the issue response only                       |
-| Visible part   | `start`: `drn_ro_` plus 4 characters                                  |
-| Per company    | At most 10 active keys per user                                       |
+| Property       | Value                                                                                        |
+| -------------- | -------------------------------------------------------------------------------------------- |
+| Prefix         | `drn_ro_`                                                                                    |
+| Storage        | SHA-256 hash only (`auth_api_keys.key`)                                                      |
+| Sessions       | Never: `enableSessionForAPIKeys: false`                                                      |
+| Default expiry | 90 days; at most 365 days                                                                    |
+| Rate limit     | 60 verifications per minute per key (`429`, `Retry-After`)                                   |
+| Issuance       | `POST /api/ledger-keys`, session only; plugin HTTP endpoints disabled                        |
+| Shown once     | The plaintext key is in the issue response only                                              |
+| Visible part   | `start`: `drn_ro_` plus 4 characters                                                         |
+| Per company    | At most 10 active keys per user, enforced under a per (user, company) Postgres advisory lock |
+
+### Rate limits
+
+Two limits apply to a request with a key; both answer `429` with the standard
+envelope (`{ "success": false, "error", "code" }`) and a `Retry-After` header
+in seconds:
+
+| Limit            | Scope                                              | Code                   |
+| ---------------- | -------------------------------------------------- | ---------------------- |
+| Per key          | 60 verifications per minute per key                | `API_KEY_RATE_LIMITED` |
+| Global (all API) | 100 requests per minute per client (`app-core.ts`) | `RATE_LIMITED`         |
+
+The per-key limit is lower, so it is the one a key holder meets. The global
+limiter counts per client (the `Authorization` value, else
+`x-forwarded-for`) on every route that reaches a handler.
+
+### Key management rules (`/api/ledger-keys`)
+
+Session only, as above. In addition, for the cookie-authenticated writes:
+
+- `POST /api/ledger-keys` needs `Content-Type: application/json`, otherwise
+  `415 UNSUPPORTED_MEDIA_TYPE`.
+- `POST /api/ledger-keys` and `DELETE /api/ledger-keys/:id` with an `Origin`
+  header outside the API's CORS allowlist (`apps/api/src/config/cors.ts`) get
+  `403 ORIGIN_NOT_ALLOWED`. Requests without `Origin` are not affected.
+- Issue and list responses carry `Cache-Control: no-store`.
+- Concurrent issues for one user and company run one at a time; a wait over
+  5 seconds answers `409 LEDGER_KEY_ISSUE_BUSY`.
 
 Configuration lives in
 [`apps/api/src/features/auth/lib/read-only-ledger-key.ts`](../../../apps/api/src/features/auth/lib/read-only-ledger-key.ts);

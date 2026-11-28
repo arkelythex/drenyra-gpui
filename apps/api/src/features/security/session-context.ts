@@ -70,6 +70,8 @@ export type SessionContextResult =
 			status: 401 | 403;
 			code: string;
 			error: string;
+			/** Seconds for `Retry-After`; only on a rate-limited key. */
+			retryAfterSeconds?: number;
 	  };
 
 interface ResolveSessionContextInput {
@@ -157,6 +159,9 @@ export async function resolveSessionContext(
 			status: caller.status,
 			code: caller.code,
 			error: caller.error,
+			...(caller.retryAfterSeconds === undefined
+				? {}
+				: { retryAfterSeconds: caller.retryAfterSeconds }),
 		};
 	}
 

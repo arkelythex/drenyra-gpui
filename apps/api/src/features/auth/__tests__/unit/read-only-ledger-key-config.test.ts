@@ -75,7 +75,7 @@ describe("read-only ledger key configuration", () => {
 				minExpiresIn: 1,
 				maxExpiresIn: 365,
 			},
-			rateLimit: { enabled: true, timeWindow: 60_000, maxRequests: 120 },
+			rateLimit: { enabled: true, timeWindow: 60_000, maxRequests: 60 },
 		});
 		expect(readOnlyLedgerKeyPermissions()).toEqual({ ledger: ["read"] });
 	});
@@ -98,7 +98,7 @@ describe("read-only ledger key configuration", () => {
 			expect(created.key.startsWith(READ_ONLY_LEDGER_KEY_PREFIX)).toBe(true);
 			expect(created.referenceId).toBe(userId);
 			expect(created.rateLimitEnabled).toBe(true);
-			expect(created.rateLimitMax).toBe(120);
+			expect(created.rateLimitMax).toBe(60);
 			expect(created.rateLimitTimeWindow).toBe(60_000);
 			const expiresAt = new Date(created.expiresAt ?? 0).getTime();
 			const expected =

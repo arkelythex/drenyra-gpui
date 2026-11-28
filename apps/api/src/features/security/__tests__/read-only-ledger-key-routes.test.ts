@@ -273,6 +273,53 @@ describe("read-only ledger key routes", () => {
 			expect(repo.findById).not.toHaveBeenCalled();
 		});
 
+		it.each([
+			["test", "cmp-a", "cmp-b"],
+			["test", "cmp-b", "cmp-a"],
+			["test", "cmp-b", "cmp-c"],
+			["production", "cmp-a", "cmp-b"],
+			["production", "cmp-b", "cmp-a"],
+		])(
+			"refuses conflicting x-company-id / x-active-company-id with a key (%s, %s vs %s) with 403 API_KEY_TENANT_MISMATCH",
+			async (env, companyHeader, activeCompanyHeader) => {
+				process.env.NODE_ENV = env;
+				for (const path of [
+					...LEDGER_GETS,
+					"/api/journal-entries",
+					`/api/journal-entries/${ENTRY_ID}`,
+				]) {
+					const res = await app.handle(
+						keyRequest(path, "GET", {
+							"x-company-id": companyHeader,
+							"x-active-company-id": activeCompanyHeader,
+						}),
+					);
+					expect(res.status, path).toBe(403);
+					expect(await res.json()).toEqual({
+						success: false,
+						error: "API key company does not match the requested company",
+						code: "API_KEY_TENANT_MISMATCH",
+					});
+				}
+				expect(getChartOfAccounts).not.toHaveBeenCalled();
+				expect(getGeneralLedger).not.toHaveBeenCalled();
+				expect(getTrialBalance).not.toHaveBeenCalled();
+				expect(executeSpy).not.toHaveBeenCalled();
+				expect(repo.findById).not.toHaveBeenCalled();
+			},
+		);
+
+		it("keeps matching x-company-id and x-active-company-id working with a key", async () => {
+			const res = await app.handle(
+				keyRequest("/api/ledger/accounts", "GET", {
+					"x-company-id": "cmp-a",
+					"x-active-company-id": "cmp-a",
+				}),
+			);
+			expect(res.status).toBe(200);
+			expect(getChartOfAccounts).toHaveBeenCalledWith("cmp-a");
+		});
+
 		it("ignores ?companyId for another company and keeps the key company", async () => {
 			const res = await app.handle(
 				keyRequest("/api/ledger/accounts?companyId=cmp-b"),
@@ -333,19 +380,48 @@ describe("read-only ledger key routes", () => {
 			expect(repo.findById).not.toHaveBeenCalled();
 		});
 
-		it("answers a rate-limited key with 429 and no data", async () => {
+		it("answers a rate-limited key with 429, Retry-After and no data", async () => {
 			verifySpy.mockResolvedValue({
 				valid: false,
-				error: { message: "Rate limit exceeded.", code: "RATE_LIMITED" },
+				error: {
+					message: "Rate limit exceeded.",
+					code: "RATE_LIMITED",
+					details: { tryAgainIn: 12_345 },
+				},
 				key: null,
 			});
 			const res = await app.handle(keyRequest("/api/ledger/accounts"));
 			expect(res.status).toBe(429);
-			expect(await res.json()).toMatchObject({
+			expect(res.headers.get("retry-after")).toBe("13");
+			expect(await res.json()).toEqual({
 				success: false,
+				error: "API key rate limit exceeded; retry later",
 				code: "API_KEY_RATE_LIMITED",
 			});
 			expect(getChartOfAccounts).not.toHaveBeenCalled();
+		});
+
+		it("falls back to the key's rate-limit window for Retry-After", async () => {
+			for (const error of [
+				{ message: "Rate limit exceeded.", code: "RATE_LIMITED" },
+				{ message: "Usage exceeded.", code: "USAGE_EXCEEDED" },
+			]) {
+				verifySpy.mockResolvedValueOnce({ valid: false, error, key: null });
+				const res = await app.handle(keyRequest("/api/ledger/accounts"));
+				expect(res.status, error.code).toBe(429);
+				expect(res.headers.get("retry-after"), error.code).toBe("60");
+			}
+		});
+
+		it("sends no Retry-After on other key refusals", async () => {
+			verifySpy.mockResolvedValue({
+				valid: false,
+				error: { message: "nope", code: "KEY_NOT_FOUND" },
+				key: null,
+			});
+			const res = await app.handle(keyRequest("/api/ledger/accounts"));
+			expect(res.status).toBe(401);
+			expect(res.headers.get("retry-after")).toBeNull();
 		});
 
 		it("refuses a key whose owner lost membership with 403 and no data", async () => {

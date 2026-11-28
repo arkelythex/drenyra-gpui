@@ -228,6 +228,36 @@ describe("read-only ledger key caller", () => {
 				status: 403,
 				code: "API_KEY_RATE_LIMITED",
 				error: "API key rate limit exceeded; retry later",
+				retryAfterSeconds: 60,
+			});
+		}
+	});
+
+	it("carries the plugin's tryAgainIn as whole seconds (at least 1)", async () => {
+		for (const [tryAgainIn, expected] of [
+			[12_345, 13],
+			[1, 1],
+			[0, 1],
+		] as const) {
+			verifySpy.mockResolvedValueOnce({
+				valid: false,
+				error: {
+					message: "slow down",
+					code: "RATE_LIMITED",
+					details: { tryAgainIn },
+				},
+				key: null,
+			});
+			const result = await resolveAuthenticatedCaller({
+				headers: bearer(),
+				allowReadOnlyLedgerKey: true,
+				method: "GET",
+			});
+
+			expect(result).toMatchObject({
+				ok: false,
+				code: "API_KEY_RATE_LIMITED",
+				retryAfterSeconds: expected,
 			});
 		}
 	});

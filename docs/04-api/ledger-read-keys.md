@@ -21,6 +21,14 @@ Reference (auth decision order, error codes, accepted routes):
 You need a Better Auth session (sign in on the web app) and active membership
 of the company. A key cannot issue keys.
 
+The request must be JSON (`content-type: application/json`, otherwise `415
+UNSUPPORTED_MEDIA_TYPE`). If it carries an `Origin` header (every browser
+request does), that origin must be in the API's CORS allowlist
+(`CORS_ALLOWED_ORIGINS`, see `apps/api/src/config/cors.ts`), otherwise `403
+ORIGIN_NOT_ALLOWED`. Together they stop a foreign site from issuing a key with
+your cookie through a plain form post. `curl` and other non-browser clients
+send no `Origin` and are not affected.
+
 ```bash
 curl -sS -X POST "$DRENYRA_API/api/ledger-keys" \
   -H "content-type: application/json" \
@@ -56,6 +64,9 @@ Response (`201`), the only time `key` is returned:
 }
 ```
 
+The response carries `Cache-Control: no-store`, so no browser or proxy cache
+keeps the key.
+
 In production the session cookie is named
 `__Secure-better-auth.session_token`.
 
@@ -69,9 +80,14 @@ curl -sS "$DRENYRA_API/api/ledger/trial-balance?asOfDate=2026-03-31" \
 ```
 
 The key alone decides the company. Do not send identity headers; if you send
-`x-company-id`, it must be the key's company or the request is refused with
-`403 API_KEY_TENANT_MISMATCH`. Writes are refused with `403
+`x-company-id` or `x-active-company-id`, each must be the key's company or the
+request is refused with `403 API_KEY_TENANT_MISMATCH` (also when the two
+headers disagree with each other). Writes are refused with `403
 API_KEY_READ_ONLY`.
+
+A key may make 60 requests per minute. Past that, requests get `429
+API_KEY_RATE_LIMITED` with a `Retry-After` header (seconds); wait that long
+before retrying.
 
 Routes that accept a key: `GET /api/ledger/accounts`,
 `GET /api/ledger/general`, `GET /api/ledger/trial-balance`,
@@ -86,7 +102,8 @@ curl -sS "$DRENYRA_API/api/ledger-keys?companyId=<company uuid>" \
 
 Returns only **your** keys for that company, without secrets: `id`, `name`,
 `start`, `companyId`, `createdAt`, `expiresAt`, `lastRequest`, `enabled`.
-Use `start` and `name` to recognise a key.
+Use `start` and `name` to recognise a key. The response carries
+`Cache-Control: no-store`.
 
 ## 4. Revoke a key
 
@@ -96,6 +113,7 @@ curl -sS -X DELETE "$DRENYRA_API/api/ledger-keys/<key id>" \
 ```
 
 `200 { "success": true, "data": { "id": "<key id>", "revoked": true } }`.
+The `Origin` rule of issuance applies here too (`403 ORIGIN_NOT_ALLOWED`).
 The key stops working on the next request (`401 API_KEY_INVALID`). Someone
 else's key and an unknown id both answer `404 LEDGER_KEY_NOT_FOUND`. You can
 revoke your keys even after you leave the company.
@@ -113,32 +131,52 @@ To rotate: issue a new key, switch the client to it, revoke the old one.
 - **Session-only management.** `/api/ledger-keys` refuses any API key
   (`403 API_KEY_NOT_ALLOWED`) and never accepts header identity, in any
   environment.
+- **No cross-site issuance or revocation.** Issue needs JSON and both issue
+  and revoke need an allowlisted `Origin` when one is sent.
+- **Never cached.** Issue and list responses are `Cache-Control: no-store`.
 - **No secrets in logs.** Issuance and revocation are logged with user,
   company and key ids only.
 
 ## Limits
 
-| Limit                    | Value                                     |
-| ------------------------ | ----------------------------------------- |
-| Active keys              | 10 per user per company (`409` beyond)    |
-| Lifetime                 | 1–365 days, default 90                    |
-| Rate limit               | 120 requests per minute per key (`429`)   |
-| Name                     | 1–64 visible characters                   |
+| Limit        | Value                                                                             |
+| ------------ | --------------------------------------------------------------------------------- |
+| Active keys  | 10 per user per company (`409` beyond)                                            |
+| Lifetime     | 1–365 days, default 90                                                            |
+| Per-key rate | 60 requests per minute per key (`429 API_KEY_RATE_LIMITED`, `Retry-After`)        |
+| Global rate  | 100 requests per minute per client, whole API (`429 RATE_LIMITED`, `Retry-After`) |
+| Name         | 1–64 visible characters                                                           |
 
-The 10-key cap is checked before issuing, so two simultaneous issue requests
-can end one key above it.
+The per-key limit is the lower one, so a key holder normally meets it first.
+The global limit counts per client (the `Authorization` value, else the
+forwarded client address) and applies to every route.
+
+The 10-key cap holds under concurrency: counting and issuing run under a
+Postgres advisory lock per user and company, so simultaneous issue requests
+are served one at a time. If the lock is still taken after 5 seconds, the
+request gets `409 LEDGER_KEY_ISSUE_BUSY` and nothing is issued; retry.
 
 ## Errors
 
-| Status | Code                          | Meaning                                         |
-| ------ | ----------------------------- | ----------------------------------------------- |
-| 400    | `VALIDATION_ERROR`            | Body or query does not match the rules above    |
-| 401    | `SESSION_REQUIRED`            | No signed-in session                            |
-| 403    | `API_KEY_NOT_ALLOWED`         | An API key was sent to a management route       |
-| 403    | `COMPANY_MEMBERSHIP_REQUIRED` | You are not an active member of that company    |
-| 404    | `LEDGER_KEY_NOT_FOUND`        | Not your key, or no such key                    |
-| 409    | `LEDGER_KEY_LIMIT_REACHED`    | Already 10 active keys for that company         |
-| 500    | `LEDGER_KEY_ERROR`            | Unexpected failure; nothing secret is returned  |
+Managing keys (`/api/ledger-keys`):
+
+| Status | Code                          | Meaning                                                 |
+| ------ | ----------------------------- | ------------------------------------------------------- |
+| 400    | `VALIDATION_ERROR`            | Body or query does not match the rules above            |
+| 401    | `SESSION_REQUIRED`            | No signed-in session                                    |
+| 403    | `API_KEY_NOT_ALLOWED`         | An API key was sent to a management route               |
+| 403    | `ORIGIN_NOT_ALLOWED`          | Issue or revoke from an origin outside the allowlist    |
+| 403    | `COMPANY_MEMBERSHIP_REQUIRED` | You are not an active member of that company            |
+| 404    | `LEDGER_KEY_NOT_FOUND`        | Not your key, or no such key                            |
+| 409    | `LEDGER_KEY_LIMIT_REACHED`    | Already 10 active keys for that company                 |
+| 409    | `LEDGER_KEY_ISSUE_BUSY`       | Another issue for you and that company is still running |
+| 415    | `UNSUPPORTED_MEDIA_TYPE`      | Issue request is not `application/json`                 |
+| 429    | `RATE_LIMITED`                | Global limit; see `Retry-After`                         |
+| 500    | `LEDGER_KEY_ERROR`            | Unexpected failure; nothing secret is returned          |
+
+Using a key: the `API_KEY_*` codes in the
+[route protection matrix](hardening/route-protection-matrix.md#how-a-request-with-a-key-is-decided),
+including `429 API_KEY_RATE_LIMITED` with `Retry-After`.
 
 Code:
 [`apps/api/src/features/ledger-keys/`](../../apps/api/src/features/ledger-keys/)

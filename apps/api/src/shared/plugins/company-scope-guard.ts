@@ -33,7 +33,8 @@
  * Modules that serve ledger reads opt in with `allowReadOnlyLedgerKey: true`.
  * A `drn_ro_…` key is then accepted on GET/HEAD for its own company only,
  * and `companyContext.readOnly` is `true`. A refused key always fails closed
- * (401/403, or 429 when rate limited), even with `allowHeaderFallback`.
+ * (401/403, or 429 with `Retry-After` when rate limited), even with
+ * `allowHeaderFallback`.
  *
  * @module company-scope-guard
  */
@@ -96,6 +97,16 @@ export interface CompanyScopeGuardOptions {
 	allowReadOnlyLedgerKey?: boolean;
 }
 
+/** Sends `Retry-After` when the refusal carries one (rate-limited key). */
+function applyRetryAfter(
+	headers: Record<string, string | number>,
+	result: { retryAfterSeconds?: number },
+): void {
+	if (result.retryAfterSeconds !== undefined) {
+		headers["retry-after"] = String(result.retryAfterSeconds);
+	}
+}
+
 function refusalStatus(result: { status: 401 | 403; code: string }) {
 	return result.code === READ_ONLY_LEDGER_KEY_RATE_LIMITED
 		? (429 as const)
@@ -151,7 +162,7 @@ export function companyScopeGuard(options: CompanyScopeGuardOptions = {}) {
 		options;
 
 	return (app: Elysia) =>
-		app.derive(async ({ headers, request, status }) => {
+		app.derive(async ({ headers, request, set, status }) => {
 			/**
 			 * During Phase 3 migration (allowHeaderFallback: true), do not
 			 * require a full session — the guard will first attempt session
@@ -189,6 +200,10 @@ export function companyScopeGuard(options: CompanyScopeGuardOptions = {}) {
 						return { companyContext: undefined as unknown as CompanyContext };
 					}
 
+					applyRetryAfter(
+						set.headers as Record<string, string | number>,
+						result,
+					);
 					// Answer with the guard's status here; a thrown error would
 					// reach the app's error handler and become a 500.
 					return status(refusalStatus(result), fail(result.error, result.code));

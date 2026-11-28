@@ -16,7 +16,7 @@ import type { ApiKeyConfigurationOptions } from "@better-auth/api-key";
  *   (`READ_ONLY_LEDGER_KEY_DISABLED_HTTP_PATHS`): over HTTP the plugin lets a
  *   client set `metadata` and `prefix`, so issuance stays server-side, where
  *   permissions and the company binding are decided.
- * - Rate limiting is on for every key.
+ * - Rate limiting is on for every key (60 verifications per minute).
  * - Keys expire after 90 days by default and at most after 365 days.
  * - Every key has a name of at most 64 characters (the management routes
  *   validate it first; the plugin enforces the same bounds).
@@ -49,10 +49,15 @@ export const READ_ONLY_LEDGER_KEY_MAX_NAME_LENGTH = 64;
 export const READ_ONLY_LEDGER_KEY_START_LENGTH =
 	READ_ONLY_LEDGER_KEY_PREFIX.length + 4;
 
-/** Rate limit per key: 120 verifications per minute. */
+/**
+ * Rate limit per key: 60 verifications per minute. Kept below the API's
+ * global limit (100 requests per minute per client, `app-core.ts`) so the
+ * per-key limit is the one a key holder hits; both answer 429 with
+ * `Retry-After`.
+ */
 export const READ_ONLY_LEDGER_KEY_RATE_LIMIT = {
 	timeWindowMs: 60 * 1000,
-	maxRequests: 120,
+	maxRequests: 60,
 } as const;
 
 /**
