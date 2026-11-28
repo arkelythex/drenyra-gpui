@@ -623,11 +623,12 @@ export const API_MODULES_ROUTE_PROTECTION_MATRIX = [
 		envelope: "canonical",
 		rateLimit: "missing",
 		notes:
-			"Read-only ledger (chart of accounts, general ledger, trial balance). Session or header fallback; also a read-only ledger key scoped to its own company. Keys are rate limited by the api-key plugin (120/min); session callers are not. POST /api/ledger/export/* belongs to Ledger MVP and refuses keys.",
+			"Read-only ledger (chart of accounts, general ledger, trial balance). Session or header fallback; also a read-only ledger key scoped to its own company. GET /api/ledger/key-identity answers key callers only (the key company's companyId, ruc, businessName); sessions and header identity get 403 KEY_IDENTITY_REQUIRES_API_KEY. Keys are rate limited by the api-key plugin (60/min); session callers are not. POST /api/ledger/export/* belongs to Ledger MVP and refuses keys.",
 		readOnlyLedgerKeyRoutes: [
 			"GET /api/ledger/accounts",
 			"GET /api/ledger/general",
 			"GET /api/ledger/trial-balance",
+			"GET /api/ledger/key-identity",
 		],
 	},
 ] as const satisfies readonly RouteProtectionMatrixRow[];

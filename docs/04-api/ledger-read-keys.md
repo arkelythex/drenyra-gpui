@@ -105,9 +105,53 @@ API_KEY_INVALID` means the key is invalid, expired or revoked.
 
 Routes that accept a key: `GET /api/ledger/accounts`,
 `GET /api/ledger/general`, `GET /api/ledger/trial-balance`,
+`GET /api/ledger/key-identity` (next section),
 `GET /api/journal-entries/`, `GET /api/journal-entries/:id`.
 
-## 3. List your keys
+## 3. Confirm which company a key belongs to
+
+> **Why this matters (fiscal risk).** A key is bound to a company, but a
+> client knows its workspaces by **RUC**. If a key for company X is pasted
+> under the workspace of company Y, every report would show X's ledger
+> labelled as Y — a wrong trial balance under the wrong taxpayer. Before a
+> client shows any ledger data for a workspace, it must ask the API which
+> company the key belongs to and **refuse to show anything unless the `ruc`
+> equals the workspace's RUC** (with a clear error naming both RUCs). Compare
+> the RUC, not the name: business names are not unique and can change; the
+> RUC is the taxpayer's identity.
+
+```bash
+curl -sS "$DRENYRA_API/api/ledger/key-identity" \
+  -H "authorization: Bearer $DRENYRA_LEDGER_KEY"
+```
+
+Response (`200`), always about the key's own company and with no other
+fields:
+
+```json
+{
+  "success": true,
+  "data": {
+    "companyId": "<company uuid>",
+    "ruc": "20123456789",
+    "businessName": "Empresa Ejemplo S.A.C."
+  }
+}
+```
+
+| Status | Code                            | Meaning                                                              |
+| ------ | ------------------------------- | -------------------------------------------------------------------- |
+| 401    | `COMPANY_CONTEXT_REQUIRED`      | No caller at all (no key, no session)                                |
+| 403    | `KEY_IDENTITY_REQUIRES_API_KEY` | Called with a session or header identity: only keys get an identity  |
+| 403    | `API_KEY_TENANT_MISMATCH`       | `?companyId=` or a tenant header names another company               |
+| 404    | `KEY_COMPANY_NOT_FOUND`         | The key's company no longer exists                                   |
+| 500    | `INTERNAL_ERROR`                | Could not read the company; the cause is logged, not returned        |
+
+Every other `API_KEY_*` answer of section 2 (`401`, `429`, `503`) applies the
+same way, and a session that also sends a key is still a session caller
+(`403`). The call counts against the key's per-minute rate limit.
+
+## 4. List your keys
 
 ```bash
 curl -sS "$DRENYRA_API/api/ledger-keys?companyId=<company uuid>" \
@@ -126,7 +170,7 @@ plugin's answer cannot be trusted to be complete — an unexpected shape, a
 can return — list and issue answer `500 LEDGER_KEY_ERROR` instead of acting on
 a partial list. Revoke is not affected: it never reads the list.
 
-## 4. Revoke a key
+## 5. Revoke a key
 
 ```bash
 curl -sS -X DELETE "$DRENYRA_API/api/ledger-keys/<key id>" \

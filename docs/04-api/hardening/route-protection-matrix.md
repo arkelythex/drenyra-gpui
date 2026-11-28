@@ -85,8 +85,17 @@ never manage keys. How to issue, use and revoke a key:
 | `GET /api/ledger/accounts`         | Ledger          |
 | `GET /api/ledger/general`          | Ledger          |
 | `GET /api/ledger/trial-balance`    | Ledger          |
+| `GET /api/ledger/key-identity`     | Ledger          |
 | `GET /api/journal-entries/`        | Journal Entries |
 | `GET /api/journal-entries/:id`     | Journal Entries |
+
+`GET /api/ledger/key-identity` answers **only** key callers: it returns the
+key's company as `{ companyId, ruc, businessName }`, read from `companies` by
+the key's own company. A session or header-identity caller gets `403
+KEY_IDENTITY_REQUIRES_API_KEY`; a key whose company row no longer exists gets
+`404 KEY_COMPANY_NOT_FOUND`. Native clients call it before showing data and
+compare the RUC with their workspace — see
+[Confirm which company a key belongs to](../ledger-read-keys.md#3-confirm-which-company-a-key-belongs-to).
 
 HEAD is treated like GET. Every other route ignores keys, and every write on
 an opted-in surface refuses them. `POST /api/ledger/export/pdf` and

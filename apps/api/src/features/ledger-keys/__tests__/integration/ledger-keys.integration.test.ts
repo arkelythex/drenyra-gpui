@@ -3,8 +3,9 @@
  * round trip against Postgres.
  *
  * Proves, with no mocks: a key issued through the service is stored hashed;
- * it authenticates a ledger GET as its own company only; another company's
- * `x-company-id` is refused; list never shows the key; once revoked through
+ * it authenticates a ledger GET as its own company only; `key-identity`
+ * answers company A's id, RUC and name; the session gets 403 there; another
+ * company's `x-company-id` is refused; list never shows the key; once revoked through
  * the route, the same key is refused (401). The 10-key cap holds under
  * concurrency (per user and company advisory lock), and issuance waits for, or
  * gives up on (409 LEDGER_KEY_ISSUE_BUSY), a lock held by another transaction.
@@ -64,6 +65,8 @@ type Fixture = {
 	authUserId: string;
 	companyA: string;
 	companyB: string;
+	rucA: string;
+	businessNameA: string;
 	categoryA: string;
 	categoryB: string;
 	sessionId: string;
@@ -106,10 +109,12 @@ async function createFixture(): Promise<Fixture> {
 
 	// Raw SQL on purpose: drizzle inserts every schema column, and the
 	// baseline `companies` table lacks the newer settings_* columns (drift).
+	const rucA = randomRuc();
+	const businessNameA = `Empresa A ${suffix}`;
 	const companyRows = await db.execute(sql`
 		insert into companies (owner_id, ruc, business_name)
 		values
-			(${ownerLegacyUserId}, ${randomRuc()}, ${`Empresa A ${suffix}`}),
+			(${ownerLegacyUserId}, ${rucA}, ${businessNameA}),
 			(${ownerLegacyUserId}, ${randomRuc()}, ${`Empresa B ${suffix}`})
 		returning id
 	`);
@@ -163,6 +168,8 @@ async function createFixture(): Promise<Fixture> {
 		authUserId,
 		companyA: companyA.id,
 		companyB: companyB.id,
+		rucA,
+		businessNameA,
 		categoryA: categoryA.id,
 		categoryB: categoryB.id,
 		sessionId,
@@ -249,6 +256,33 @@ describeDb("read-only ledger keys (DB integration, real plugin)", () => {
 		const names = okPayload.data.accounts.map((account) => account.name);
 		expect(names.some((name) => name.startsWith("Ventas A"))).toBe(true);
 		expect(names.some((name) => name.startsWith("Ventas B"))).toBe(false);
+
+		// key-identity names company A, read from the companies table.
+		const identity = await app.handle(
+			new Request("http://localhost/api/ledger/key-identity", {
+				headers: { authorization: `Bearer ${plaintext}` },
+			}),
+		);
+		expect(identity.status).toBe(200);
+		expect(await identity.json()).toEqual({
+			success: true,
+			data: {
+				companyId: fixture.companyA,
+				ruc: fixture.rucA,
+				businessName: fixture.businessNameA,
+			},
+		});
+
+		// Only key callers get an identity: the session is refused.
+		const sessionIdentity = await app.handle(
+			new Request("http://localhost/api/ledger/key-identity", {
+				headers: { cookie: fixture.cookie },
+			}),
+		);
+		expect(sessionIdentity.status).toBe(403);
+		expect(((await sessionIdentity.json()) as { code: string }).code).toBe(
+			"KEY_IDENTITY_REQUIRES_API_KEY",
+		);
 
 		// Another company's tenant header is refused.
 		const foreign = await trialBalance(plaintext, {

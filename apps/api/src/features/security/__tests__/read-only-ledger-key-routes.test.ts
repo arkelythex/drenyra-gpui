@@ -232,6 +232,7 @@ describe("read-only ledger key routes", () => {
 				"GET /api/ledger/accounts",
 				"GET /api/ledger/general",
 				"GET /api/ledger/trial-balance",
+				"GET /api/ledger/key-identity",
 			]);
 		});
 
