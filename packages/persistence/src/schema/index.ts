@@ -128,6 +128,8 @@ export {
 export {
 	authAccounts,
 	authAccountsRelations,
+	authApiKeys,
+	authApiKeysRelations,
 	authAuditLogs,
 	authAuditLogsRelations,
 	authInvitations,

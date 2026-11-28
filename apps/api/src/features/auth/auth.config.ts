@@ -1,6 +1,8 @@
+import { apiKey } from "@better-auth/api-key";
 import { db } from "@drenyra/persistence/client";
 import {
 	authAccounts,
+	authApiKeys,
 	authSessions,
 	authUsers,
 	authVerifications,
@@ -12,6 +14,10 @@ import { customSession } from "better-auth/plugins/custom-session";
 import { enrichSessionUserWithCompanyContext } from "./handlers/session-company-context";
 import { resolveTrustedOriginsFromEnv } from "./lib/auth-trusted-origins";
 import { oauthAuditHooks } from "./lib/oauth-audit-hooks";
+import {
+	READ_ONLY_LEDGER_KEY_DISABLED_HTTP_PATHS,
+	readOnlyLedgerApiKeyOptions,
+} from "./lib/read-only-ledger-key";
 import { resolveSocialProvidersFromEnv } from "./lib/resolve-social-providers";
 
 /**
@@ -32,6 +38,12 @@ import { resolveSocialProvidersFromEnv } from "./lib/resolve-social-providers";
  * - authSessions: active sessions (token, userId, expiresAt)
  * - authAccounts: OAuth providers (future: Google, Microsoft)
  * - authVerifications: email/password reset tokens
+ * - authApiKeys: read-only ledger keys (hashed; api-key plugin model `apikey`)
+ *
+ * **Read-only ledger keys:** the `@better-auth/api-key` plugin issues
+ * `drn_ro_…` keys (see `lib/read-only-ledger-key.ts`). Keys never become
+ * sessions, and the plugin's HTTP endpoints are disabled: keys are issued and
+ * verified only by server code.
  *
  * **Environment Variables Required:**
  * - BETTER_AUTH_SECRET: Secret for signing tokens (min 32 chars)
@@ -54,8 +66,10 @@ export const authOptions = {
 			session: authSessions,
 			account: authAccounts,
 			verification: authVerifications,
+			apikey: authApiKeys,
 		},
 	}),
+	disabledPaths: [...READ_ONLY_LEDGER_KEY_DISABLED_HTTP_PATHS],
 	emailAndPassword: {
 		enabled: true,
 	},
@@ -82,6 +96,7 @@ export const auth = betterAuth({
 	...authOptions,
 	plugins: [
 		mfaPlugin({ enforced: false }),
+		apiKey(readOnlyLedgerApiKeyOptions),
 		customSession(
 			async ({ user, session }) => ({
 				session,

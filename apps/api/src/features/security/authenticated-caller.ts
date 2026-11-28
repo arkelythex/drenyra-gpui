@@ -3,12 +3,18 @@ import {
 	type HeaderContainer,
 	resolveSessionIdentityFromHeaders,
 } from "../auth/handlers/session-identity";
+import {
+	READ_ONLY_LEDGER_KEY_ROLE,
+	readPresentedLedgerKey,
+	verifyReadOnlyLedgerKey,
+} from "./read-only-ledger-key";
 import { readHeaderValue, resolveTenantAssertion } from "./tenant-assertions";
 
 export const AUTHENTICATED_CALLER_KIND = {
 	SESSION: "session",
 	MACHINE: "machine",
 	HEADER_FALLBACK: "header-fallback",
+	API_KEY: "api-key",
 } as const;
 
 export type AuthenticatedCallerKind =
@@ -23,6 +29,13 @@ export interface AuthenticatedCaller {
 	companyId: string | null;
 	sessionId: string | null;
 	serviceId: string | null;
+	/**
+	 * `true` only for read-only ledger key callers (`kind: "api-key"`). Such a
+	 * caller may read, never write. Absent for every other caller kind.
+	 */
+	readOnly?: true;
+	/** Id of the read-only ledger key; present only when `kind` is `"api-key"`. */
+	apiKeyId?: string;
 }
 
 export type AuthenticatedCallerResult =
@@ -46,6 +59,15 @@ export interface ResolveAuthenticatedCallerInput {
 	machineCallerAllowlist?: readonly string[];
 	requireTenant?: boolean;
 	requireRole?: boolean;
+	/**
+	 * Route opt-in for read-only ledger keys (`drn_ro_…`). Only when set, and
+	 * only when no session resolved, a presented key is verified; the request
+	 * is then answered by the key alone (never by header identity). Off by
+	 * default: other routes ignore keys.
+	 */
+	allowReadOnlyLedgerKey?: boolean | undefined;
+	/** HTTP method of the request; read-only keys require GET or HEAD. */
+	method?: string | undefined;
 }
 
 interface SignedMachineCaller {
@@ -363,6 +385,75 @@ function resolveHeaderFallbackCaller(
 }
 
 /**
+ * Resolves a read-only ledger key caller. The key alone decides identity and
+ * tenant: identity headers are ignored, and a tenant assertion
+ * (`x-company-id` / `x-active-company-id`) or requested company must equal
+ * the key's company.
+ */
+async function resolveReadOnlyLedgerKeyCaller(input: {
+	key: string;
+	method: string | undefined;
+	assertedCompanyId: string | null;
+	requestedCompanyId: string | undefined;
+}): Promise<AuthenticatedCallerResult> {
+	const verified = await verifyReadOnlyLedgerKey({
+		key: input.key,
+		method: input.method,
+	});
+	if (!verified.ok) return verified;
+
+	const foreignAssertion =
+		input.assertedCompanyId !== null &&
+		input.assertedCompanyId !== verified.companyId;
+	const foreignRequest =
+		input.requestedCompanyId !== undefined &&
+		input.requestedCompanyId !== verified.companyId;
+	if (foreignAssertion || foreignRequest) {
+		return {
+			ok: false,
+			status: 403,
+			code: "API_KEY_TENANT_MISMATCH",
+			error: "API key company does not match the requested company",
+		};
+	}
+
+	return {
+		ok: true,
+		caller: {
+			kind: AUTHENTICATED_CALLER_KIND.API_KEY,
+			userId: verified.ownerId,
+			authUserId: verified.ownerId,
+			legacyUserId: null,
+			role: READ_ONLY_LEDGER_KEY_ROLE,
+			companyId: verified.companyId,
+			sessionId: null,
+			serviceId: null,
+			readOnly: true,
+			apiKeyId: verified.apiKeyId,
+		},
+	};
+}
+
+/**
+ * Returns the key decision when the route opts in and a key is presented,
+ * or `null` so resolution continues (machine caller, header fallback).
+ */
+async function resolveOptedInReadOnlyLedgerKey(
+	input: ResolveAuthenticatedCallerInput,
+	assertedCompanyId: string | null,
+): Promise<AuthenticatedCallerResult | null> {
+	if (!input.allowReadOnlyLedgerKey) return null;
+	const presentedKey = readPresentedLedgerKey(input.headers);
+	if (presentedKey === null) return null;
+	return resolveReadOnlyLedgerKeyCaller({
+		key: presentedKey,
+		method: input.method,
+		assertedCompanyId,
+		requestedCompanyId: input.requestedCompanyId,
+	});
+}
+
+/**
  * Identity headers (x-user-id, x-user-role, x-company-id) are whatever the
  * caller sends, so production never accepts them as proof of who the caller
  * is: only a Better Auth session or a signed machine caller counts there.
@@ -464,6 +555,12 @@ export async function resolveAuthenticatedCaller(
 			},
 		};
 	}
+
+	const readOnlyKeyCaller = await resolveOptedInReadOnlyLedgerKey(
+		input,
+		assertedCompanyId,
+	);
+	if (readOnlyKeyCaller) return readOnlyKeyCaller;
 
 	if (input.allowMachineCaller) {
 		const machineCallerAllowlist = resolveMachineCallerAllowlist(
