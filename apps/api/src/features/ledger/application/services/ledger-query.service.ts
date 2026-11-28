@@ -1,3 +1,4 @@
+import type { LedgerDayInput } from "../../_internal/fiscal-day";
 import type { GeneralLedgerEntry, TrialBalanceResult } from "../../queries";
 import { getChartOfAccounts } from "../../queries/get-chart-of-accounts.query";
 import { getGeneralLedger } from "../../queries/get-general-ledger.query";
@@ -29,15 +30,15 @@ export class LedgerQueryService {
 
 	async getGeneralLedger(
 		companyId: string,
-		startDate: Date,
-		endDate: Date,
+		startDate: LedgerDayInput,
+		endDate: LedgerDayInput,
 	): Promise<GeneralLedgerEntry[]> {
 		return getGeneralLedger(companyId, startDate, endDate);
 	}
 
 	async getTrialBalance(
 		companyId: string,
-		asOfDate: Date,
+		asOfDate: LedgerDayInput,
 	): Promise<TrialBalanceResult> {
 		return getTrialBalance(companyId, asOfDate);
 	}

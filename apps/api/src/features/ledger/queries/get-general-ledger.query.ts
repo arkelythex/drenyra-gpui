@@ -1,6 +1,12 @@
 import { db as globalDb } from "@drenyra/persistence/client";
-import { and, desc, eq, gte, lte } from "@drenyra/persistence/query";
+import { and, desc, eq, sql } from "@drenyra/persistence/query";
 import { categories, transactions } from "@drenyra/persistence/schema";
+import type { LedgerDayInput } from "../_internal/fiscal-day";
+import {
+	companyFiscalTimeZone,
+	requestedFiscalDay,
+	transactionFiscalDay,
+} from "../_internal/fiscal-day-sql";
 import { formatVoucher, toNumber } from "../_internal/ledger-utils";
 
 /**
@@ -24,11 +30,17 @@ export interface GeneralLedgerEntry {
 	bancarizado: boolean;
 }
 
+/**
+ * General ledger entries between two fiscal days (both inclusive, whole days
+ * in the company's fiscal zone).
+ */
 export async function getGeneralLedger(
 	companyId: string,
-	startDate: Date,
-	endDate: Date,
+	start: LedgerDayInput,
+	end: LedgerDayInput,
 ): Promise<GeneralLedgerEntry[]> {
+	const timeZone = companyFiscalTimeZone(companyId);
+	const fiscalDay = transactionFiscalDay(timeZone);
 	const rows = await globalDb
 		.select({
 			id: transactions.id,
@@ -46,8 +58,8 @@ export async function getGeneralLedger(
 		.where(
 			and(
 				eq(transactions.companyId, companyId),
-				gte(transactions.issueDate, startDate),
-				lte(transactions.issueDate, endDate),
+				sql`${fiscalDay} >= ${requestedFiscalDay(start, timeZone)}`,
+				sql`${fiscalDay} <= ${requestedFiscalDay(end, timeZone)}`,
 			),
 		)
 		.orderBy(desc(transactions.issueDate), desc(transactions.createdAt));

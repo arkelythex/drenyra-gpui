@@ -2,14 +2,13 @@ import { Elysia } from "elysia";
 import { z } from "zod";
 import { companyScopeGuard } from "../../shared/plugins";
 import { fail, getErrorMessage, ok } from "../shared/api-response";
+import {
+	ledgerDayToInstant,
+	parseLedgerDayBound,
+} from "./_internal/fiscal-day";
 import { getChartOfAccounts } from "./application/queries/get-chart-of-accounts.query";
 import { getGeneralLedger } from "./application/queries/get-general-ledger.query";
 import { getTrialBalance } from "./application/queries/get-trial-balance.query";
-
-const parseIsoDateOrNull = (value: string): Date | null => {
-	const parsed = new Date(value);
-	return Number.isNaN(parsed.getTime()) ? null : parsed;
-};
 
 /**
  * ledgerModule const.
@@ -48,8 +47,8 @@ export const ledgerModule = new Elysia({ prefix: "/api/ledger" })
 				return fail("Company context is required", "COMPANY_CONTEXT_REQUIRED");
 			}
 			try {
-				const startDate = parseIsoDateOrNull(query.startDate);
-				const endDate = parseIsoDateOrNull(query.endDate);
+				const startDate = parseLedgerDayBound(query.startDate);
+				const endDate = parseLedgerDayBound(query.endDate);
 				if (!startDate || !endDate) {
 					set.status = 400;
 					return fail(
@@ -57,7 +56,10 @@ export const ledgerModule = new Elysia({ prefix: "/api/ledger" })
 						"INVALID_DATE",
 					);
 				}
-				if (startDate.getTime() > endDate.getTime()) {
+				if (
+					ledgerDayToInstant(startDate).getTime() >
+					ledgerDayToInstant(endDate).getTime()
+				) {
 					set.status = 400;
 					return fail(
 						"startDate must be less than or equal to endDate.",
@@ -92,7 +94,7 @@ export const ledgerModule = new Elysia({ prefix: "/api/ledger" })
 				return fail("Company context is required", "COMPANY_CONTEXT_REQUIRED");
 			}
 			try {
-				const asOfDate = parseIsoDateOrNull(query.asOfDate);
+				const asOfDate = parseLedgerDayBound(query.asOfDate);
 				if (!asOfDate) {
 					set.status = 400;
 					return fail("asOfDate invalid format. Use ISO date.", "INVALID_DATE");

@@ -1,10 +1,14 @@
 import { eq } from "@drenyra/persistence/query";
 import { companies } from "@drenyra/persistence/schema";
 import ExcelJS from "exceljs";
+import {
+	ledgerDayToInstant,
+	parseLedgerDayBound,
+} from "../../../../features/ledger/_internal/fiscal-day";
 import type { GeneralLedgerEntry } from "../../../../features/ledger/queries/get-general-ledger.query";
 import { getGeneralLedger } from "../../../../features/ledger/queries/get-general-ledger.query";
 import { db } from "../../../../lib/db";
-import { formatDatePE, parseIsoDateOrNull } from "../helpers/export-helpers";
+import { formatDatePE } from "../helpers/export-helpers";
 
 async function generateXLSX(
 	entries: GeneralLedgerEntry[],
@@ -113,8 +117,13 @@ export async function exportGeneralLedgerXlsx(input: {
 	| { ok: true; buffer: Buffer; contentType: string; disposition: string }
 	| { ok: false; status: number; message: string; code: string }
 > {
-	const startDate = parseIsoDateOrNull(input.startDate);
-	const endDate = parseIsoDateOrNull(input.endDate);
+	// `YYYY-MM-DD` means the whole calendar day in the company's fiscal zone.
+	const startBound = input.startDate
+		? parseLedgerDayBound(input.startDate)
+		: null;
+	const endBound = input.endDate ? parseLedgerDayBound(input.endDate) : null;
+	const startDate = startBound ? ledgerDayToInstant(startBound) : null;
+	const endDate = endBound ? ledgerDayToInstant(endBound) : null;
 
 	if (startDate && endDate && startDate.getTime() > endDate.getTime()) {
 		return {
@@ -127,8 +136,8 @@ export async function exportGeneralLedgerXlsx(input: {
 
 	const entries = await getGeneralLedger(
 		input.companyId,
-		startDate ?? new Date(0),
-		endDate ?? new Date(),
+		startBound ?? new Date(0),
+		endBound ?? new Date(),
 	);
 
 	const [company] = await db
