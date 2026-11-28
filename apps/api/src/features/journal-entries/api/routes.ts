@@ -46,11 +46,24 @@ function mapTenantError(message: string, set: { status?: number | string }) {
 // Routes
 // ---------------------------------------------------------------------------
 
+/**
+ * Journal entry routes.
+ *
+ * GET `/` and GET `/:id` also accept a read-only ledger key (`drn_ro_…`)
+ * scoped to its own company (`allowReadOnlyLedgerKey`). The guard refuses a
+ * key on every write (POST, PATCH, DELETE) with 403 before any handler runs.
+ * Adding a GET route here makes it readable with a key: keep GETs read-only.
+ */
 export const journalEntryRoutes = new Elysia({
 	prefix: "/api/journal-entries",
 	name: "journal-entries",
 })
-	.use(companyScopeGuard({ allowHeaderFallback: true }))
+	.use(
+		companyScopeGuard({
+			allowHeaderFallback: true,
+			allowReadOnlyLedgerKey: true,
+		}),
+	)
 	// ---- LIST ----
 	.get(
 		"/",

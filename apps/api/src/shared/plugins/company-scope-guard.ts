@@ -28,11 +28,25 @@
  *
  * Phase 4 will remove the fallback and mandate session-only context.
  *
+ * ## Read-only ledger keys
+ *
+ * Modules that serve ledger reads opt in with `allowReadOnlyLedgerKey: true`.
+ * A `drn_ro_…` key is then accepted on GET/HEAD for its own company only,
+ * and `companyContext.readOnly` is `true`. A refused key always fails closed
+ * (401/403, or 429 when rate limited), even with `allowHeaderFallback`.
+ *
  * @module company-scope-guard
  */
 
 import type { Elysia } from "elysia";
-import { resolveSessionContext } from "../../features/security/session-context";
+import {
+	isReadOnlyLedgerKeyRefusal,
+	READ_ONLY_LEDGER_KEY_RATE_LIMITED,
+} from "../../features/security/read-only-ledger-key";
+import {
+	resolveSessionContext,
+	type SessionContext,
+} from "../../features/security/session-context";
 import { fail } from "../../features/shared/api-response";
 
 /**
@@ -51,6 +65,11 @@ export interface CompanyContext {
 	role: string;
 	/** Tenant (company) identifier — used for all query scoping */
 	companyId: string;
+	/**
+	 * `true` only for a read-only ledger key caller: it may read, never write.
+	 * Absent for every other caller.
+	 */
+	readOnly?: true;
 }
 
 /**
@@ -67,6 +86,42 @@ export interface CompanyScopeGuardOptions {
 	 * Phase 4 will require session-only context.
 	 */
 	allowHeaderFallback?: boolean;
+	/**
+	 * If `true`, a read-only ledger key (`drn_ro_…`) is accepted for GET/HEAD
+	 * requests of this module, scoped to the key's company. Writes with a key
+	 * are refused with 403. Only for modules whose GET routes are ledger reads.
+	 *
+	 * Default: `false` (keys are ignored).
+	 */
+	allowReadOnlyLedgerKey?: boolean;
+}
+
+function refusalStatus(result: { status: 401 | 403; code: string }) {
+	return result.code === READ_ONLY_LEDGER_KEY_RATE_LIMITED
+		? (429 as const)
+		: result.status;
+}
+
+/**
+ * Header-fallback modules pass a failed resolution through as "no context",
+ * except a refused read-only key: that request is answered with the refusal.
+ */
+function passesThroughWithoutContext(
+	allowHeaderFallback: boolean,
+	code: string,
+): boolean {
+	return allowHeaderFallback && !isReadOnlyLedgerKeyRefusal(code);
+}
+
+function toCompanyContext(context: SessionContext): CompanyContext {
+	return {
+		userId: context.userId,
+		authUserId: context.authUserId,
+		legacyUserId: context.legacyUserId,
+		role: context.role,
+		companyId: context.companyId,
+		...(context.readOnly ? { readOnly: true as const } : {}),
+	};
 }
 
 /**
@@ -92,10 +147,11 @@ export interface CompanyScopeGuardOptions {
  * .use(companyScopeGuard({ allowHeaderFallback: true }))
  */
 export function companyScopeGuard(options: CompanyScopeGuardOptions = {}) {
-	const { allowHeaderFallback = false } = options;
+	const { allowHeaderFallback = false, allowReadOnlyLedgerKey = false } =
+		options;
 
 	return (app: Elysia) =>
-		app.derive(async ({ headers, status }) => {
+		app.derive(async ({ headers, request, status }) => {
 			/**
 			 * During Phase 3 migration (allowHeaderFallback: true), do not
 			 * require a full session — the guard will first attempt session
@@ -114,6 +170,8 @@ export function companyScopeGuard(options: CompanyScopeGuardOptions = {}) {
 					headers: headers as Record<string, unknown>,
 					requireSession,
 					allowHeaderFallback,
+					allowReadOnlyLedgerKey,
+					method: request.method,
 				});
 
 				if (!result.ok) {
@@ -125,7 +183,7 @@ export function companyScopeGuard(options: CompanyScopeGuardOptions = {}) {
 					 *
 					 * In Phase 4 (allowHeaderFallback: false), we fail closed.
 					 */
-					if (allowHeaderFallback) {
+					if (passesThroughWithoutContext(allowHeaderFallback, result.code)) {
 						// Pass through — no company context available.
 						// The handler can still use its existing scoping mechanism.
 						return { companyContext: undefined as unknown as CompanyContext };
@@ -133,21 +191,10 @@ export function companyScopeGuard(options: CompanyScopeGuardOptions = {}) {
 
 					// Answer with the guard's status here; a thrown error would
 					// reach the app's error handler and become a 500.
-					return status(
-						result.status as 401 | 403,
-						fail(result.error, result.code),
-					);
+					return status(refusalStatus(result), fail(result.error, result.code));
 				}
 
-				return {
-					companyContext: {
-						userId: result.context.userId,
-						authUserId: result.context.authUserId,
-						legacyUserId: result.context.legacyUserId,
-						role: result.context.role,
-						companyId: result.context.companyId,
-					},
-				};
+				return { companyContext: toCompanyContext(result.context) };
 			} catch (error) {
 				/**
 				 * If resolveSessionContext throws (e.g. DB is unavailable in

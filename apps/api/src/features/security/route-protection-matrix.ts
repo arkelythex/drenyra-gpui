@@ -94,7 +94,19 @@ export interface RouteProtectionMatrixRow {
 	readonly envelope: RouteEnvelopeStyle;
 	readonly rateLimit: RouteRateLimitStatus;
 	readonly notes: string;
+	/**
+	 * Routes of this surface that also accept a read-only ledger key
+	 * (`drn_ro_…`, GET/HEAD only, scoped to the key's company), as
+	 * `"<METHOD> <path>"`. Absent when the surface ignores keys.
+	 */
+	readonly readOnlyLedgerKeyRoutes?: readonly string[];
 }
+
+/**
+ * Auth mode name used in docs for routes that accept a read-only ledger key
+ * in addition to their row's `authMode`.
+ */
+export const READ_ONLY_LEDGER_KEY_AUTH_MODE = "read-only-ledger-key";
 
 /**
  * PUBLIC_ROUTE_SURFACE_IDS const.
@@ -400,7 +412,12 @@ export const ROUTE_PROTECTION_MATRIX = [
 		schemaSystem: "zod",
 		envelope: "canonical",
 		rateLimit: "missing",
-		notes: "Accounting journal entries for fiscal period tracking.",
+		notes:
+			"Accounting journal entries for fiscal period tracking. GET / and GET /:id also accept a read-only ledger key for its own company; every write refuses keys.",
+		readOnlyLedgerKeyRoutes: [
+			"GET /api/journal-entries/",
+			"GET /api/journal-entries/:id",
+		],
 	},
 	{
 		id: "fiscal-console",
@@ -565,5 +582,37 @@ export const ROUTE_PROTECTION_MATRIX = [
 		rateLimit: "documented",
 		notes:
 			"Supplier catalog surface; tenant policy should be centralized in later wave.",
+	},
+] as const satisfies readonly RouteProtectionMatrixRow[];
+
+/**
+ * Surfaces mounted through `apiModules` (`api-module-surface.ts`) rather
+ * than directly in `app-core.ts`. Only surfaces with a documented protection
+ * decision are listed here.
+ *
+ * @example
+ * ```ts
+ * console.log(API_MODULES_ROUTE_PROTECTION_MATRIX);
+ * ```
+ */
+export const API_MODULES_ROUTE_PROTECTION_MATRIX = [
+	{
+		id: "ledger",
+		surface: "Ledger",
+		appCoreExportName: "ledgerModule",
+		prefix: "/api/ledger",
+		mounted: true,
+		authMode: "legacy-header-fallback",
+		tenantSource: "mixed",
+		schemaSystem: "zod",
+		envelope: "canonical",
+		rateLimit: "missing",
+		notes:
+			"Read-only ledger (chart of accounts, general ledger, trial balance). Session or header fallback; also a read-only ledger key scoped to its own company. Keys are rate limited by the api-key plugin (120/min); session callers are not. POST /api/ledger/export/* belongs to Ledger MVP and refuses keys.",
+		readOnlyLedgerKeyRoutes: [
+			"GET /api/ledger/accounts",
+			"GET /api/ledger/general",
+			"GET /api/ledger/trial-balance",
+		],
 	},
 ] as const satisfies readonly RouteProtectionMatrixRow[];

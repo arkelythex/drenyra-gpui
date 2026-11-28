@@ -1,5 +1,6 @@
 import { relations, sql } from "drizzle-orm";
 import {
+	bigint,
 	boolean,
 	index,
 	integer,
@@ -169,6 +170,63 @@ export const authUserCompanies = pgTable(
 );
 
 // ============================================================
+// API keys (Better Auth `@better-auth/api-key`, model `apikey`)
+// ============================================================
+
+/**
+ * authApiKeys table.
+ *
+ * Storage for the Better Auth api-key plugin (model `apikey`, mapped in
+ * `apps/api/src/features/auth/auth.config.ts`). Drenyra uses it for read-only
+ * ledger keys (`drn_ro_…`): `key` holds only the SHA-256 hash, `permissions`
+ * and `metadata` are JSON strings written by the plugin (`metadata.companyId`
+ * binds a key to one company). Columns mirror the plugin schema of
+ * `@better-auth/api-key@1.6.23`; millisecond intervals are `bigint` so a
+ * window longer than ~24 days cannot overflow.
+ *
+ * @example
+ * ```ts
+ * console.log(authApiKeys);
+ * ```
+ */
+export const authApiKeys = pgTable(
+	"auth_api_keys",
+	{
+		id: text("id").primaryKey(),
+		configId: text("config_id").notNull().default("default"),
+		name: text("name"),
+		start: text("start"),
+		referenceId: text("reference_id")
+			.notNull()
+			.references(() => authUsers.id, { onDelete: "cascade" }),
+		prefix: text("prefix"),
+		key: text("key").notNull(),
+		refillInterval: bigint("refill_interval", { mode: "number" }),
+		refillAmount: integer("refill_amount"),
+		lastRefillAt: timestamp("last_refill_at"),
+		enabled: boolean("enabled").default(true),
+		rateLimitEnabled: boolean("rate_limit_enabled").default(true),
+		rateLimitTimeWindow: bigint("rate_limit_time_window", { mode: "number" }),
+		rateLimitMax: integer("rate_limit_max"),
+		requestCount: integer("request_count").default(0),
+		remaining: integer("remaining"),
+		lastRequest: timestamp("last_request"),
+		expiresAt: timestamp("expires_at"),
+		createdAt: timestamp("created_at").notNull(),
+		updatedAt: timestamp("updated_at").notNull(),
+		permissions: text("permissions"),
+		metadata: text("metadata"),
+	},
+	(table) => ({
+		configIdIdx: index("auth_api_keys_config_id_idx").on(table.configId),
+		referenceIdIdx: index("auth_api_keys_reference_id_idx").on(
+			table.referenceId,
+		),
+		keyIdx: index("auth_api_keys_key_idx").on(table.key),
+	}),
+);
+
+// ============================================================
 // Invitations
 // ============================================================
 
@@ -226,6 +284,22 @@ export const authUsersRelations = relations(authUsers, ({ many }) => ({
 	accounts: many(authAccounts),
 	companies: many(authUserCompanies),
 	sentInvitations: many(authInvitations),
+	apiKeys: many(authApiKeys),
+}));
+
+/**
+ * authApiKeysRelations const.
+ *
+ * @example
+ * ```ts
+ * console.log(authApiKeysRelations);
+ * ```
+ */
+export const authApiKeysRelations = relations(authApiKeys, ({ one }) => ({
+	owner: one(authUsers, {
+		fields: [authApiKeys.referenceId],
+		references: [authUsers.id],
+	}),
 }));
 
 /**

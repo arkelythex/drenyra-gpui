@@ -127,6 +127,13 @@
       "when": 1790500000000,
       "tag": "0018_error_recovery",
       "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1795828456932,
+      "tag": "0035_auth_api_keys",
+      "breakpoints": true
     }
   ]
 }

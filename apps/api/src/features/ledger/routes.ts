@@ -14,13 +14,23 @@ const parseIsoDateOrNull = (value: string): Date | null => {
 /**
  * ledgerModule const.
  *
+ * Read-only ledger routes. Besides sessions, they accept a read-only ledger
+ * key (`drn_ro_…`) scoped to its own company (`allowReadOnlyLedgerKey`).
+ * Keep this module GET-only: a write route added here would be refused for
+ * keys, but belongs in a module that does not opt in.
+ *
  * @example
  * ```ts
  * console.log(ledgerModule);
  * ```
  */
 export const ledgerModule = new Elysia({ prefix: "/api/ledger" })
-	.use(companyScopeGuard({ allowHeaderFallback: true }))
+	.use(
+		companyScopeGuard({
+			allowHeaderFallback: true,
+			allowReadOnlyLedgerKey: true,
+		}),
+	)
 	.get(
 		"/accounts",
 		async ({ companyContext, set }) => {

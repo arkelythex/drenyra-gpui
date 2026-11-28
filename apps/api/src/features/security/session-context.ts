@@ -1,5 +1,5 @@
-import { resolveAuthenticatedCaller } from "./authenticated-caller";
 import type { UnifiedActor, UnifiedRole } from "@drenyra/security/rbac";
+import { resolveAuthenticatedCaller } from "./authenticated-caller";
 
 export const SESSION_SECURITY_PROFILE = {
 	DEFAULT: "default",
@@ -23,6 +23,11 @@ export interface SessionContext {
 	legacyUserId: string | null;
 	role: string;
 	companyId: string;
+	/**
+	 * `true` only when the caller is a read-only ledger key: it may read, never
+	 * write. Absent for sessions, machine callers and header fallback.
+	 */
+	readOnly?: true;
 }
 
 /**
@@ -75,6 +80,10 @@ interface ResolveSessionContextInput {
 	allowMachineCaller?: boolean;
 	machineCallerAllowlist?: readonly string[];
 	securityProfile?: SessionSecurityProfile;
+	/** Route opt-in for read-only ledger keys; see `authenticated-caller.ts`. */
+	allowReadOnlyLedgerKey?: boolean | undefined;
+	/** HTTP method of the request (read-only keys require GET or HEAD). */
+	method?: string | undefined;
 }
 
 function shouldRequireSession(requireSessionOverride?: boolean): boolean {
@@ -138,6 +147,8 @@ export async function resolveSessionContext(
 		machineCallerAllowlist: input.machineCallerAllowlist,
 		requireTenant: true,
 		requireRole: true,
+		allowReadOnlyLedgerKey: input.allowReadOnlyLedgerKey,
+		method: input.method,
 	});
 
 	if (caller.ok === false) {
@@ -157,6 +168,7 @@ export async function resolveSessionContext(
 			legacyUserId: caller.caller.legacyUserId,
 			role: caller.caller.role,
 			companyId: caller.caller.companyId ?? "",
+			...(caller.caller.readOnly ? { readOnly: true as const } : {}),
 		},
 	};
 }
