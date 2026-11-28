@@ -1,5 +1,6 @@
 import { LedgerQueryService } from "../application/services/ledger-query.service";
 import type { GeneralLedgerEntry, TrialBalanceResult } from "../queries";
+import type { LedgerDayInput } from "./fiscal-day";
 
 const defaultService = new LedgerQueryService();
 
@@ -31,15 +32,15 @@ export const defaultLedgerQueryService: Pick<
 
 	getGeneralLedger(
 		companyId: string,
-		startDate: Date,
-		endDate: Date,
+		startDate: LedgerDayInput,
+		endDate: LedgerDayInput,
 	): Promise<GeneralLedgerEntry[]> {
 		return defaultService.getGeneralLedger(companyId, startDate, endDate);
 	},
 
 	getTrialBalance(
 		companyId: string,
-		asOfDate: Date,
+		asOfDate: LedgerDayInput,
 	): Promise<TrialBalanceResult> {
 		return defaultService.getTrialBalance(companyId, asOfDate);
 	},

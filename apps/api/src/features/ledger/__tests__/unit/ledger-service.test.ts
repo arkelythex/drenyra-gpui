@@ -6,6 +6,7 @@
 
 import { db } from "@drenyra/persistence/client";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { resetKnownTimeZoneNamesCache } from "../../_internal/known-time-zones";
 import { LedgerService } from "../../index";
 
 vi.mock("@drenyra/persistence/client", () => ({
@@ -16,6 +17,7 @@ vi.mock("@drenyra/persistence/client", () => ({
 		where: vi.fn().mockReturnThis(),
 		groupBy: vi.fn().mockReturnThis(),
 		orderBy: vi.fn().mockResolvedValue([]),
+		execute: vi.fn().mockResolvedValue([{ zone: "America/Lima" }]),
 	},
 }));
 
@@ -29,9 +31,30 @@ vi.mock("@drenyra/persistence/query", () => ({
 	sql: vi.fn((strings: TemplateStringsArray) => strings.join("")),
 }));
 
+/** Answers by the (mocked) SQL text: company zone, zone names, instant days. */
+function answerExecute(instantDays: string) {
+	(db.execute as ReturnType<typeof vi.fn>).mockImplementation(
+		async (query: unknown) => {
+			const text = String(query);
+			if (text.includes("pg_timezone_names")) {
+				return [{ name: "America/Lima" }];
+			}
+			if (text.includes("concat_ws")) return [{ days: instantDays }];
+			return [{ zone: "America/Lima" }];
+		},
+	);
+}
+
+const executedSql = () =>
+	(db.execute as ReturnType<typeof vi.fn>).mock.calls.map(([query]) =>
+		String(query),
+	);
+
 describe("LedgerService", () => {
 	beforeEach(() => {
 		vi.clearAllMocks();
+		resetKnownTimeZoneNamesCache();
+		answerExecute("2026-03-31");
 	});
 
 	describe("getChartOfAccounts", () => {
@@ -267,36 +290,156 @@ describe("LedgerService", () => {
 	});
 
 	describe("getTrialBalance", () => {
+		/** Row shape produced by the trial balance SQL (all money as decimal text). */
+		function trialRow(overrides: Record<string, unknown>) {
+			return {
+				categoryId: "cat",
+				name: "Cuenta",
+				direction: null,
+				activity: 0,
+				debits: "0.00",
+				credits: "0.00",
+				balance: "0.00",
+				totalDebits: "0.00",
+				totalCredits: "0.00",
+				totalBalance: "0.00",
+				...overrides,
+			};
+		}
+
 		it("should return trial balance with accounts and totals", async () => {
+			const totals = {
+				totalDebits: "5000.00",
+				totalCredits: "5000.00",
+				totalBalance: "0.00",
+			};
 			(db.orderBy as ReturnType<typeof vi.fn>).mockResolvedValue([
-				{
+				trialRow({
 					categoryId: "cat-1",
 					name: "Caja",
-					direction: null,
 					activity: 10,
-					totalDebit: 5000,
-					totalCredit: 2000,
-				},
-				{
+					debits: "5000.00",
+					credits: "2000.00",
+					balance: "3000.00",
+					...totals,
+				}),
+				trialRow({
 					categoryId: "cat-2",
 					name: "Ventas",
 					direction: "INCOME",
 					activity: 8,
-					totalDebit: 0,
-					totalCredit: 3000,
-				},
+					debits: "0.00",
+					credits: "3000.00",
+					balance: "-3000.00",
+					...totals,
+				}),
 			]);
 
-			const result = await LedgerService.getTrialBalance(
-				"cmp-1",
-				new Date("2026-03-31"),
-			);
+			const result = await LedgerService.getTrialBalance("cmp-1", {
+				kind: "calendar-day",
+				day: "2026-03-31",
+			});
 
 			expect(result.asOfDate).toBe("2026-03-31T00:00:00.000Z");
 			expect(result.accounts).toHaveLength(2);
+			expect(result.accounts[0]).toMatchObject({
+				name: "Caja",
+				debits: "5000.00",
+				credits: "2000.00",
+				balance: "3000.00",
+				activity: 10,
+			});
 			expect(result.debits).toBe("5000.00");
 			expect(result.credits).toBe("5000.00");
 			expect(result.balance).toBe("0.00");
+		});
+
+		it("should keep 0.10 + 0.20 exactly 0.30 (SQL decimal text, no JS floats)", async () => {
+			const totals = {
+				totalDebits: "0.30",
+				totalCredits: "0.00",
+				totalBalance: "0.30",
+			};
+			(db.orderBy as ReturnType<typeof vi.fn>).mockResolvedValue([
+				trialRow({ name: "A", debits: "0.10", balance: "0.10", ...totals }),
+				trialRow({ name: "B", debits: "0.20", balance: "0.20", ...totals }),
+			]);
+
+			const result = await LedgerService.getTrialBalance("cmp-1", {
+				kind: "calendar-day",
+				day: "2026-03-31",
+			});
+
+			expect(result.debits).toBe("0.30");
+			expect(result.balance).toBe("0.30");
+		});
+
+		it("should return large amounts exactly and without exponent notation", async () => {
+			(db.orderBy as ReturnType<typeof vi.fn>).mockResolvedValue([
+				trialRow({
+					name: "Masivo",
+					credits: "99999999999999999999999.99",
+					balance: "-99999999999999999999999.99",
+					totalDebits: "0.00",
+					totalCredits: "99999999999999999999999.99",
+					totalBalance: "-99999999999999999999999.99",
+				}),
+			]);
+
+			const result = await LedgerService.getTrialBalance("cmp-1", {
+				kind: "calendar-day",
+				day: "2026-03-31",
+			});
+
+			expect(result.accounts[0]?.credits).toBe("99999999999999999999999.99");
+			expect(result.credits).toBe("99999999999999999999999.99");
+			expect(result.balance).toBe("-99999999999999999999999.99");
+			expect(JSON.stringify(result)).not.toMatch(/e\+/i);
+		});
+
+		it("should return negative balances as signed decimal text", async () => {
+			(db.orderBy as ReturnType<typeof vi.fn>).mockResolvedValue([
+				trialRow({
+					name: "Ventas",
+					direction: "INCOME",
+					credits: "150.25",
+					balance: "-150.25",
+					totalCredits: "150.25",
+					totalBalance: "-150.25",
+				}),
+			]);
+
+			const result = await LedgerService.getTrialBalance("cmp-1", {
+				kind: "calendar-day",
+				day: "2026-03-31",
+			});
+
+			expect(result.accounts[0]?.balance).toBe("-150.25");
+			expect(result.balance).toBe("-150.25");
+		});
+
+		it("should refuse amounts that are not exact 2-decimal text", async () => {
+			(db.orderBy as ReturnType<typeof vi.fn>).mockResolvedValue([
+				trialRow({ name: "Caja", debits: 5000, totalDebits: "5000.00" }),
+			]);
+
+			await expect(
+				LedgerService.getTrialBalance("cmp-1", {
+					kind: "calendar-day",
+					day: "2026-03-31",
+				}),
+			).rejects.toThrow(/exact 2-decimal/);
+
+			(db.orderBy as ReturnType<typeof vi.fn>).mockResolvedValue([
+				trialRow({ name: "Caja", totalCredits: "1e+21" }),
+			]);
+
+			await expect(
+				LedgerService.getTrialBalance("cmp-1", {
+					kind: "calendar-day",
+					day: "2026-03-31",
+				}),
+			).rejects.toThrow(/exact 2-decimal/);
 		});
 
 		it("should return empty trial balance when no categories exist", async () => {
@@ -314,23 +457,21 @@ describe("LedgerService", () => {
 		});
 
 		it("should filter out accounts with null names", async () => {
+			const totals = {
+				totalDebits: "1000.00",
+				totalCredits: "1000.00",
+				totalBalance: "0.00",
+			};
 			(db.orderBy as ReturnType<typeof vi.fn>).mockResolvedValue([
-				{
-					categoryId: "cat-null",
-					name: null,
-					direction: "INCOME",
-					activity: 0,
-					totalDebit: 0,
-					totalCredit: 0,
-				},
-				{
+				trialRow({ categoryId: "cat-null", name: null, ...totals }),
+				trialRow({
 					categoryId: "cat-valid",
 					name: "IGV",
-					direction: null,
 					activity: 5,
-					totalDebit: 1000,
-					totalCredit: 1000,
-				},
+					debits: "1000.00",
+					credits: "1000.00",
+					...totals,
+				}),
 			]);
 
 			const result = await LedgerService.getTrialBalance(
@@ -339,7 +480,58 @@ describe("LedgerService", () => {
 			);
 
 			expect(result.accounts).toHaveLength(1);
-			expect(result.accounts[0].name).toBe("IGV");
+			expect(result.accounts[0]?.name).toBe("IGV");
+		});
+	});
+
+	describe("fiscal zone lookup", () => {
+		// pg_timezone_names is a full function scan (~13-50 ms): it is cached
+		// per process (TTL), and the company zone is read once per report.
+		it("reads the company zone once per trial balance and scans zone names once per process", async () => {
+			(db.orderBy as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+			const asOf = {
+				kind: "instant" as const,
+				at: new Date("2026-04-01T04:59:59.999Z"),
+			};
+
+			await LedgerService.getTrialBalance("cmp-1", asOf);
+			await LedgerService.getTrialBalance("cmp-1", asOf);
+
+			const queries = executedSql();
+			expect(queries.filter((q) => q.includes("AS zone"))).toHaveLength(2);
+			expect(
+				queries.filter((q) => q.includes("pg_timezone_names")),
+			).toHaveLength(1);
+			expect(queries.filter((q) => q.includes("concat_ws"))).toHaveLength(2);
+		});
+
+		it("resolves both instant bounds of a general ledger in one query", async () => {
+			(db.orderBy as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+			answerExecute("2026-03-01,2026-03-31");
+
+			await LedgerService.getGeneralLedger(
+				"cmp-1",
+				{ kind: "instant", at: new Date("2026-03-01T10:00:00.000Z") },
+				{ kind: "instant", at: new Date("2026-04-01T04:59:59.999Z") },
+			);
+
+			const queries = executedSql();
+			expect(queries.filter((q) => q.includes("AS zone"))).toHaveLength(1);
+			expect(queries.filter((q) => q.includes("concat_ws"))).toHaveLength(1);
+		});
+
+		it("needs no day query for calendar-day bounds", async () => {
+			(db.orderBy as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+			await LedgerService.getGeneralLedger(
+				"cmp-1",
+				{ kind: "calendar-day", day: "2026-03-01" },
+				{ kind: "calendar-day", day: "2026-03-31" },
+			);
+
+			expect(executedSql().filter((q) => q.includes("concat_ws"))).toHaveLength(
+				0,
+			);
 		});
 	});
 });

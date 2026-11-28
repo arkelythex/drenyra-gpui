@@ -239,12 +239,22 @@ export const getLedgerTool: AgentTool = {
 	outputSchema: z.object({ entries: z.array(z.any()) }),
 	approvalLevel: "auto",
 	async execute(input: unknown, context: AgentContext) {
-		const { LedgerService } = await import("../../ledger");
+		const { LedgerService, parseLedgerDayBound } = await import("../../ledger");
 		const inp = input as { startDate?: string; endDate?: string };
+		// Whole fiscal days: `YYYY-MM-DD` (or a UTC-midnight date-time) is a
+		// calendar day in the company's zone; a non-existent day is refused.
 		const start = inp.startDate
-			? new Date(inp.startDate)
-			: new Date(new Date().getFullYear(), 0, 1);
-		const end = inp.endDate ? new Date(inp.endDate) : new Date();
+			? parseLedgerDayBound(inp.startDate)
+			: {
+					kind: "calendar-day" as const,
+					day: `${new Date().getFullYear()}-01-01`,
+				};
+		const end = inp.endDate
+			? parseLedgerDayBound(inp.endDate)
+			: { kind: "instant" as const, at: new Date() };
+		if (!start || !end) {
+			throw new Error("startDate/endDate invalid. Use YYYY-MM-DD.");
+		}
 		const entries = await LedgerService.getGeneralLedger(
 			context.companyId,
 			start,

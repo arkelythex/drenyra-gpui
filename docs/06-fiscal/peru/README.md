@@ -1,6 +1,6 @@
 # Perú — Fiscal Domain
 
-**Última actualización:** 2026-07-29
+**Última actualización:** 2026-11-27
 **FEOS Plano:** 09 — Country Plane _(no disponible)_
 **Country Pack:** `country-packs/peru/`
 
@@ -51,6 +51,7 @@ Este directorio documenta las reglas fiscales peruanas que Drenyra modela, valid
 | [SIRE](./sire.md) | SIRE: RVIE, RCE, cronograma de obligatoriedad, reemplazo, unknown, facultad discrecional 2026 |
 | [PLE](./ple.md) | Programa de Libros Electrónicos: formatos 3.1–14.1, plazos, cierre, migración a SIRE |
 | [Renta](./renta.md) | Impuesto a la Renta: categorías, pagos a cuenta, tasa 29.5%, declaración anual |
+| [Ledger: fechas y montos](./ledger-fechas-y-montos.md) | Día fiscal completo (zona de la empresa, `America/Lima`) y montos exactos en balanza y mayor general |
 
 ---
 

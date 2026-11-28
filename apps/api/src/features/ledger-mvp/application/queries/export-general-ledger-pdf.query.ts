@@ -1,10 +1,16 @@
 import { eq } from "@drenyra/persistence/query";
 import { companies } from "@drenyra/persistence/schema";
 import PDFDocument from "pdfkit";
+import {
+	isInvertedCalendarDayRange,
+	LedgerDateRangeError,
+	ledgerDayToInstant,
+	parseLedgerDayBound,
+} from "../../../../features/ledger/_internal/fiscal-day";
 import type { GeneralLedgerEntry } from "../../../../features/ledger/queries/get-general-ledger.query";
 import { getGeneralLedger } from "../../../../features/ledger/queries/get-general-ledger.query";
 import { db } from "../../../../lib/db";
-import { formatDatePE, parseIsoDateOrNull } from "../helpers/export-helpers";
+import { formatDatePE } from "../helpers/export-helpers";
 
 function generatePDF(
 	entries: GeneralLedgerEntry[],
@@ -130,23 +136,44 @@ export async function exportGeneralLedgerPdf(input: {
 	| { ok: true; buffer: Buffer; contentType: string; disposition: string }
 	| { ok: false; status: number; message: string; code: string }
 > {
-	const startDate = parseIsoDateOrNull(input.startDate);
-	const endDate = parseIsoDateOrNull(input.endDate);
-
-	if (startDate && endDate && startDate.getTime() > endDate.getTime()) {
+	// `YYYY-MM-DD` means the whole calendar day in the company's fiscal zone.
+	const startBound = input.startDate
+		? parseLedgerDayBound(input.startDate)
+		: null;
+	const endBound = input.endDate ? parseLedgerDayBound(input.endDate) : null;
+	// A date that was sent but is not a real day (2026-02-30) must not widen
+	// the export to the whole history.
+	if ((input.startDate && !startBound) || (input.endDate && !endBound)) {
 		return {
 			ok: false,
 			status: 400,
-			message: "startDate must be <= endDate",
-			code: "INVALID_DATE_RANGE",
+			message: "startDate/endDate invalid. Use YYYY-MM-DD.",
+			code: "INVALID_DATE",
 		};
 	}
+	// Report header labels only; never used to order the bounds.
+	const startDate = startBound ? ledgerDayToInstant(startBound) : null;
+	const endDate = endBound ? ledgerDayToInstant(endBound) : null;
+	const invalidRange = {
+		ok: false,
+		status: 400,
+		message: "startDate must be <= endDate",
+		code: "INVALID_DATE_RANGE",
+	} as const;
 
-	const entries = await getGeneralLedger(
-		input.companyId,
-		startDate ?? new Date(0),
-		endDate ?? new Date(),
-	);
+	const rangeStart = startBound ?? new Date(0);
+	const rangeEnd = endBound ?? new Date();
+	// Two calendar days are ordered here; a range with an instant is ordered
+	// by the query on fiscal days in the company zone.
+	if (isInvertedCalendarDayRange(rangeStart, rangeEnd)) return invalidRange;
+
+	let entries: GeneralLedgerEntry[];
+	try {
+		entries = await getGeneralLedger(input.companyId, rangeStart, rangeEnd);
+	} catch (error: unknown) {
+		if (error instanceof LedgerDateRangeError) return invalidRange;
+		throw error;
+	}
 
 	const [company] = await db
 		.select({ businessName: companies.businessName, ruc: companies.ruc })
