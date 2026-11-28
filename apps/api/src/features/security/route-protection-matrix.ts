@@ -151,6 +151,7 @@ export const APP_CORE_MOUNTED_SURFACE_EXPORTS = [
 	"healthModule",
 	"invoiceRoutes",
 	"journalEntryRoutes",
+	"ledgerKeysRoutes",
 	"ledgerMvpModule",
 	"llmGatewayModule",
 	"platformMcpModule",
@@ -486,6 +487,20 @@ export const ROUTE_PROTECTION_MATRIX = [
 		rateLimit: "documented",
 		notes:
 			"Invoice routes have scoped route tests for X-Company-Id enforcement.",
+	},
+	{
+		id: "ledger-keys",
+		surface: "Ledger Keys",
+		appCoreExportName: "ledgerKeysRoutes",
+		prefix: "/api/ledger-keys",
+		mounted: true,
+		authMode: "session",
+		tenantSource: "session",
+		schemaSystem: "zod",
+		envelope: "canonical",
+		rateLimit: "missing",
+		notes:
+			"Issue, list and revoke the caller's own read-only ledger keys. Better Auth session only, in every environment: a presented API key is refused (403 API_KEY_NOT_ALLOWED) and header identity is never accepted. The companyId in the body/query must be one of the session user's active memberships. Keys are returned once, at issuance. See docs/04-api/ledger-read-keys.md.",
 	},
 	{
 		id: "ledger-mvp",

@@ -134,6 +134,25 @@ describe("route protection matrix", () => {
 		}
 	});
 
+	it("declares ledger key management as a session-only app-core surface", () => {
+		expect(extractMountedSurfaceExports(appCoreSource)).toContain(
+			"ledgerKeysRoutes",
+		);
+		expect(APP_CORE_MOUNTED_SURFACE_EXPORTS).toContain("ledgerKeysRoutes");
+
+		const row = ALL_ROWS.find((candidate) => candidate.id === "ledger-keys");
+		expect(row).toMatchObject({
+			appCoreExportName: "ledgerKeysRoutes",
+			prefix: "/api/ledger-keys",
+			authMode: "session",
+			tenantSource: "session",
+		});
+		// A key can never manage keys: the surface accepts none.
+		expect(row?.readOnlyLedgerKeyRoutes).toBeUndefined();
+		expect(routeMatrixDoc).toContain("| Ledger Keys");
+		expect(routeMatrixDoc).toContain("(../ledger-read-keys.md)");
+	});
+
 	it("documents the read-only ledger key routes", () => {
 		expect(routeMatrixDoc).toContain(`\`${READ_ONLY_LEDGER_KEY_AUTH_MODE}\``);
 		for (const row of ALL_ROWS) {

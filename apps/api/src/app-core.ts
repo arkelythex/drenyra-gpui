@@ -43,6 +43,7 @@ import { frontendTelemetryModule } from "./features/frontend-telemetry";
 import { healthModule } from "./features/health";
 import { journalEntryRoutes } from "./features/journal-entries";
 import { judgmentDayRoutes } from "./features/judgment-day";
+import { ledgerKeysRoutes } from "./features/ledger-keys";
 import { ledgerMvpModule } from "./features/ledger-mvp";
 import {
 	isLedgerMvpEnabled,
@@ -145,6 +146,11 @@ const baseApp = new Elysia()
 				tags: [
 					{ name: "Health", description: "Service health checks" },
 					{ name: "Auth", description: "Authentication" },
+					{
+						name: "Ledger Keys",
+						description:
+							"Issue, list and revoke your read-only ledger keys (session only)",
+					},
 					{ name: "Analytics", description: "Business intelligence and KPIs" },
 					{
 						name: "Dashboard",
@@ -347,6 +353,7 @@ const baseApp = new Elysia()
 	.use(frontendTelemetryModule)
 	.use(ledgerMvpEnabled ? ledgerMvpModule : new Elysia())
 	.use(authRoutes)
+	.use(ledgerKeysRoutes)
 	.use(invitationRoutes)
 	.use(aiWorkersRoutes)
 	.use(bankingRoutes)

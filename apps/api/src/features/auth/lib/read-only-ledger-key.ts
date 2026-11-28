@@ -18,6 +18,10 @@ import type { ApiKeyConfigurationOptions } from "@better-auth/api-key";
  *   permissions and the company binding are decided.
  * - Rate limiting is on for every key.
  * - Keys expire after 90 days by default and at most after 365 days.
+ * - Every key has a name of at most 64 characters (the management routes
+ *   validate it first; the plugin enforces the same bounds).
+ * - The stored `start` is the prefix plus 4 random characters, enough to
+ *   tell keys apart in a list without revealing a usable part of the key.
  *
  * @module auth/lib/read-only-ledger-key
  */
@@ -37,6 +41,13 @@ export const READ_ONLY_LEDGER_KEY_DEFAULT_EXPIRES_IN_SECONDS =
 
 /** Longest lifetime a caller may request, in days. */
 export const READ_ONLY_LEDGER_KEY_MAX_EXPIRES_IN_DAYS = 365;
+
+/** Longest key name the plugin accepts (it measures `name.length`). */
+export const READ_ONLY_LEDGER_KEY_MAX_NAME_LENGTH = 64;
+
+/** Characters of the key kept in clear as `start`: `drn_ro_` + 4. */
+export const READ_ONLY_LEDGER_KEY_START_LENGTH =
+	READ_ONLY_LEDGER_KEY_PREFIX.length + 4;
 
 /** Rate limit per key: 120 verifications per minute. */
 export const READ_ONLY_LEDGER_KEY_RATE_LIMIT = {
@@ -72,6 +83,13 @@ export const readOnlyLedgerApiKeyOptions = {
 	disableKeyHashing: false,
 	enableSessionForAPIKeys: false,
 	enableMetadata: true,
+	requireName: true,
+	minimumNameLength: 1,
+	maximumNameLength: READ_ONLY_LEDGER_KEY_MAX_NAME_LENGTH,
+	startingCharactersConfig: {
+		shouldStore: true,
+		charactersLength: READ_ONLY_LEDGER_KEY_START_LENGTH,
+	},
 	keyExpiration: {
 		defaultExpiresIn: READ_ONLY_LEDGER_KEY_DEFAULT_EXPIRES_IN_SECONDS,
 		minExpiresIn: 1,

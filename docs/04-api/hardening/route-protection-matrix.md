@@ -54,6 +54,7 @@ source of truth is
 | Invoices              | `/api/invoices`            | `invoiceRoutes`            | `legacy-header-fallback` | `x-company-id`      | no                   | documented  |
 | Journal Entries       | `/api/journal-entries`     | `journalEntryRoutes`       | `bearer-tenant`          | `x-company-id`      | GET only (see below) | missing     |
 | Ledger                | `/api/ledger`              | `ledgerModule`             | `legacy-header-fallback` | `mixed`             | GET only (see below) | missing     |
+| Ledger Keys           | `/api/ledger-keys`         | `ledgerKeysRoutes`         | `session`                | `session`           | no (session only)    | missing     |
 | Ledger MVP            | `/ledger-mvp`              | `ledgerMvpModule`          | `legacy-header-fallback` | `mixed`             | no                   | implemented |
 | LLM Gateway           | `/api/v1`                  | `llmGatewayModule`         | `ai-surface`             | `x-organization-id` | no                   | documented  |
 | Platform MCP          | `/api/platform/mcp`        | `platformMcpModule`        | `ai-surface`             | `x-organization-id` | no                   | missing     |
@@ -71,6 +72,11 @@ A read-only ledger key is a personal token for the native app, the CLI and
 agents. It is issued by the Better Auth `@better-auth/api-key` plugin, stored
 hashed, carries `ledger:read`, and is bound to exactly one company
 (`metadata.companyId`).
+
+Keys are issued, listed and revoked through `Ledger Keys`
+(`/api/ledger-keys`), which accepts **only** a Better Auth session: a key can
+never manage keys. How to issue, use and revoke a key:
+[Read-only ledger keys — how-to](../ledger-read-keys.md).
 
 ### Routes that accept a key
 
@@ -110,14 +116,17 @@ company context. Production and non-production behave the same.
 
 ### Key properties
 
-| Property       | Value                                                      |
-| -------------- | ---------------------------------------------------------- |
-| Prefix         | `drn_ro_`                                                  |
-| Storage        | SHA-256 hash only (`auth_api_keys.key`)                    |
-| Sessions       | Never: `enableSessionForAPIKeys: false`                    |
-| Default expiry | 90 days; at most 365 days                                  |
-| Rate limit     | 120 verifications per minute per key                       |
-| Issuance       | Server-side only; the plugin's HTTP endpoints are disabled |
+| Property       | Value                                                                 |
+| -------------- | --------------------------------------------------------------------- |
+| Prefix         | `drn_ro_`                                                             |
+| Storage        | SHA-256 hash only (`auth_api_keys.key`)                               |
+| Sessions       | Never: `enableSessionForAPIKeys: false`                               |
+| Default expiry | 90 days; at most 365 days                                             |
+| Rate limit     | 120 verifications per minute per key                                  |
+| Issuance       | `POST /api/ledger-keys`, session only; plugin HTTP endpoints disabled |
+| Shown once     | The plaintext key is in the issue response only                       |
+| Visible part   | `start`: `drn_ro_` plus 4 characters                                  |
+| Per company    | At most 10 active keys per user                                       |
 
 Configuration lives in
 [`apps/api/src/features/auth/lib/read-only-ledger-key.ts`](../../../apps/api/src/features/auth/lib/read-only-ledger-key.ts);
