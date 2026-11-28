@@ -6,6 +6,11 @@
  * for a day either as a calendar day (`YYYY-MM-DD`, the preferred form) or as
  * an instant (an ISO date-time), which is resolved to its calendar day in the
  * company's zone.
+ *
+ * Label rule (same as for stored rows): a value at exactly 00:00:00.000 UTC is
+ * a calendar-day label of that UTC date, not an instant. The API echoes a day
+ * as `YYYY-MM-DDT00:00:00.000Z` and `new Date("YYYY-MM-DD")` builds that same
+ * value, so sending either back means that calendar day.
  */
 
 /** A ledger day as requested by the caller. */
@@ -20,6 +25,8 @@ export type LedgerDayInput = LedgerDayBound | Date;
 export const DEFAULT_FISCAL_TIME_ZONE = "America/Lima";
 
 const CALENDAR_DAY_PATTERN = /^(\d{4})-(\d{2})-(\d{2})$/;
+
+const DAY_MS = 86_400_000;
 
 function isValidCalendarDay(value: string): boolean {
 	const match = CALENDAR_DAY_PATTERN.exec(value);
@@ -52,12 +59,28 @@ export function parseLedgerDayBound(value: string): LedgerDayBound | null {
 			: null;
 	}
 	const at = new Date(value);
-	return Number.isNaN(at.getTime()) ? null : { kind: "instant", at };
+	return Number.isNaN(at.getTime()) ? null : instantBound(at);
 }
 
-/** Normalise a query input to a bound (`Date` → instant). */
+/**
+ * Bound for an instant, applying the label rule: exactly 00:00:00.000 UTC is
+ * the calendar day of that UTC date; any other instant stays an instant.
+ */
+function instantBound(at: Date): LedgerDayBound {
+	if (at.getTime() % DAY_MS === 0) {
+		const day = at.toISOString().slice(0, 10);
+		if (isValidCalendarDay(day)) return { kind: "calendar-day", day };
+	}
+	return { kind: "instant", at };
+}
+
+/**
+ * Normalise a query input to a bound. A `Date` or an instant at exactly
+ * 00:00:00.000 UTC becomes that calendar day; any other one stays an instant.
+ */
 export function toLedgerDayBound(input: LedgerDayInput): LedgerDayBound {
-	return input instanceof Date ? { kind: "instant", at: input } : input;
+	if (input instanceof Date) return instantBound(input);
+	return input.kind === "instant" ? instantBound(input.at) : input;
 }
 
 /**

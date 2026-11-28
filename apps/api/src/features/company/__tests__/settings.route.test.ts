@@ -1,3 +1,5 @@
+import type { SQL } from "drizzle-orm";
+import { PgDialect } from "drizzle-orm/pg-core";
 import { Elysia } from "elysia";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { auth } from "../../auth/auth.config";
@@ -9,6 +11,7 @@ const dbMocks = vi.hoisted(() => {
 	const where = vi.fn(() => ({ returning }));
 	const set = vi.fn(() => ({ where }));
 	const update = vi.fn(() => ({ set }));
+	const execute = vi.fn();
 
 	return {
 		findFirst,
@@ -16,6 +19,7 @@ const dbMocks = vi.hoisted(() => {
 		where,
 		set,
 		update,
+		execute,
 	};
 });
 
@@ -27,6 +31,7 @@ vi.mock("@drenyra/persistence/client", () => ({
 			},
 		},
 		update: dbMocks.update,
+		execute: dbMocks.execute,
 	},
 }));
 
@@ -142,5 +147,105 @@ describe("companySettingsRoute", () => {
 			companyName: "ARKELYTHEX DEMO SAC",
 			companyRuc: "20100070970",
 		});
+	});
+
+	function patchSettings(body: Record<string, unknown>): Request {
+		return new Request(`http://localhost/api/company/${COMPANY_A}/settings`, {
+			method: "PATCH",
+			headers: {
+				...sessionHeaders(COMPANY_A),
+				"content-type": "application/json",
+			},
+			body: JSON.stringify(body),
+		});
+	}
+
+	function renderedQuery(callIndex: number): {
+		sql: string;
+		params: unknown[];
+	} {
+		const query = dbMocks.execute.mock.calls[callIndex]?.[0] as SQL;
+		return new PgDialect().sqlToQuery(query);
+	}
+
+	const storedCompany = {
+		settingsLanguage: "es",
+		settingsTimezone: "America/Santiago",
+		settingsCurrency: "PEN",
+		businessName: "ARKELYTHEX DEMO SAC",
+		ruc: "20100070970",
+		settingsAutoClosePeriod: true,
+		settingsShowAmountsInWords: false,
+	};
+
+	it.each(["Lima", " ", "America/Nowhere"])(
+		"rejects timezone %j unknown to Postgres with 400 INVALID_TIMEZONE and does not update",
+		async (timezone) => {
+			mockSession(COMPANY_A);
+			dbMocks.execute.mockResolvedValue([{ known: false }]);
+
+			const response = await createApp().handle(patchSettings({ timezone }));
+
+			expect(response.status).toBe(400);
+			expect(await response.json()).toEqual({
+				error:
+					"Unknown time zone. Use an IANA time zone name such as America/Lima.",
+				code: "INVALID_TIMEZONE",
+			});
+			expect(dbMocks.update).not.toHaveBeenCalled();
+		},
+	);
+
+	it("checks the trimmed timezone against pg_timezone_names and stores it", async () => {
+		mockSession(COMPANY_A);
+		dbMocks.execute.mockResolvedValue([{ known: true }]);
+		dbMocks.returning.mockResolvedValue([storedCompany]);
+
+		const response = await createApp().handle(
+			patchSettings({ timezone: " America/Santiago " }),
+		);
+
+		expect(response.status).toBe(200);
+		expect(await response.json()).toMatchObject({
+			timezone: "America/Santiago",
+		});
+		expect(dbMocks.execute).toHaveBeenCalledOnce();
+		const query = renderedQuery(0);
+		expect(query.sql).toContain("pg_timezone_names");
+		expect(query.params).toEqual(["America/Santiago"]);
+		expect(dbMocks.set).toHaveBeenCalledWith(
+			expect.objectContaining({ settingsTimezone: "America/Santiago" }),
+		);
+	});
+
+	it("still updates other settings without a timezone check", async () => {
+		mockSession(COMPANY_A);
+		dbMocks.returning.mockResolvedValue([storedCompany]);
+
+		const response = await createApp().handle(
+			patchSettings({ language: "es" }),
+		);
+
+		expect(response.status).toBe(200);
+		expect(dbMocks.execute).not.toHaveBeenCalled();
+		expect(dbMocks.set).toHaveBeenCalledWith(
+			expect.objectContaining({
+				settingsLanguage: "es",
+				settingsTimezone: undefined,
+			}),
+		);
+	});
+
+	it("still answers 404 when the company does not exist", async () => {
+		mockSession(COMPANY_A);
+		dbMocks.execute.mockResolvedValue([{ known: true }]);
+		dbMocks.returning.mockResolvedValue([]);
+
+		const response = await createApp().handle(
+			patchSettings({ timezone: "America/Lima" }),
+		);
+
+		expect(response.status).toBe(404);
+		expect(await response.json()).toEqual({ error: "Company not found" });
 	});
 });

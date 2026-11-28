@@ -139,6 +139,16 @@ export async function exportGeneralLedgerPdf(input: {
 		? parseLedgerDayBound(input.startDate)
 		: null;
 	const endBound = input.endDate ? parseLedgerDayBound(input.endDate) : null;
+	// A date that was sent but is not a real day (2026-02-30) must not widen
+	// the export to the whole history.
+	if ((input.startDate && !startBound) || (input.endDate && !endBound)) {
+		return {
+			ok: false,
+			status: 400,
+			message: "startDate/endDate invalid. Use YYYY-MM-DD.",
+			code: "INVALID_DATE",
+		};
+	}
 	const startDate = startBound ? ledgerDayToInstant(startBound) : null;
 	const endDate = endBound ? ledgerDayToInstant(endBound) : null;
 

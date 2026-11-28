@@ -81,7 +81,7 @@ export async function getTrialBalance(
 	companyId: string,
 	asOf: LedgerDayInput,
 ): Promise<TrialBalanceResult> {
-	const timeZone = companyFiscalTimeZone(companyId);
+	const timeZone = await companyFiscalTimeZone(companyId);
 	const debitSum = sql`COALESCE(SUM(CASE WHEN ${transactions.type} = 'EXPENSE' THEN ${transactions.totalAmount} END), 0)`;
 	const creditSum = sql`COALESCE(SUM(CASE WHEN ${transactions.type} = 'INCOME' THEN ${transactions.totalAmount} END), 0)`;
 

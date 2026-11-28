@@ -8,6 +8,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const mocks = vi.hoisted(() => ({
 	getTrialBalance: vi.fn(),
 	getGeneralLedger: vi.fn(),
+	getChartOfAccounts: vi.fn(),
+	logError: vi.fn(),
+}));
+
+vi.mock("../../../../lib/logger", () => ({
+	createLogger: () => ({ error: mocks.logError }),
 }));
 
 vi.mock("../../../../shared/plugins", () => ({
@@ -31,6 +37,10 @@ vi.mock("../../application/queries/get-general-ledger.query", () => ({
 	getGeneralLedger: mocks.getGeneralLedger,
 }));
 
+vi.mock("../../application/queries/get-chart-of-accounts.query", () => ({
+	getChartOfAccounts: mocks.getChartOfAccounts,
+}));
+
 const { ledgerModule } = await import("../../routes");
 
 describe("ledger routes — fiscal-day bounds", () => {
@@ -45,6 +55,8 @@ describe("ledger routes — fiscal-day bounds", () => {
 			accounts: [],
 		});
 		mocks.getGeneralLedger.mockReset().mockResolvedValue([]);
+		mocks.getChartOfAccounts.mockReset().mockResolvedValue([]);
+		mocks.logError.mockReset();
 	});
 
 	it("passes asOfDate=YYYY-MM-DD as a whole calendar day", async () => {
@@ -130,4 +142,52 @@ describe("ledger routes — fiscal-day bounds", () => {
 		expect(response.status).toBe(200);
 		expect(mocks.getGeneralLedger).toHaveBeenCalledOnce();
 	});
+
+	it("reads asOfDate at exactly 00:00:00.000Z (the echoed value) as that calendar day", async () => {
+		const response = await app.handle(
+			new Request(
+				"http://localhost/api/ledger/trial-balance?asOfDate=2026-03-31T00:00:00.000Z",
+			),
+		);
+
+		expect(response.status).toBe(200);
+		expect(mocks.getTrialBalance).toHaveBeenCalledExactlyOnceWith("cmp-1", {
+			kind: "calendar-day",
+			day: "2026-03-31",
+		});
+	});
+
+	it.each([
+		["/api/ledger/trial-balance?asOfDate=2026-03-31", "getTrialBalance"],
+		[
+			"/api/ledger/general?startDate=2026-03-01&endDate=2026-03-31",
+			"getGeneralLedger",
+		],
+		["/api/ledger/accounts", "getChartOfAccounts"],
+	] as const)(
+		"%s answers 500 with a fixed message, never the error text",
+		async (path, query) => {
+			const leak =
+				'invalid input syntax: SELECT "settings_timezone" FROM "companies"';
+			const failure = new Error(leak);
+			failure.name = "PostgresError";
+			mocks[query].mockRejectedValue(failure);
+
+			const response = await app.handle(new Request(`http://localhost${path}`));
+			const body = await response.text();
+
+			expect(response.status).toBe(500);
+			expect(JSON.parse(body)).toEqual({
+				success: false,
+				error: "Ledger query failed",
+				code: "INTERNAL_ERROR",
+			});
+			expect(body).not.toContain("SELECT");
+			expect(body).not.toContain("settings_timezone");
+			expect(mocks.logError).toHaveBeenCalledOnce();
+			const [fields] = mocks.logError.mock.calls[0] ?? [];
+			expect(fields).toMatchObject({ errorName: "PostgresError" });
+			expect(JSON.stringify(mocks.logError.mock.calls)).not.toContain("SELECT");
+		},
+	);
 });

@@ -1,7 +1,8 @@
 import { Elysia } from "elysia";
 import { z } from "zod";
+import { createLogger } from "../../lib/logger";
 import { companyScopeGuard } from "../../shared/plugins";
-import { fail, getErrorMessage, ok } from "../shared/api-response";
+import { fail, ok } from "../shared/api-response";
 import {
 	ledgerDayToInstant,
 	parseLedgerDayBound,
@@ -9,6 +10,26 @@ import {
 import { getChartOfAccounts } from "./application/queries/get-chart-of-accounts.query";
 import { getGeneralLedger } from "./application/queries/get-general-ledger.query";
 import { getTrialBalance } from "./application/queries/get-trial-balance.query";
+
+const logger = createLogger({ feature: "ledger", handler: "routes" });
+
+/**
+ * 500 answer for a failed ledger query. The body is a fixed message: driver
+ * errors carry SQL text and parameters, which must not reach the client. Only
+ * the error name is logged, for the same reason.
+ */
+function ledgerQueryFailed(
+	route: string,
+	error: unknown,
+	set: { status?: number | string },
+) {
+	logger.error(
+		{ route, errorName: error instanceof Error ? error.name : typeof error },
+		"Ledger query failed",
+	);
+	set.status = 500;
+	return fail("Ledger query failed", "INTERNAL_ERROR");
+}
 
 /**
  * ledgerModule const.
@@ -31,8 +52,7 @@ export const ledgerModule = new Elysia({ prefix: "/api/ledger" })
 				const result = await getChartOfAccounts(companyContext.companyId);
 				return ok(result);
 			} catch (error: unknown) {
-				set.status = 500;
-				return fail(getErrorMessage(error), "INTERNAL_ERROR");
+				return ledgerQueryFailed("/api/ledger/accounts", error, set);
 			}
 		},
 		{
@@ -74,8 +94,7 @@ export const ledgerModule = new Elysia({ prefix: "/api/ledger" })
 				);
 				return ok(result);
 			} catch (error: unknown) {
-				set.status = 500;
-				return fail(getErrorMessage(error), "INTERNAL_ERROR");
+				return ledgerQueryFailed("/api/ledger/general", error, set);
 			}
 		},
 		{
@@ -106,8 +125,7 @@ export const ledgerModule = new Elysia({ prefix: "/api/ledger" })
 				);
 				return ok(result);
 			} catch (error: unknown) {
-				set.status = 500;
-				return fail(getErrorMessage(error), "INTERNAL_ERROR");
+				return ledgerQueryFailed("/api/ledger/trial-balance", error, set);
 			}
 		},
 		{

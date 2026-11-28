@@ -16,6 +16,7 @@ vi.mock("@drenyra/persistence/client", () => ({
 		where: vi.fn().mockReturnThis(),
 		groupBy: vi.fn().mockReturnThis(),
 		orderBy: vi.fn().mockResolvedValue([]),
+		execute: vi.fn().mockResolvedValue([{ zone: "America/Lima" }]),
 	},
 }));
 
@@ -458,6 +459,33 @@ describe("LedgerService", () => {
 
 			expect(result.accounts).toHaveLength(1);
 			expect(result.accounts[0]?.name).toBe("IGV");
+		});
+	});
+
+	describe("fiscal zone lookup", () => {
+		// pg_timezone_names is a full function scan (~13-50 ms); it must run
+		// once per report, not once per use of the zone in the SQL.
+		it("resolves the company zone with a single query per trial balance", async () => {
+			(db.orderBy as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+			await LedgerService.getTrialBalance("cmp-1", {
+				kind: "instant",
+				at: new Date("2026-04-01T04:59:59.999Z"),
+			});
+
+			expect(db.execute).toHaveBeenCalledOnce();
+		});
+
+		it("resolves the company zone with a single query per general ledger", async () => {
+			(db.orderBy as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+			await LedgerService.getGeneralLedger(
+				"cmp-1",
+				{ kind: "instant", at: new Date("2026-03-01T10:00:00.000Z") },
+				{ kind: "instant", at: new Date("2026-04-01T04:59:59.999Z") },
+			);
+
+			expect(db.execute).toHaveBeenCalledOnce();
 		});
 	});
 });

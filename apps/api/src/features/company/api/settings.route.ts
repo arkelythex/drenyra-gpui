@@ -79,15 +79,23 @@ export const companySettingsRoute = new Elysia({
 			);
 			if (authFailure) return authFailure;
 
-			const updated = await updateCompanySettings({
+			const result = await updateCompanySettings({
 				companyId: params.companyId,
 				...body,
 			});
-			if (!updated) {
+			if (result.status === "invalid_timezone") {
+				set.status = 400;
+				return {
+					error:
+						"Unknown time zone. Use an IANA time zone name such as America/Lima.",
+					code: "INVALID_TIMEZONE",
+				};
+			}
+			if (result.status === "not_found") {
 				set.status = 404;
 				return { error: "Company not found" };
 			}
-			return updated;
+			return result.settings;
 		},
 		{
 			body: settingsBody,

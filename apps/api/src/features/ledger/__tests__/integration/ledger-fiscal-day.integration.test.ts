@@ -417,3 +417,105 @@ describeDb("ledger fiscal day and exact money (integration)", () => {
 		});
 	});
 });
+
+/**
+ * B1 — `companies.settings_timezone` is honoured only when it is exactly a
+ * name in `pg_timezone_names` after trimming; anything else falls back to
+ * America/Lima instead of failing the report.
+ *
+ * One income row at 2026-03-31T15:30Z: 1 Apr 00:30 in Tokyo, 31 Mar 10:30 in
+ * Lima, so a trial balance as of 31 Mar tells which zone was applied.
+ */
+describeDb("ledger fiscal zone fallback (integration)", () => {
+	const ownerId = randomUUID();
+	const zones = {
+		paddedTokyo: " Asia/Tokyo ",
+		blank: " ",
+		unknown: "Lima",
+		wrongCase: "asia/tokyo",
+	} as const;
+	const ids = {} as Record<keyof typeof zones, string>;
+
+	beforeAll(async () => {
+		await db.insert(users).values({
+			id: ownerId,
+			email: `t5e-zone-${ownerId}@example.test`,
+			password: "not-a-real-password",
+			name: "T5e zone fallback",
+		});
+		let ruc = Math.floor(Math.random() * 900_000_000);
+		for (const [name, timeZone] of Object.entries(zones)) {
+			const companyId = randomUUID();
+			const categoryId = randomUUID();
+			ids[name as keyof typeof zones] = companyId;
+			await db.insert(companies).values({
+				id: companyId,
+				ownerId,
+				ruc: `20${String(ruc++).padStart(9, "0")}`,
+				businessName: `T5e zone ${name}`,
+				settingsTimezone: timeZone,
+			});
+			await db
+				.insert(categories)
+				.values({ id: categoryId, companyId, name: "Ventas", type: "INCOME" });
+			await db
+				.insert(transactions)
+				.values(
+					income(
+						randomUUID(),
+						companyId,
+						categoryId,
+						new Date("2026-03-31T15:30:00.000Z"),
+						"1.00",
+					),
+				);
+		}
+	}, 60_000);
+
+	afterAll(async () => {
+		const companyIds = Object.values(ids);
+		await db
+			.delete(transactions)
+			.where(inArray(transactions.companyId, companyIds));
+		await db
+			.delete(categories)
+			.where(inArray(categories.companyId, companyIds));
+		await db.delete(companies).where(inArray(companies.id, companyIds));
+		await db.delete(users).where(inArray(users.id, [ownerId]));
+	});
+
+	function income(
+		id: string,
+		companyId: string,
+		categoryId: string,
+		issueDate: Date,
+		totalAmount: string,
+	) {
+		return {
+			id,
+			companyId,
+			categoryId,
+			type: "INCOME" as const,
+			documentType: "FACTURA" as const,
+			issueDate,
+			totalAmount,
+		};
+	}
+
+	it("trims a known zone name before using it", async () => {
+		const result = await getTrialBalance(ids.paddedTokyo, day("2026-03-31"));
+		expect(result.credits).toBe("0.00");
+	});
+
+	it.each(["blank", "unknown", "wrongCase"] as const)(
+		"falls back to America/Lima for the %s zone value instead of failing",
+		async (name) => {
+			await expect(
+				getTrialBalance(ids[name], day("2026-03-31")),
+			).resolves.toMatchObject({ credits: "1.00" });
+			await expect(
+				getGeneralLedger(ids[name], day("2026-03-31"), day("2026-03-31")),
+			).resolves.toHaveLength(1);
+		},
+	);
+});

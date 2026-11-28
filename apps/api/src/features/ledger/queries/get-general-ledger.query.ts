@@ -39,7 +39,7 @@ export async function getGeneralLedger(
 	start: LedgerDayInput,
 	end: LedgerDayInput,
 ): Promise<GeneralLedgerEntry[]> {
-	const timeZone = companyFiscalTimeZone(companyId);
+	const timeZone = await companyFiscalTimeZone(companyId);
 	const fiscalDay = transactionFiscalDay(timeZone);
 	const rows = await globalDb
 		.select({

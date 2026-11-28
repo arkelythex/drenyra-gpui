@@ -31,6 +31,29 @@ describe("parseLedgerDayBound", () => {
 		});
 	});
 
+	it("reads a date-time at exactly 00:00:00.000 UTC as that calendar day (echoed asOfDate)", () => {
+		expect(parseLedgerDayBound("2026-03-31T00:00:00.000Z")).toEqual({
+			kind: "calendar-day",
+			day: "2026-03-31",
+		});
+		expect(parseLedgerDayBound("2026-03-31T00:00:00Z")).toEqual({
+			kind: "calendar-day",
+			day: "2026-03-31",
+		});
+	});
+
+	it("keeps any other date-time as an instant", () => {
+		expect(parseLedgerDayBound("2026-03-31T00:00:00.001Z")).toEqual({
+			kind: "instant",
+			at: new Date("2026-03-31T00:00:00.001Z"),
+		});
+		// Lima midnight is 05:00 UTC: an instant, not a UTC-midnight label.
+		expect(parseLedgerDayBound("2026-03-31T00:00:00-05:00")).toEqual({
+			kind: "instant",
+			at: new Date("2026-03-31T05:00:00.000Z"),
+		});
+	});
+
 	it("rejects values that are not dates", () => {
 		expect(parseLedgerDayBound("invalid")).toBeNull();
 		expect(parseLedgerDayBound("not-a-date")).toBeNull();
@@ -45,6 +68,22 @@ describe("ledgerDayToInstant", () => {
 				day: "2026-03-31",
 			}).toISOString(),
 		).toBe("2026-03-31T00:00:00.000Z");
+	});
+
+	it("reads a Date at exactly 00:00:00.000 UTC as that calendar day (new Date('YYYY-MM-DD'))", () => {
+		expect(toLedgerDayBound(new Date("2026-03-31"))).toEqual({
+			kind: "calendar-day",
+			day: "2026-03-31",
+		});
+		expect(
+			toLedgerDayBound({
+				kind: "instant",
+				at: new Date("2026-03-31T00:00:00.000Z"),
+			}),
+		).toEqual({ kind: "calendar-day", day: "2026-03-31" });
+		expect(ledgerDayToInstant(new Date("2026-03-31")).toISOString()).toBe(
+			"2026-03-31T00:00:00.000Z",
+		);
 	});
 
 	it("returns an instant unchanged and treats a bare Date as an instant", () => {

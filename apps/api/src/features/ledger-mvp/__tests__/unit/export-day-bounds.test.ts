@@ -81,5 +81,20 @@ describe.each(exporters)(
 			});
 			expect(mocks.getGeneralLedger).not.toHaveBeenCalled();
 		});
+
+		it("rejects a calendar day that does not exist with 400 INVALID_DATE", async () => {
+			for (const input of [
+				{ startDate: "2026-02-30", endDate: "2026-03-31" },
+				{ startDate: "2026-03-01", endDate: "2026-02-30" },
+			]) {
+				const result = await exporter({ companyId: "cmp-1", ...input });
+				expect(result).toMatchObject({
+					ok: false,
+					status: 400,
+					code: "INVALID_DATE",
+				});
+			}
+			expect(mocks.getGeneralLedger).not.toHaveBeenCalled();
+		});
 	},
 );
