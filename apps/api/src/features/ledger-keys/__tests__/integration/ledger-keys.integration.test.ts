@@ -3,9 +3,12 @@
  * round trip against Postgres.
  *
  * Proves, with no mocks: a key issued through the service is stored hashed;
- * it authenticates a ledger GET as its own company only; another company's
- * `x-company-id` is refused; list never shows the key; once revoked through
- * the route, the same key is refused (401).
+ * it authenticates a ledger GET as its own company only; `key-identity`
+ * answers company A's id, RUC and name; the session gets 403 there; another
+ * company's `x-company-id` is refused; list never shows the key; once revoked through
+ * the route, the same key is refused (401). The 10-key cap holds under
+ * concurrency (per user and company advisory lock), and issuance waits for, or
+ * gives up on (409 LEDGER_KEY_ISSUE_BUSY), a lock held by another transaction.
  *
  * Runs only with RUN_DB_TESTS=1 and only against a DISPOSABLE database:
  *
@@ -44,6 +47,10 @@ import { READ_ONLY_LEDGER_KEY_PREFIX } from "../../../auth/lib/read-only-ledger-
 import { ledgerModule } from "../../../ledger/routes";
 import { ledgerKeysRoutes } from "../../ledger-keys.routes";
 import { issueLedgerKey } from "../../ledger-keys.service";
+import {
+	LEDGER_KEY_ISSUE_LOCK_TIMEOUT_MS,
+	ledgerKeyIssueLockId,
+} from "../../ledger-keys-issue-lock";
 
 const describeDb = process.env.RUN_DB_TESTS === "1" ? describe : describe.skip;
 
@@ -58,6 +65,8 @@ type Fixture = {
 	authUserId: string;
 	companyA: string;
 	companyB: string;
+	rucA: string;
+	businessNameA: string;
 	categoryA: string;
 	categoryB: string;
 	sessionId: string;
@@ -100,10 +109,12 @@ async function createFixture(): Promise<Fixture> {
 
 	// Raw SQL on purpose: drizzle inserts every schema column, and the
 	// baseline `companies` table lacks the newer settings_* columns (drift).
+	const rucA = randomRuc();
+	const businessNameA = `Empresa A ${suffix}`;
 	const companyRows = await db.execute(sql`
 		insert into companies (owner_id, ruc, business_name)
 		values
-			(${ownerLegacyUserId}, ${randomRuc()}, ${`Empresa A ${suffix}`}),
+			(${ownerLegacyUserId}, ${rucA}, ${businessNameA}),
 			(${ownerLegacyUserId}, ${randomRuc()}, ${`Empresa B ${suffix}`})
 		returning id
 	`);
@@ -157,6 +168,8 @@ async function createFixture(): Promise<Fixture> {
 		authUserId,
 		companyA: companyA.id,
 		companyB: companyB.id,
+		rucA,
+		businessNameA,
 		categoryA: categoryA.id,
 		categoryB: categoryB.id,
 		sessionId,
@@ -244,6 +257,33 @@ describeDb("read-only ledger keys (DB integration, real plugin)", () => {
 		expect(names.some((name) => name.startsWith("Ventas A"))).toBe(true);
 		expect(names.some((name) => name.startsWith("Ventas B"))).toBe(false);
 
+		// key-identity names company A, read from the companies table.
+		const identity = await app.handle(
+			new Request("http://localhost/api/ledger/key-identity", {
+				headers: { authorization: `Bearer ${plaintext}` },
+			}),
+		);
+		expect(identity.status).toBe(200);
+		expect(await identity.json()).toEqual({
+			success: true,
+			data: {
+				companyId: fixture.companyA,
+				ruc: fixture.rucA,
+				businessName: fixture.businessNameA,
+			},
+		});
+
+		// Only key callers get an identity: the session is refused.
+		const sessionIdentity = await app.handle(
+			new Request("http://localhost/api/ledger/key-identity", {
+				headers: { cookie: fixture.cookie },
+			}),
+		);
+		expect(sessionIdentity.status).toBe(403);
+		expect(((await sessionIdentity.json()) as { code: string }).code).toBe(
+			"KEY_IDENTITY_REQUIRES_API_KEY",
+		);
+
 		// Another company's tenant header is refused.
 		const foreign = await trialBalance(plaintext, {
 			"x-company-id": fixture.companyB,
@@ -297,5 +337,131 @@ describeDb("read-only ledger keys (DB integration, real plugin)", () => {
 		expect(((await revoked.json()) as { code: string }).code).toBe(
 			"API_KEY_INVALID",
 		);
+	});
+
+	describe("issue cap under concurrency (advisory lock per user and company)", () => {
+		async function deleteAllKeys(userId: string) {
+			await db.delete(authApiKeys).where(eq(authApiKeys.referenceId, userId));
+		}
+
+		async function activeKeyCount(userId: string, companyId: string) {
+			const rows = await db.execute(sql`
+				select count(*)::int as count from auth_api_keys
+				where reference_id = ${userId}
+					and enabled = true
+					and (expires_at is null or expires_at > now())
+					and metadata like ${`%${companyId}%`}`);
+			return Number((Array.from(rows)[0] as { count: number }).count);
+		}
+
+		function issueOverHttp(cookie: string, companyId: string, name: string) {
+			return app.handle(
+				new Request("http://localhost/api/ledger-keys", {
+					method: "POST",
+					headers: { cookie, "content-type": "application/json" },
+					body: JSON.stringify({ companyId, name }),
+				}),
+			);
+		}
+
+		it("lets exactly one of 6 parallel issues through when 9 keys are active", async () => {
+			if (!fixture) throw new Error("fixture missing");
+			const { authUserId, companyA, cookie } = fixture;
+			await deleteAllKeys(authUserId);
+			try {
+				for (let index = 0; index < 9; index++) {
+					const issued = await issueLedgerKey({
+						userId: authUserId,
+						companyId: companyA,
+						name: `existing ${index}`,
+						expiresInDays: 1,
+						sessionHeaders: new Headers({ cookie }),
+					});
+					expect(issued.ok).toBe(true);
+				}
+				expect(await activeKeyCount(authUserId, companyA)).toBe(9);
+
+				const responses = await Promise.all(
+					Array.from({ length: 6 }, (_, index) =>
+						issueOverHttp(cookie, companyA, `parallel ${index}`),
+					),
+				);
+				const statuses = responses.map((response) => response.status).sort();
+				expect(statuses).toEqual([201, 409, 409, 409, 409, 409]);
+				for (const response of responses) {
+					if (response.status !== 409) continue;
+					expect(((await response.json()) as { code: string }).code).toBe(
+						"LEDGER_KEY_LIMIT_REACHED",
+					);
+				}
+				expect(await activeKeyCount(authUserId, companyA)).toBe(10);
+			} finally {
+				await deleteAllKeys(authUserId);
+			}
+		}, 30_000);
+
+		it("waits while another transaction holds the (user, company) advisory lock", async () => {
+			if (!fixture) throw new Error("fixture missing");
+			const { authUserId, companyA, cookie } = fixture;
+			await deleteAllKeys(authUserId);
+			const lockId = ledgerKeyIssueLockId(authUserId, companyA).toString();
+			let settled = false;
+			let pending: ReturnType<typeof issueLedgerKey> | null = null;
+			try {
+				await db.transaction(async (tx) => {
+					await tx.execute(
+						sql`select pg_advisory_xact_lock(${lockId}::bigint)`,
+					);
+					pending = issueLedgerKey({
+						userId: authUserId,
+						companyId: companyA,
+						name: "waits for the lock",
+						expiresInDays: 1,
+						sessionHeaders: new Headers({ cookie }),
+					});
+					void pending.then(() => {
+						settled = true;
+					});
+					await new Promise((resolve) => setTimeout(resolve, 500));
+					expect(settled).toBe(false);
+					expect(await activeKeyCount(authUserId, companyA)).toBe(0);
+				});
+				const issued = await (pending as ReturnType<
+					typeof issueLedgerKey
+				> | null);
+				expect(issued?.ok).toBe(true);
+				expect(await activeKeyCount(authUserId, companyA)).toBe(1);
+			} finally {
+				await deleteAllKeys(authUserId);
+			}
+		}, 30_000);
+
+		it("gives up after the lock timeout with 409 LEDGER_KEY_ISSUE_BUSY and creates nothing", async () => {
+			if (!fixture) throw new Error("fixture missing");
+			const { authUserId, companyA, cookie } = fixture;
+			await deleteAllKeys(authUserId);
+			const lockId = ledgerKeyIssueLockId(authUserId, companyA).toString();
+			try {
+				await db.transaction(async (tx) => {
+					await tx.execute(
+						sql`select pg_advisory_xact_lock(${lockId}::bigint)`,
+					);
+					const started = Date.now();
+					const response = await issueOverHttp(cookie, companyA, "busy");
+					expect(Date.now() - started).toBeGreaterThanOrEqual(
+						LEDGER_KEY_ISSUE_LOCK_TIMEOUT_MS - 100,
+					);
+					expect(response.status).toBe(409);
+					expect(await response.json()).toEqual({
+						success: false,
+						error: "Another ledger key is being issued for this company; retry",
+						code: "LEDGER_KEY_ISSUE_BUSY",
+					});
+				});
+				expect(await activeKeyCount(authUserId, companyA)).toBe(0);
+			} finally {
+				await deleteAllKeys(authUserId);
+			}
+		}, 30_000);
 	});
 });

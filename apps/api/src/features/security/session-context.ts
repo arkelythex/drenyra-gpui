@@ -63,14 +63,26 @@ export function toUnifiedActor(ctx: SessionContext): UnifiedActor {
  * };
  * ```
  */
+type SessionContextRefusal<Status extends number> = {
+	ok: false;
+	status: Status;
+	code: string;
+	error: string;
+	/** Seconds for `Retry-After`; only on a rate-limited or unverifiable key. */
+	retryAfterSeconds?: number;
+};
+
 export type SessionContextResult =
 	| { ok: true; context: SessionContext }
-	| {
-			ok: false;
-			status: 401 | 403;
-			code: string;
-			error: string;
-	  };
+	| SessionContextRefusal<401 | 403>;
+
+/**
+ * Result when the route opts in to read-only ledger keys: a key may also be
+ * refused with 429 (rate limited) or 503 (verification unavailable).
+ */
+export type ReadOnlyLedgerKeySessionContextResult =
+	| SessionContextResult
+	| SessionContextRefusal<429 | 503>;
 
 interface ResolveSessionContextInput {
 	headers: Record<string, unknown>;
@@ -84,6 +96,10 @@ interface ResolveSessionContextInput {
 	allowReadOnlyLedgerKey?: boolean | undefined;
 	/** HTTP method of the request (read-only keys require GET or HEAD). */
 	method?: string | undefined;
+	/** Registered route, for the read-only key refusal log only. */
+	route?: string | undefined;
+	/** Requested company ids checked only for read-only key callers. */
+	readOnlyLedgerKeyRequestedCompanyIds?: readonly unknown[] | undefined;
 }
 
 function shouldRequireSession(requireSessionOverride?: boolean): boolean {
@@ -133,9 +149,17 @@ function resolveAllowHeaderFallback(
  * });
  * ```
  */
+export function resolveSessionContext(
+	input: ResolveSessionContextInput & {
+		allowReadOnlyLedgerKey?: false | undefined;
+	},
+): Promise<SessionContextResult>;
+export function resolveSessionContext(
+	input: ResolveSessionContextInput,
+): Promise<ReadOnlyLedgerKeySessionContextResult>;
 export async function resolveSessionContext(
 	input: ResolveSessionContextInput,
-): Promise<SessionContextResult> {
+): Promise<ReadOnlyLedgerKeySessionContextResult> {
 	const requireSession = shouldRequireSession(input.requireSession);
 	const allowHeaderFallback = resolveAllowHeaderFallback(input, requireSession);
 	const caller = await resolveAuthenticatedCaller({
@@ -149,6 +173,9 @@ export async function resolveSessionContext(
 		requireRole: true,
 		allowReadOnlyLedgerKey: input.allowReadOnlyLedgerKey,
 		method: input.method,
+		route: input.route,
+		readOnlyLedgerKeyRequestedCompanyIds:
+			input.readOnlyLedgerKeyRequestedCompanyIds,
 	});
 
 	if (caller.ok === false) {
@@ -157,6 +184,9 @@ export async function resolveSessionContext(
 			status: caller.status,
 			code: caller.code,
 			error: caller.error,
+			...(caller.retryAfterSeconds === undefined
+				? {}
+				: { retryAfterSeconds: caller.retryAfterSeconds }),
 		};
 	}
 

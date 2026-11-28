@@ -18,6 +18,8 @@
  */
 
 import type { Elysia } from "elysia";
+import { fail } from "../../features/shared/api-response";
+import { ErrorCodes } from "../error-codes";
 
 export interface RateLimiterOptions {
 	/** Time window in milliseconds (default: 60_000 = 1 min) */
@@ -40,10 +42,12 @@ interface RateLimitEntry {
 const stores = new Map<string, Map<string, RateLimitEntry>>();
 
 function getStore(prefix: string): Map<string, RateLimitEntry> {
-	if (!stores.has(prefix)) {
-		stores.set(prefix, new Map());
+	let store = stores.get(prefix);
+	if (!store) {
+		store = new Map();
+		stores.set(prefix, store);
 	}
-	return stores.get(prefix)!;
+	return store;
 }
 
 function cleanup() {
@@ -75,6 +79,11 @@ function ensureCleanup() {
  *
  * Tracks requests by company ID (from companyContext) or user identity
  * (from authorization header) using a sliding window algorithm.
+ *
+ * A request over the limit is answered here with `statusCode` (429), the
+ * standard error envelope (`{ success: false, error, code: "RATE_LIMITED" }`)
+ * and `Retry-After` (seconds until the window resets). It is returned, not
+ * thrown: a thrown error would reach `globalErrorHandler` and become a 500.
  */
 export function rateLimiter(options: RateLimiterOptions = {}) {
 	const {
@@ -126,7 +135,10 @@ export function rateLimiter(options: RateLimiterOptions = {}) {
 
 			if (entry.count > max) {
 				set.status = statusCode;
-				throw new Error(message);
+				(set.headers as Record<string, string | number>)["Retry-After"] =
+					String(Math.max(1, resetSeconds));
+				return fail(message, ErrorCodes.RATE_LIMITED);
 			}
+			return undefined;
 		});
 }

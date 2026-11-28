@@ -4,7 +4,9 @@ import {
 	resolveSessionIdentityFromHeaders,
 } from "../auth/handlers/session-identity";
 import {
+	logReadOnlyLedgerKeyRefusal,
 	READ_ONLY_LEDGER_KEY_ROLE,
+	type ReadOnlyLedgerKeyRefusal,
 	readPresentedLedgerKey,
 	verifyReadOnlyLedgerKey,
 } from "./read-only-ledger-key";
@@ -38,17 +40,34 @@ export interface AuthenticatedCaller {
 	apiKeyId?: string;
 }
 
+type CallerRefusal<Status extends number> = {
+	ok: false;
+	status: Status;
+	code: string;
+	error: string;
+	/**
+	 * Seconds for `Retry-After`; only on a rate-limited key or when key
+	 * verification is unavailable.
+	 */
+	retryAfterSeconds?: number;
+};
+
+/** Result for callers that do not opt in to read-only ledger keys. */
 export type AuthenticatedCallerResult =
 	| {
 			ok: true;
 			caller: AuthenticatedCaller;
 	  }
-	| {
-			ok: false;
-			status: 401 | 403;
-			code: string;
-			error: string;
-	  };
+	| CallerRefusal<401 | 403>;
+
+/**
+ * Result when the route opts in to read-only ledger keys: besides 401/403, a
+ * key may be refused with 429 (rate limited) or 503 (verification
+ * unavailable). Only the key branch produces those two statuses.
+ */
+export type ReadOnlyLedgerKeyCallerResult =
+	| AuthenticatedCallerResult
+	| CallerRefusal<429 | 503>;
 
 export interface ResolveAuthenticatedCallerInput {
 	headers: HeaderContainer;
@@ -68,6 +87,18 @@ export interface ResolveAuthenticatedCallerInput {
 	allowReadOnlyLedgerKey?: boolean | undefined;
 	/** HTTP method of the request; read-only keys require GET or HEAD. */
 	method?: string | undefined;
+	/**
+	 * Route of the request (the registered path, e.g. `/api/ledger/accounts`),
+	 * used only in the read-only key refusal log.
+	 */
+	route?: string | undefined;
+	/**
+	 * Company ids the request asks for (e.g. `?companyId=`), checked only for
+	 * a read-only ledger key caller: any value other than the key's company is
+	 * refused with 403 `API_KEY_TENANT_MISMATCH`. Sessions, machine callers and
+	 * header fallback never read it, so their behavior does not change.
+	 */
+	readOnlyLedgerKeyRequestedCompanyIds?: readonly unknown[] | undefined;
 }
 
 interface SignedMachineCaller {
@@ -384,18 +415,53 @@ function resolveHeaderFallbackCaller(
 	};
 }
 
+function apiKeyTenantMismatch(apiKeyId?: string): ReadOnlyLedgerKeyRefusal {
+	return {
+		ok: false,
+		status: 403,
+		code: "API_KEY_TENANT_MISMATCH",
+		error: "API key company does not match the requested company",
+		...(apiKeyId === undefined ? {} : { apiKeyId }),
+	};
+}
+
+/**
+ * Logs a refused key request once and returns the refusal as the caller
+ * result, without the log-only fields (key id, error name and code).
+ */
+function refuseReadOnlyLedgerKey(
+	input: ResolveAuthenticatedCallerInput,
+	refusal: ReadOnlyLedgerKeyRefusal,
+): ReadOnlyLedgerKeyCallerResult {
+	logReadOnlyLedgerKeyRefusal({
+		refusal,
+		route: input.route,
+		method: input.method,
+	});
+	return {
+		ok: false,
+		status: refusal.status,
+		code: refusal.code,
+		error: refusal.error,
+		...(refusal.retryAfterSeconds === undefined
+			? {}
+			: { retryAfterSeconds: refusal.retryAfterSeconds }),
+	};
+}
+
 /**
  * Resolves a read-only ledger key caller. The key alone decides identity and
  * tenant: identity headers are ignored, and a tenant assertion
- * (`x-company-id` / `x-active-company-id`) or requested company must equal
- * the key's company.
+ * (`x-company-id` / `x-active-company-id`) or requested company (argument or
+ * `?companyId=`) must equal the key's company.
  */
 async function resolveReadOnlyLedgerKeyCaller(input: {
 	key: string;
 	method: string | undefined;
 	assertedCompanyId: string | null;
 	requestedCompanyId: string | undefined;
-}): Promise<AuthenticatedCallerResult> {
+	requestedCompanyIds: readonly unknown[];
+}): Promise<ReadOnlyLedgerKeyCallerResult | ReadOnlyLedgerKeyRefusal> {
 	const verified = await verifyReadOnlyLedgerKey({
 		key: input.key,
 		method: input.method,
@@ -406,15 +472,13 @@ async function resolveReadOnlyLedgerKeyCaller(input: {
 		input.assertedCompanyId !== null &&
 		input.assertedCompanyId !== verified.companyId;
 	const foreignRequest =
-		input.requestedCompanyId !== undefined &&
-		input.requestedCompanyId !== verified.companyId;
+		(input.requestedCompanyId !== undefined &&
+			input.requestedCompanyId !== verified.companyId) ||
+		input.requestedCompanyIds.some(
+			(requested) => requested !== verified.companyId,
+		);
 	if (foreignAssertion || foreignRequest) {
-		return {
-			ok: false,
-			status: 403,
-			code: "API_KEY_TENANT_MISMATCH",
-			error: "API key company does not match the requested company",
-		};
+		return apiKeyTenantMismatch(verified.apiKeyId);
 	}
 
 	return {
@@ -441,16 +505,19 @@ async function resolveReadOnlyLedgerKeyCaller(input: {
 async function resolveOptedInReadOnlyLedgerKey(
 	input: ResolveAuthenticatedCallerInput,
 	assertedCompanyId: string | null,
-): Promise<AuthenticatedCallerResult | null> {
+): Promise<ReadOnlyLedgerKeyCallerResult | null> {
 	if (!input.allowReadOnlyLedgerKey) return null;
 	const presentedKey = readPresentedLedgerKey(input.headers);
 	if (presentedKey === null) return null;
-	return resolveReadOnlyLedgerKeyCaller({
+	const result = await resolveReadOnlyLedgerKeyCaller({
 		key: presentedKey,
 		method: input.method,
 		assertedCompanyId,
 		requestedCompanyId: input.requestedCompanyId,
+		requestedCompanyIds: input.readOnlyLedgerKeyRequestedCompanyIds ?? [],
 	});
+	if (result.ok) return result;
+	return refuseReadOnlyLedgerKey(input, result);
 }
 
 /**
@@ -463,20 +530,53 @@ function headerIdentityAllowed(allowHeaderFallback?: boolean): boolean {
 	return (process.env.NODE_ENV ?? "").toLowerCase() !== "production";
 }
 
+/**
+ * Refusal for conflicting `x-company-id` / `x-active-company-id`. The two
+ * headers can never both be a key's company, so a key on an opted-in route is
+ * refused as a tenant mismatch (fail closed, before the key is looked up)
+ * instead of the generic conflict, which header-fallback routes would pass
+ * through without context.
+ */
+function tenantConflictRefusal(
+	input: ResolveAuthenticatedCallerInput,
+	conflict: { status: 403; code: string; error: string },
+): ReadOnlyLedgerKeyCallerResult {
+	if (
+		input.allowReadOnlyLedgerKey &&
+		readPresentedLedgerKey(input.headers) !== null
+	) {
+		return refuseReadOnlyLedgerKey(input, apiKeyTenantMismatch());
+	}
+	return {
+		ok: false,
+		status: conflict.status,
+		code: conflict.code,
+		error: conflict.error,
+	};
+}
+
+/**
+ * Resolves the caller. Without `allowReadOnlyLedgerKey` the result is a
+ * session, machine or header-fallback caller, or a 401/403 refusal; with it,
+ * a read-only ledger key may also be refused with 429 or 503.
+ */
+export function resolveAuthenticatedCaller(
+	input: ResolveAuthenticatedCallerInput & {
+		allowReadOnlyLedgerKey?: false | undefined;
+	},
+): Promise<AuthenticatedCallerResult>;
+export function resolveAuthenticatedCaller(
+	input: ResolveAuthenticatedCallerInput,
+): Promise<ReadOnlyLedgerKeyCallerResult>;
 export async function resolveAuthenticatedCaller(
 	input: ResolveAuthenticatedCallerInput,
-): Promise<AuthenticatedCallerResult> {
+): Promise<ReadOnlyLedgerKeyCallerResult> {
 	const requireSession = shouldRequireSession(input.requireSession);
 	const requireTenant = input.requireTenant ?? true;
 	const requireRole = input.requireRole ?? true;
 	const tenantAssertion = resolveTenantAssertion(input.headers);
 	if (tenantAssertion.ok === false) {
-		return {
-			ok: false,
-			status: tenantAssertion.status,
-			code: tenantAssertion.code,
-			error: tenantAssertion.error,
-		};
+		return tenantConflictRefusal(input, tenantAssertion);
 	}
 
 	const assertedCompanyId = tenantAssertion.assertion.companyId;

@@ -33,16 +33,17 @@
  * Modules that serve ledger reads opt in with `allowReadOnlyLedgerKey: true`.
  * A `drn_ro_…` key is then accepted on GET/HEAD for its own company only,
  * and `companyContext.readOnly` is `true`. A refused key always fails closed
- * (401/403, or 429 when rate limited), even with `allowHeaderFallback`.
+ * (401/403, 429 with `Retry-After` when rate limited, or 503 with
+ * `Retry-After` when the key cannot be verified right now), even with
+ * `allowHeaderFallback`. A `?companyId=` other than the key's company is
+ * refused with 403 `API_KEY_TENANT_MISMATCH`; for sessions and header
+ * fallback the query is not read here (unchanged behavior).
  *
  * @module company-scope-guard
  */
 
 import type { Elysia } from "elysia";
-import {
-	isReadOnlyLedgerKeyRefusal,
-	READ_ONLY_LEDGER_KEY_RATE_LIMITED,
-} from "../../features/security/read-only-ledger-key";
+import { isReadOnlyLedgerKeyRefusal } from "../../features/security/read-only-ledger-key";
 import {
 	resolveSessionContext,
 	type SessionContext,
@@ -91,15 +92,39 @@ export interface CompanyScopeGuardOptions {
 	 * requests of this module, scoped to the key's company. Writes with a key
 	 * are refused with 403. Only for modules whose GET routes are ledger reads.
 	 *
+	 * For a key caller, `?companyId=` must be the key's company (403
+	 * `API_KEY_TENANT_MISMATCH` otherwise). A request body is not read: a key
+	 * request is GET/HEAD (no body), and any other method is refused with
+	 * `API_KEY_READ_ONLY` before tenant checks.
+	 *
 	 * Default: `false` (keys are ignored).
 	 */
 	allowReadOnlyLedgerKey?: boolean;
 }
 
-function refusalStatus(result: { status: 401 | 403; code: string }) {
-	return result.code === READ_ONLY_LEDGER_KEY_RATE_LIMITED
-		? (429 as const)
-		: result.status;
+/**
+ * Sends `Retry-After` when the refusal carries one (rate-limited key, or key
+ * verification unavailable).
+ */
+function applyRetryAfter(
+	headers: Record<string, string | number>,
+	result: { retryAfterSeconds?: number },
+): void {
+	if (result.retryAfterSeconds !== undefined) {
+		headers["retry-after"] = String(result.retryAfterSeconds);
+	}
+}
+
+/**
+ * Every `companyId` value in the query (`?companyId=a&companyId=b` gives
+ * both), or none when the parameter is absent. Checked only for read-only
+ * ledger key callers.
+ */
+function requestedCompanyIdsOf(query: unknown): unknown[] {
+	if (!query || typeof query !== "object") return [];
+	if (!Object.hasOwn(query, "companyId")) return [];
+	const value = (query as { companyId?: unknown }).companyId;
+	return Array.isArray(value) ? value : [value];
 }
 
 /**
@@ -150,67 +175,128 @@ export function companyScopeGuard(options: CompanyScopeGuardOptions = {}) {
 	const { allowHeaderFallback = false, allowReadOnlyLedgerKey = false } =
 		options;
 
-	return (app: Elysia) =>
-		app.derive(async ({ headers, request, status }) => {
-			/**
-			 * During Phase 3 migration (allowHeaderFallback: true), do not
-			 * require a full session — the guard will first attempt session
-			 * resolution and fall back to header-based identity.
-			 *
-			 * When allowHeaderFallback: false (Phase 4+), session is required.
-			 *
-			 * Note: resolveSessionContext internally forces allowHeaderFallback
-			 * to false when requireSession is true, so we MUST pass
-			 * requireSession=false when using the fallback.
-			 */
-			const requireSession = !allowHeaderFallback;
+	type GuardRequest = {
+		headers: Record<string, string | undefined>;
+		method: string;
+		set: { headers: unknown };
+		route?: string;
+		requestedCompanyIds?: unknown[];
+	};
+	type GuardOutcome =
+		| { refused: false; companyContext: CompanyContext }
+		| {
+				refused: true;
+				status: 401 | 403 | 429 | 503;
+				body: ReturnType<typeof fail>;
+		  };
 
-			try {
-				const result = await resolveSessionContext({
-					headers: headers as Record<string, unknown>,
-					requireSession,
-					allowHeaderFallback,
-					allowReadOnlyLedgerKey,
-					method: request.method,
-				});
+	const passThrough = (): GuardOutcome => ({
+		refused: false,
+		companyContext: undefined as unknown as CompanyContext,
+	});
 
-				if (!result.ok) {
-					/**
-					 * During migration (allowHeaderFallback: true), we log the
-					 * rejection but do NOT fail-closed — this preserves backward
-					 * compatibility for features that want to handle their own
-					 * company scoping while the guard is being adopted.
-					 *
-					 * In Phase 4 (allowHeaderFallback: false), we fail closed.
-					 */
-					if (passesThroughWithoutContext(allowHeaderFallback, result.code)) {
-						// Pass through — no company context available.
-						// The handler can still use its existing scoping mechanism.
-						return { companyContext: undefined as unknown as CompanyContext };
-					}
+	const resolveGuard = async (input: GuardRequest): Promise<GuardOutcome> => {
+		/**
+		 * During Phase 3 migration (allowHeaderFallback: true), do not
+		 * require a full session — the guard will first attempt session
+		 * resolution and fall back to header-based identity.
+		 *
+		 * When allowHeaderFallback: false (Phase 4+), session is required.
+		 *
+		 * Note: resolveSessionContext internally forces allowHeaderFallback
+		 * to false when requireSession is true, so we MUST pass
+		 * requireSession=false when using the fallback.
+		 */
+		const requireSession = !allowHeaderFallback;
 
-					// Answer with the guard's status here; a thrown error would
-					// reach the app's error handler and become a 500.
-					return status(refusalStatus(result), fail(result.error, result.code));
-				}
+		try {
+			const result = await resolveSessionContext({
+				headers: input.headers as Record<string, unknown>,
+				requireSession,
+				allowHeaderFallback,
+				allowReadOnlyLedgerKey,
+				method: input.method,
+				route: input.route,
+				readOnlyLedgerKeyRequestedCompanyIds: input.requestedCompanyIds,
+			});
 
-				return { companyContext: toCompanyContext(result.context) };
-			} catch (error) {
+			if (!result.ok) {
 				/**
-				 * If resolveSessionContext throws (e.g. DB is unavailable in
-				 * test environments or session validation fails unexpectedly),
-				 * behave according to the fallback mode.
+				 * During migration (allowHeaderFallback: true), we log the
+				 * rejection but do NOT fail-closed — this preserves backward
+				 * compatibility for features that want to handle their own
+				 * company scoping while the guard is being adopted.
 				 *
-				 * With allowHeaderFallback: true, gracefully degrade — the
-				 * handler can continue with its existing scoping mechanism.
-				 *
-				 * With allowHeaderFallback: false, re-throw to fail closed.
+				 * In Phase 4 (allowHeaderFallback: false), we fail closed.
 				 */
-				if (allowHeaderFallback) {
-					return { companyContext: undefined as unknown as CompanyContext };
+				if (passesThroughWithoutContext(allowHeaderFallback, result.code)) {
+					// Pass through — no company context available.
+					// The handler can still use its existing scoping mechanism.
+					return passThrough();
 				}
-				throw error;
+
+				applyRetryAfter(
+					input.set.headers as Record<string, string | number>,
+					result,
+				);
+				return {
+					refused: true,
+					status: result.status,
+					body: fail(result.error, result.code),
+				};
 			}
+
+			return {
+				refused: false,
+				companyContext: toCompanyContext(result.context),
+			};
+		} catch (error) {
+			/**
+			 * If resolveSessionContext throws (e.g. DB is unavailable in
+			 * test environments or session validation fails unexpectedly),
+			 * behave according to the fallback mode.
+			 *
+			 * With allowHeaderFallback: true, gracefully degrade — the
+			 * handler can continue with its existing scoping mechanism.
+			 *
+			 * With allowHeaderFallback: false, re-throw to fail closed.
+			 */
+			if (allowHeaderFallback) {
+				return passThrough();
+			}
+			throw error;
+		}
+	};
+
+	// Two derive functions on purpose: Elysia infers from the parameters a
+	// derive reads which request parts to parse, so modules that do not opt
+	// in to keys keep exactly the previous inference (no `query`, no `route`).
+	// A refusal is answered with `status()` here; a thrown error would reach
+	// the app's error handler and become a 500.
+	if (allowReadOnlyLedgerKey) {
+		return (app: Elysia) =>
+			app.derive(async ({ headers, request, set, status, query, route }) => {
+				const outcome = await resolveGuard({
+					headers,
+					method: request.method,
+					set,
+					route,
+					requestedCompanyIds: requestedCompanyIdsOf(query),
+				});
+				if (outcome.refused) return status(outcome.status, outcome.body);
+				return { companyContext: outcome.companyContext };
+			});
+	}
+
+	return (app: Elysia) =>
+		app.derive(async ({ headers, request, set, status }) => {
+			const outcome = await resolveGuard({
+				headers,
+				method: request.method,
+				set,
+			});
+			if (outcome.refused) return status(outcome.status, outcome.body);
+			return { companyContext: outcome.companyContext };
 		});
 }
 
